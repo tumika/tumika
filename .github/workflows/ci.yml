@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # golangci-lint runs depguard, which is the mechanical enforcement of the
+      # layering rules in .agents/rules/ and ADR-0004. A forbidden import fails
+      # the build here rather than becoming a review argument.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  build-test:
+    name: build & test
+    # Both supported platforms, because a meaningful amount of this codebase is
+    # platform-specific: the Keychain and systemd-creds sealing backends, the
+    # launchd and systemd service drivers, and the PTY login flow. Testing only
+    # on Linux would leave the macOS half of that unbuilt.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race ./...
+
+  # The single job the branch-protection ruleset actually requires. Individual
+  # job names are an implementation detail that changes as CI evolves —
+  # pointing the ruleset at each one means every job rename/add/remove is
+  # also a ruleset edit, and a job left off the required list can fail
+  # silently without blocking a merge. Add a job to `needs:` below and the
+  # gate covers it automatically; the ruleset itself never needs to change.
+  #
+  # Jobs still to join this list as the capabilities they test arrive:
+  #   sqlc          — `sqlc diff`, with persistence
+  #   build         — `goreleaser build --snapshot --clean`, with .goreleaser.yml
+  #   images        — shipped image + systemd test-harness image
+  #   linux-install — the integration gate that makes the Pi deployment
+  #                   trustworthy without a Pi
+  pr-gate:
+    name: PR Gate
+    if: always()
+    needs: [lint, build-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all upstream jobs to have succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          case "$RESULTS" in
+            *failure*|*cancelled*|*skipped*)
+              echo "one or more required jobs did not succeed" >&2
+              exit 1
+              ;;
+          esac

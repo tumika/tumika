@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Go module dependencies.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait a week after a release is published before opening an update PR,
+    # so freshly-cut versions have time to be yanked or superseded.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+
+  # GitHub Actions used in our workflows. Every third-party action is
+  # SHA-pinned with a version comment, because a tag their owner controls can
+  # be silently repointed at code we never reviewed; dependabot is what keeps
+  # those pins from going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
