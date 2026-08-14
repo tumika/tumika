@@ -1,0 +1,11 @@
+version: 2
+sources:
+- url: github.com/wardnet/agentic-stacks.git
+  ref: main
+  sha: 3a19c994319dd8a0d16db16629d19df46cd7e920
+- url: github.com/pedromvgomes/agentic-toolkit.git
+  ref: main
+  sha: 90f31c44829abbc52403ec681847679aa7c36910
+- url: github.com/anthropics/skills.git
+  ref: main
+  sha: f6656c1256d5a8adfa37db9110046ef20bac644c

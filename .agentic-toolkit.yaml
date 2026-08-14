@@ -1,0 +1,5 @@
+root: agentic
+extends:
+  - github.com/wardnet/agentic-stacks/wardnet.yaml@main
+mcp:
+  - github.com/pedromvgomes/agentic-toolkit.git/definitions/mcp/chrome-devtools.yaml@main
