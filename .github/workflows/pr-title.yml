@@ -1,0 +1,88 @@
+# Enforces .agents/rules/every-commit-and-pr-title-is-a-conventional-commit.md.
+#
+# This is a separate workflow from ci.yml, not another job in it, because it must
+# re-run on `edited`. Adding `edited` to ci.yml's triggers would re-run the whole
+# pipeline — two build-test legs and a three-minute bulwark job — every time
+# somebody adjusts a title. Here, fixing a title costs a few seconds.
+#
+# The trade-off: it is a second required status check rather than being covered
+# by ci.yml's PR Gate. That is acceptable because this workflow has exactly one
+# job and no reason to grow, so it does not reintroduce the job-churn problem the
+# PR Gate exists to solve.
+name: PR Title
+
+on:
+  pull_request:
+    branches:
+      - main
+    # `edited` is the load-bearing one: without it, correcting a rejected title
+    # would leave the check red until an unrelated push.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventional-commit:
+    name: conventional commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the PR title
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script: a PR title is attacker-controlled text, and `${{ }}` inside
+          # `run:` would splice it straight into the shell.
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Conventional Commits 1.0.0: <type>[(scope)][!]: <description>
+          #
+          # Matched case-insensitively, because the spec is: "The units of
+          # information that make up Conventional Commits MUST NOT be treated as
+          # case sensitive by implementors, with the exception of BREAKING CHANGE
+          # which MUST be uppercase." Rejecting `Feat:` here would be a local
+          # house style masquerading as the standard. Lowercase is what this repo
+          # writes; it is a convention, not a gate.
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+'
+
+          # GitHub's "Revert" button generates `Revert "<original title>"`, and a
+          # revert is usually urgent. Accept it rather than making someone edit a
+          # title during an incident; `revert: …` is equally valid.
+          if printf '%s' "$TITLE" | grep -Eqi '^Revert "'; then
+            echo "✅ revert PR title accepted: $TITLE"
+            exit 0
+          fi
+
+          if printf '%s' "$TITLE" | grep -Eqi "$pattern"; then
+            echo "✅ $TITLE"
+            exit 0
+          fi
+
+          cat >&2 <<MSG
+          ❌ The pull request title is not a Conventional Commit.
+
+             Title: $TITLE
+
+          Pull requests here are squash-merged, so this title becomes the commit
+          message on main — it is the history, not a label.
+
+             <type>[(scope)][!]: <description>
+
+          Types:  feat fix docs style refactor perf test build ci chore revert
+          Scope:  optional, the package or layer — fix(logging): …
+          Break:  feat(api)!: …  plus a BREAKING CHANGE: footer
+
+          Examples:
+             feat(api): add the provider credential endpoint
+             fix(logging): follow a credential across terminal wrapping
+             docs: record why the daemon owns its own binary
+
+          See .agents/rules/every-commit-and-pr-title-is-a-conventional-commit.md
+          and https://www.conventionalcommits.org/en/v1.0.0/
+          MSG
+          exit 1

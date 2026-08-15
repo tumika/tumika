@@ -1,3 +1,9 @@
+# Dependabot's commit message is also its PR title, and PRs here are
+# squash-merged — so without `commit-message.prefix` every dependency update
+# would land on main outside the Conventional Commits convention
+# (.agents/rules/every-commit-and-pr-title-is-a-conventional-commit.md), and
+# would be rejected by the PR Title workflow. `include: scope` appends the
+# dependency scope, producing e.g. `build(deps): bump golang.org/x/mod …`.
 version: 2
 updates:
   # Go module dependencies.
@@ -10,6 +16,12 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 10
+    # `build` rather than `chore`: these are external dependencies, which is
+    # exactly what the type is for.
+    commit-message:
+      prefix: build
+      prefix-development: build
+      include: scope
 
   # GitHub Actions used in our workflows. Every third-party action is
   # SHA-pinned with a version comment, because a tag their owner controls can
@@ -22,3 +34,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 10
+    # `ci`, not `build`: these updates only ever touch workflow files.
+    commit-message:
+      prefix: ci
+      include: scope
