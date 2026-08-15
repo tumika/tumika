@@ -39,6 +39,18 @@ Both conditions are load-bearing: escapes alone swallow the prose after the toke
 alone swallows ordinary words after a space. Anything new that redacts credential material out
 of terminal output goes through `Redact` rather than growing its own pattern.
 
+**Redaction happens on the bytes that are written, not on the values that are
+logged.** `logging.New` wraps the output writer, so whatever a handler serialises is scrubbed
+before it reaches the destination. This is not belt-and-braces — attribute-level inspection
+*cannot* do the job on its own, because the handler serialises the original value and any check
+beforehand is a guess about what the encoder will produce. A type with a masking `String()` and a
+revealing `MarshalJSON` passed every attribute check and then wrote the token verbatim.
+
+The one thing a writer-level scrub cannot catch is an encoding that transforms the bytes:
+`[]byte` is base64-encoded by the JSON handler, so a token leaves as `c2stYW50…` — unrecognisable
+to any pattern and trivially reversible. That case is handled in `redactAttr`, before an encoder
+sees it. Both halves are covered by tests that were verified to fail when either is removed.
+
 **Sealing is bound to its row.** `Sealer.Seal(plaintext, aad)` takes the AAD
 `provider_id|kind`, so ciphertext cannot be transplanted from one credential row to another —
 opening it against a different row fails authentication rather than yielding a token under the

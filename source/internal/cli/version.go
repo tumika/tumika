@@ -29,7 +29,15 @@ func newVersionCmd(g *globals) *cobra.Command {
 			}
 
 			printf(cmd, "%s\n", info)
-			printf(cmd, "home: %s\n", g.paths.Home)
+
+			// Reported when it can be, but never fatal: this command is the
+			// updater's pre-flight, and it must produce a version even on a
+			// machine where the home directory cannot be resolved.
+			if p, err := g.Paths(); err == nil {
+				printf(cmd, "home: %s\n", p.Home)
+			} else {
+				printf(cmd, "home: unresolved (%v)\n", err)
+			}
 			return nil
 		},
 	}

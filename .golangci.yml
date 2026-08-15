@@ -87,14 +87,24 @@ linters:
         # DOMAIN — shared types. Every layer may import it; it imports nothing
         # of ours, which is what keeps it importable from everywhere without
         # creating a cycle.
+        # DOMAIN — shared types. Every layer may import it; it imports nothing
+        # but the standard library and itself, which is what keeps it importable
+        # from everywhere without creating a cycle.
+        #
+        # Expressed as an allowlist rather than a deny on the
+        # `.../source/internal` prefix. That prefix is also a prefix of
+        # `.../source/internal/domain/...`, so the deny form fired on domain's
+        # own subpackages with a message describing a rule they were not
+        # breaking — and depguard does not let `allow` override `deny`. The
+        # allowlist has no such blind spot, and is stricter: it also keeps
+        # third-party dependencies out of domain, which a deny on our own prefix
+        # never did.
         domain:
           files:
             - "**/source/internal/domain/**"
-          deny:
-            - pkg: github.com/tumika/tumika/source/internal
-              desc: >-
-                domain holds shared types and imports nothing of ours. Anything
-                it needs from another package belongs in domain itself.
+          allow:
+            - $gostd
+            - github.com/tumika/tumika/source/internal/domain
 
         # No cgo, anywhere. Every build is CGO_ENABLED=0 so cross-compiling for
         # linux/arm64 is free — which is also why the SQLite driver is the pure

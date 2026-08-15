@@ -29,22 +29,36 @@ var (
 func main() {
 	buildinfo.Set(version, commit, date)
 
-	// The first signal cancels the context, which is how every long-running
-	// command unwinds: the daemon stops its runners, drains in-flight requests
-	// and closes the database.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// One channel for both signals rather than signal.NotifyContext plus a
+	// second registration.
+	//
+	// The two-channel version had a race: the second channel was only registered
+	// after the context was already cancelled, and the signal package delivers to
+	// whichever channels are registered at the moment a signal arrives. A SIGINT
+	// landing inside that window went to NotifyContext's channel — buffered 1 and
+	// already full — and was dropped, so an operator double-tapping Ctrl-C on a
+	// wedged shutdown saw the second press do nothing.
+	//
+	// Registering once up front and reading twice has no such window: the buffer
+	// holds the second signal until we get to it.
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
 
-	// A second signal means the operator is not willing to wait for that. Give
-	// them an immediate exit rather than a process that appears wedged —
-	// stopping the notifier first so the signal reverts to its default
-	// disposition if a third arrives.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	go func() {
-		<-ctx.Done()
-		second := make(chan os.Signal, 1)
-		signal.Notify(second, os.Interrupt, syscall.SIGTERM)
-		<-second
-		stop()
+		<-signals
+		// First signal: unwind. Long-running commands stop their runners, drain
+		// in-flight requests and close the database.
+		cancel()
+
+		<-signals
+		// Second signal: the operator is not willing to wait. Stop handling
+		// signals first, so a third takes the default disposition if this exit
+		// somehow blocks.
+		signal.Stop(signals)
 		os.Exit(1)
 	}()
 
