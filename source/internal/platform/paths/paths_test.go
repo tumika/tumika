@@ -164,3 +164,58 @@ func TestContainerOverrideIsTriState(t *testing.T) {
 		})
 	}
 }
+
+// os.MkdirAll applies its mode only to directories it creates and is a silent
+// no-op for one that already exists. A distro package, a Docker VOLUME or an
+// admin creating /var/lib/tumika at 0755 would otherwise leave the database, the
+// sealed credentials and the fallback master key readable by every user on the
+// host — with MkdirAll returning nil.
+func TestMkdirAllTightensAPreExistingDirectory(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "tumika")
+	if err := os.MkdirAll(filepath.Join(home, "bin"), 0o755); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+
+	p, err := paths.Resolve(home)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := p.MkdirAll(); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	for _, dir := range []string{home, filepath.Join(home, "bin")} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat %s: %v", dir, err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s has mode %#o; the credential tree must not be group- or world-accessible", dir, perm)
+		}
+	}
+}
+
+// An already-correct directory is left alone, so a prepared volume does not
+// require chmod permission tumika may not have.
+func TestMkdirAllLeavesACorrectDirectoryUntouched(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "tumika")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+
+	p, err := paths.Resolve(home)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := p.MkdirAll(); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	info, err := os.Stat(home)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("mode = %#o, want 0700 unchanged", perm)
+	}
+}
