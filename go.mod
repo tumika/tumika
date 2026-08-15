@@ -2,6 +2,11 @@ module github.com/tumika/tumika
 
 go 1.26
 
+// Floors the toolchain at the patch release that fixes the crypto/tls,
+// net/http and encoding/asn1 advisories govulncheck reports as reachable
+// through http.Server.Serve.
+toolchain go1.26.6
+
 require (
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/spf13/cobra v1.10.2
