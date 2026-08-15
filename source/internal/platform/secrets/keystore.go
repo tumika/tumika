@@ -47,8 +47,22 @@ var ErrNoKey = errors.New("no master key available")
 //
 // Precedence is explicit-over-implicit: an operator who set the environment
 // variable meant it, and silently preferring a keychain entry over it would make
-// the override untrustworthy. After that the platform's own facility is
-// preferred, and the file is the fallback — honest about being one.
+// the override untrustworthy.
+//
+// On macOS, an unreachable Keychain is a HARD FAILURE — there is deliberately no
+// fallback. An earlier version fell through to the file store, which is a data
+// loss bug rather than resilience: a locked Keychain, or a denied access prompt,
+// would send a daemon that had been running for weeks to a file store holding no
+// key, which would mint a fresh one. The daemon would start cleanly, report
+// backend "file", and be unable to open a single existing credential — and any
+// credential re-submitted during that run would be sealed under the new key,
+// while the next successful start preferred the Keychain again. The two sets
+// orphan each other, flip-flopping run to run.
+//
+// Failing closed costs one confusing startup. Falling back costs the
+// credentials. ADR-0002 already handles the no-session case: macOS runs as a
+// LaunchAgent precisely so a session exists, and TUMIKA_MASTER_KEY is the answer
+// where it does not.
 //
 // The Linux systemd-creds backend joins at the service-manager step; until then
 // Linux gets the file, which is what a container would use anyway.
@@ -58,17 +72,7 @@ func OpenKeyStore(keyFile string) (KeyStore, error) {
 	}
 
 	if runtime.GOOS == "darwin" {
-		store, err := newKeychainKeyStore()
-		if err == nil {
-			return store, nil
-		}
-		// A Mac without a usable Keychain is a real configuration — a daemon
-		// with no user session, most obviously. Falling back to the file keeps
-		// it working; the backend is reported in /v1/health either way, so the
-		// choice is visible rather than silent.
-		if !errors.Is(err, errKeychainUnavailable) {
-			return nil, err
-		}
+		return newKeychainKeyStore()
 	}
 
 	return newFileKeyStore(keyFile)
@@ -123,6 +127,13 @@ func newFileKeyStore(path string) (KeyStore, error) {
 	}
 
 	key, err = store.create()
+	if errors.Is(err, os.ErrExist) {
+		// Another process created the key between our load and our create — a
+		// supervisor restarting the daemon mid-first-run, or a CLI command and
+		// the daemon initialising custody together. The winner's key is the
+		// key; refusing to start would report a race as corruption.
+		key, err = store.load()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +145,14 @@ func (s *fileKeyStore) load() ([]byte, error) {
 	info, err := os.Stat(s.path)
 	if err != nil {
 		return nil, err
+	}
+
+	// An empty file is treated as absent rather than as a broken key. It is what
+	// a crash between create and write used to leave behind, and reporting "no
+	// master key available" for it wedged startup with no hint that deleting the
+	// file was the fix.
+	if info.Size() == 0 {
+		return nil, os.ErrNotExist
 	}
 
 	// A key file anyone can read is not a key file. Refuse rather than quietly
@@ -162,16 +181,56 @@ func (s *fileKeyStore) create() ([]byte, error) {
 		return nil, fmt.Errorf("create %s: %w", filepath.Dir(s.path), err)
 	}
 
-	// O_EXCL so two daemons racing to first-start cannot both mint a key and
-	// leave one of them holding credentials nothing can open.
-	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Written to a temp file, fsynced, then linked into place with O_EXCL
+	// semantics. The key file therefore either does not exist or is complete:
+	// writing in place left a window where a crash produced an empty file that
+	// no later start could interpret.
+	//
+	// The link is what makes this safe against a concurrent first-run — the
+	// loser gets os.ErrExist and reloads the winner's key rather than failing.
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".master.key.*")
 	if err != nil {
-		return nil, fmt.Errorf("create %s: %w", s.path, err)
+		return nil, fmt.Errorf("create a temporary key file in %s: %w", filepath.Dir(s.path), err)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
 
-	if _, err := f.WriteString(base64.StdEncoding.EncodeToString(key)); err != nil {
-		return nil, fmt.Errorf("write %s: %w", s.path, err)
+	if err := tmp.Chmod(0o600); err != nil {
+		return nil, fmt.Errorf("set permissions on %s: %w", tmp.Name(), err)
+	}
+	if _, err := tmp.WriteString(base64.StdEncoding.EncodeToString(key)); err != nil {
+		return nil, fmt.Errorf("write %s: %w", tmp.Name(), err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return nil, fmt.Errorf("flush %s: %w", tmp.Name(), err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", tmp.Name(), err)
+	}
+
+	// os.Link fails with EEXIST rather than replacing, which os.Rename would do
+	// silently — and replacing the key file is precisely what must never happen.
+	if err := os.Link(tmp.Name(), s.path); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("install %s: %w", s.path, err)
+		}
+
+		// Something is already there. A zero-length file is the debris of a
+		// crash between create and write — not a key, and nothing will ever be
+		// able to read it — so clear it and take the slot. Anything non-empty is
+		// a real key from whoever won the race, and os.ErrExist tells the caller
+		// to load it rather than clobber it.
+		if info, statErr := os.Stat(s.path); statErr == nil && info.Size() == 0 {
+			if rmErr := os.Remove(s.path); rmErr == nil {
+				if linkErr := os.Link(tmp.Name(), s.path); linkErr != nil {
+					return nil, fmt.Errorf("install %s: %w", s.path, linkErr)
+				}
+				return key, nil
+			}
+		}
+		return nil, err
 	}
 	return key, nil
 }
@@ -180,8 +239,16 @@ func (s *fileKeyStore) Key() ([]byte, error) { return s.key, nil }
 func (s *fileKeyStore) Backend() string      { return BackendFile }
 func (s *fileKeyStore) KeyRef() string       { return BackendFile + ":" + s.path }
 
-// decodeKey accepts base64 (standard or URL, padded or not) or a hex-length raw
-// string, and insists on exactly KeySize bytes.
+// decodeKey accepts base64 in any of its four flavours and insists on exactly
+// KeySize bytes.
+//
+// There is deliberately no "raw bytes" fallback. It looked like a kindness —
+// supply 32 characters and skip the encoding question — but it turned a
+// truncated key into a silently different one: the first 32 characters of a
+// 44-character base64 key decode to 24 bytes, fail the length check, and were
+// then accepted verbatim as raw material. The daemon would start, use a key
+// nobody intended, and fail to open every stored credential. An error naming the
+// problem is worth far more than saving an operator a base64 call.
 func decodeKey(s string) ([]byte, error) {
 	if s == "" {
 		return nil, ErrNoKey
@@ -193,16 +260,16 @@ func decodeKey(s string) ([]byte, error) {
 		base64.URLEncoding,
 		base64.RawURLEncoding,
 	} {
-		if key, err := enc.DecodeString(s); err == nil && len(key) == KeySize {
-			return key, nil
+		key, err := enc.DecodeString(s)
+		if err != nil {
+			continue
 		}
+		if len(key) != KeySize {
+			return nil, fmt.Errorf("%w, but this decoded to %d (is the value truncated?)",
+				ErrKeyLength, len(key))
+		}
+		return key, nil
 	}
 
-	// A raw 32-byte string is accepted too, so an operator can supply one
-	// without having to think about encoding.
-	if len(s) == KeySize {
-		return []byte(s), nil
-	}
-
-	return nil, fmt.Errorf("%w: expected %d bytes, base64-encoded", ErrKeyLength, KeySize)
+	return nil, fmt.Errorf("%w, base64-encoded; this is not valid base64", ErrKeyLength)
 }

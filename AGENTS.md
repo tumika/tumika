@@ -228,8 +228,16 @@ Two things that are easy to get wrong and are pinned by tests:
   provider with another's credential — which presents as a mysterious 401.
 
 `secrets.OpenKeyStore` *selects* a backend; `NewFileKeyStore` / `NewEnvKeyStore`
-*construct* one. Tests must use the constructors: calling the selector on a Mac
-reaches for the real login Keychain and writes a key into it.
+*construct* one. **Tests must never reach the selector**: on a Mac it reaches for
+the real login Keychain and writes a key into it, so `go test ./...` would mutate
+the Keychain of whoever ran it. Unit tests use the constructors; anything that
+builds a `daemon` sets `TUMIKA_MASTER_KEY` (see `useTestKeyCustody`).
+
+**There is no fallback off the Keychain on macOS, deliberately.** A locked
+keychain or a denied prompt fails the daemon closed. Falling back to a file would
+find no key, mint a fresh one, start cleanly — and be unable to open a single
+existing credential, while anything re-submitted during that run got sealed under
+the new key and orphaned on the next successful start.
 
 ## Conventions
 

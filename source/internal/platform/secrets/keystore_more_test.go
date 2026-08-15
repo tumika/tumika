@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/tumika/tumika/source/internal/platform/secrets"
@@ -86,7 +85,6 @@ func TestKeyEncodingsAccepted(t *testing.T) {
 		"url":               base64.URLEncoding.EncodeToString(key),
 		"raw url":           base64.RawURLEncoding.EncodeToString(key),
 		"surrounding space": "  " + base64.StdEncoding.EncodeToString(key) + "\n",
-		"raw 32 bytes":      string(key),
 	} {
 		t.Run(name, func(t *testing.T) {
 			store, err := secrets.NewEnvKeyStore(encoded)
@@ -104,6 +102,29 @@ func TestKeyEncodingsAccepted(t *testing.T) {
 				t.Error("KeyRef must not be empty")
 			}
 		})
+	}
+}
+
+// A truncated key must be an error, not a different key.
+//
+// The first 32 characters of a 44-character base64 key decode to 24 bytes. An
+// earlier version rejected that on length and then accepted the 32 characters
+// verbatim as raw key material — so a value truncated in a systemd unit or a
+// .env started the daemon under a key nobody intended, and every stored
+// credential failed to open with no indication why.
+func TestTruncatedKeyIsRejectedRatherThanReinterpreted(t *testing.T) {
+	full := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x3b}, secrets.KeySize))
+
+	for _, truncated := range []string{full[:32], full[:16], full[:40]} {
+		store, err := secrets.NewEnvKeyStore(truncated)
+		if err == nil {
+			got, _ := store.Key()
+			t.Errorf("NewEnvKeyStore(%q) was accepted as a %d-byte key", truncated, len(got))
+			continue
+		}
+		if !errors.Is(err, secrets.ErrKeyLength) {
+			t.Errorf("NewEnvKeyStore(%q) = %v, want ErrKeyLength", truncated, err)
+		}
 	}
 }
 
@@ -138,9 +159,14 @@ func TestFileKeyStoreReportsAnUncreatablePath(t *testing.T) {
 	}
 }
 
-// The sealed row records which custody produced it, and a row from an unknown
-// custody still fails closed.
-func TestOpenRefusesARowFromAnUnknownCustody(t *testing.T) {
+// KeyRef is advisory, not a gate.
+//
+// A row whose ref no longer matches — the home directory moved, so the file
+// store's path changed — must still open when the KEY is the same. Refusing on a
+// ref mismatch would turn a relocated install into an unrecoverable one, which
+// is the opposite of what the ref is for: it exists to explain a failure, not to
+// cause one.
+func TestKeyRefMismatchDoesNotBlockAValidKey(t *testing.T) {
 	sealer := sealerFor(t)
 	binding := aad("claude-code", "oauth_token")
 
@@ -148,14 +174,13 @@ func TestOpenRefusesARowFromAnUnknownCustody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	sealed.KeyRef = "systemd-creds:host-bound"
+	sealed.KeyRef = "file:/somewhere/else/master.key"
 
-	_, err = sealer.Open(sealed, binding)
+	opened, err := sealer.Open(sealed, binding)
 	if err != nil {
-		// The ciphertext is still valid for this key, so it opens; the ref is
-		// advisory. What must not happen is a silent wrong answer.
-		if !strings.Contains(err.Error(), "submitted again") {
-			t.Errorf("unexpected error: %v", err)
-		}
+		t.Fatalf("a row with a stale KeyRef but the right key must still open: %v", err)
+	}
+	if string(opened) != "a-credential" {
+		t.Errorf("opened %q", opened)
 	}
 }

@@ -18,10 +18,15 @@ const (
 	keychainAccount = "master-key"
 )
 
-// errKeychainUnavailable means the Keychain cannot be reached at all — most
-// often a daemon with no user session. The caller falls back to a file rather
-// than failing, and /v1/health reports which one is in use.
-var errKeychainUnavailable = errors.New("keychain is unavailable")
+// errKeychainUnavailable means the Keychain cannot be reached.
+//
+// This is a HARD failure on macOS: there is no fallback, because falling back
+// would mint a fresh key and orphan every credential sealed under the Keychain
+// (see OpenKeyStore). The message names the way out.
+var errKeychainUnavailable = errors.New(
+	"macOS Keychain is unavailable; tumika will not fall back to a file key, because that " +
+		"would mint a new key and orphan every credential already sealed. Unlock the keychain, " +
+		"or set " + MasterKeyEnv + " to supply the key explicitly")
 
 // keychainKeyStore keeps the master key in the macOS Keychain.
 //
@@ -45,9 +50,10 @@ func newKeychainKeyStore() (KeyStore, error) {
 		// First run: mint one.
 
 	default:
-		// No session, no keychain, or access denied. Distinguished from a
-		// genuine failure so the caller can fall back rather than refuse to
-		// start.
+		// A locked keychain, a denied access prompt, or no session at all. Any
+		// of these may sit in front of an EXISTING key, and there is no way from
+		// here to tell. Refusing to start is the only answer that cannot lose
+		// credentials.
 		return nil, fmt.Errorf("%w: %w", errKeychainUnavailable, err)
 	}
 
