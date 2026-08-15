@@ -62,7 +62,7 @@ source/internal/domain/                 # shared types; imports nothing of ours
 source/internal/platform/provider/      # provider interfaces + registry
 source/internal/platform/provider/claudecode/
 source/internal/platform/provider/anthropicapi/
-source/internal/platform/secrets/       # Sealer + keychain / systemdcreds / file backends
+source/internal/platform/secrets/       # Sealer (AES-256-GCM) + env / keychain / file key custody
 source/internal/platform/servicemgr/    # ServiceManager + launchd / systemd drivers
 source/internal/platform/release/       # ReleaseSource (self-update)
 source/internal/platform/paths/         # filesystem layout resolution
@@ -203,6 +203,33 @@ Note this differs from the plan's literal ordering, which put recovery and
 logging innermost. Placed there, recovery would not cover a panic in the layers
 above it and logging would never see a rejected request — both of which defeat
 the point of having them.
+
+## Credential sealing
+
+Envelope encryption (ADR-0002): AES-256-GCM ciphertext stays in SQLite, and only
+the **key** leaves. That is what keeps "the database is the whole state" true —
+the file is still complete and backup-able, just not readable on its own.
+
+The cipher is fixed; only key custody varies, chosen at startup and reported by
+`/v1/health`:
+
+| Precedence | Backend | Notes |
+|---|---|---|
+| 1 | `TUMIKA_MASTER_KEY` | explicit beats implicit, or the override would not be trustworthy |
+| 2 | macOS Keychain | why the Mac install is a LaunchAgent, not a daemon — Keychain needs a session |
+| 3 | `0600` file | the honest fallback; a container has no keystore. `systemd-creds` joins at the service-manager step |
+
+Two things that are easy to get wrong and are pinned by tests:
+
+- **Every seal draws a fresh nonce.** GCM does not degrade under nonce reuse, it
+  collapses. Never derive one from a counter or the plaintext.
+- **The AAD binds ciphertext to its row** (`provider_id|kind`). Without it a row
+  copied between providers decrypts cleanly, and tumika authenticates to one
+  provider with another's credential — which presents as a mysterious 401.
+
+`secrets.OpenKeyStore` *selects* a backend; `NewFileKeyStore` / `NewEnvKeyStore`
+*construct* one. Tests must use the constructors: calling the selector on a Mac
+reaches for the real login Keychain and writes a key into it.
 
 ## Conventions
 

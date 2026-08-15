@@ -17,7 +17,7 @@ func TestHealthReportsAHealthyDaemon(t *testing.T) {
 	}
 
 	schema := func(context.Context) (int64, error) { return 1, nil }
-	svc := service.NewHealthService("v1.2.3", time.Now().Add(-90*time.Second), schema, auth)
+	svc := service.NewHealthService("v1.2.3", time.Now().Add(-90*time.Second), schema, auth, "file")
 
 	h := svc.Snapshot(t.Context())
 
@@ -48,7 +48,7 @@ func TestHealthDegradesRatherThanFailing(t *testing.T) {
 	auth, _ := newAuth(t) // deliberately no token minted
 
 	schema := func(context.Context) (int64, error) { return 0, errors.New("database is gone") }
-	svc := service.NewHealthService("dev", time.Now(), schema, auth)
+	svc := service.NewHealthService("dev", time.Now(), schema, auth, "file")
 
 	h := svc.Snapshot(t.Context())
 
@@ -78,11 +78,37 @@ func TestHealthNeverCarriesTheToken(t *testing.T) {
 	}
 
 	schema := func(context.Context) (int64, error) { return 1, nil }
-	h := service.NewHealthService("dev", time.Now(), schema, auth).Snapshot(t.Context())
+	h := service.NewHealthService("dev", time.Now(), schema, auth, "file").Snapshot(t.Context())
 
 	rendered := strings.Join(append(h.Warnings,
 		h.Status, h.Version, h.Uptime, h.Database.Error), " ")
 	if strings.Contains(rendered, token) {
 		t.Error("the API token appears in the health report")
+	}
+}
+
+// The backend is reported so an operator can tell which custody is in use —
+// which matters because restoring a database to a new host loses credentials
+// sealed by a host-bound backend (ADR-0002).
+func TestHealthReportsTheSecretsBackend(t *testing.T) {
+	auth, _ := newAuth(t)
+	if _, err := auth.Rotate(t.Context()); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	schema := func(context.Context) (int64, error) { return 1, nil }
+
+	h := service.NewHealthService("dev", time.Now(), schema, auth, "keychain").Snapshot(t.Context())
+	if h.Secrets.Backend != "keychain" {
+		t.Errorf("Secrets.Backend = %q, want keychain", h.Secrets.Backend)
+	}
+	if h.Status != "ok" {
+		t.Errorf("Status = %q, warnings %v", h.Status, h.Warnings)
+	}
+
+	// No custody at all means credentials cannot be stored; that is degraded,
+	// not fine.
+	degraded := service.NewHealthService("dev", time.Now(), schema, auth, "").Snapshot(t.Context())
+	if degraded.Status != "degraded" {
+		t.Errorf("Status = %q with no key custody, want degraded", degraded.Status)
 	}
 }
