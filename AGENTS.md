@@ -22,6 +22,8 @@ The current branch builds **foundations only** — no workflow engine, no UI, no
 go build ./...                    # build
 go test -race ./...               # run tests (race detector on, as CI does)
 golangci-lint run ./...           # lint — must be clean before a PR; enforces the layering rules
+bulwark scan                      # gosec + govulncheck + semgrep, exactly as CI runs them
+bulwark coverage                  # diff coverage against the cached baseline (the CI gate)
 go run ./source/cmd/tumika        # run the CLI locally
 
 # Release build dry-run (produces dist/):
@@ -154,9 +156,10 @@ obvious implementation:
 
 ## Boundaries
 
-- **Always:** run `go build ./...`, `go test -race ./...` and `golangci-lint run ./...` before
-  proposing a PR; write a goose migration and regenerate sqlc in the same commit as any schema
-  change; keep `.golangci.yml`'s depguard rules in step with `.agents/rules/`.
+- **Always:** run `go build ./...`, `go test -race ./...`, `golangci-lint run ./...` and
+  `bulwark scan` before proposing a PR; write a goose migration and regenerate sqlc in the same
+  commit as any schema change; keep `.golangci.yml`'s depguard rules in step with
+  `.agents/rules/`.
 - **Ask first:** changing the Go version, moving code out of `/source`, adding a third
   provider, changing the pinned Claude Code version, altering the release archive layout (the
   raw-binary archive is what self-update fetches), or editing CI.
