@@ -144,3 +144,23 @@ func TestContainerHomeIsFixed(t *testing.T) {
 		t.Errorf("Home = %q, want /var/lib/tumika in a container", p.Home)
 	}
 }
+
+// The override works in both directions. It used to be truthiness-blind:
+// TUMIKA_CONTAINER=0 meant "yes", silently relocating the home directory and
+// disabling self-update for an operator who had asked for the opposite.
+func TestContainerOverrideIsTriState(t *testing.T) {
+	tests := map[string]bool{
+		"1": true, "true": true, "TRUE": true,
+		"0": false, "false": false, "False": false,
+		"yes": true, // set but unparseable: taken as intent to force it on
+	}
+
+	for value, want := range tests {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(paths.ContainerEnv, value)
+			if got := paths.InContainer(); got != want {
+				t.Errorf("InContainer() with %s=%q = %v, want %v", paths.ContainerEnv, value, got, want)
+			}
+		})
+	}
+}
