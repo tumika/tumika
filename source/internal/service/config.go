@@ -33,6 +33,10 @@ const (
 	// the value is a string literal. It is a config key naming how often to
 	// re-verify, not a credential.
 	KeyCredentialCheckInterval = "credential.check_interval" // #nosec G101 -- a config key, not a credential
+
+	// KeyAPITokenHash holds the SHA-256 of the API bearer token. It is a secret
+	// setting: invisible to the config API, readable only through ReadSecret.
+	KeyAPITokenHash = "server.api_token_sha256" // #nosec G101 -- a config key, not a credential
 )
 
 // settingDefinitions is the closed set of keys tumika understands.
@@ -71,6 +75,14 @@ var settingDefinitions = []domain.SettingDefinition{
 		Default:     json.RawMessage(`false`),
 	},
 	{
+		Key:  KeyAPITokenHash,
+		Kind: domain.SettingString,
+		Description: "SHA-256 of the API bearer token. Managed by `tumika token`; " +
+			"never returned and not settable through the API.",
+		Default: json.RawMessage(`""`),
+		Secret:  true,
+	},
+	{
 		Key:         KeyCredentialCheckInterval,
 		Kind:        domain.SettingDuration,
 		Description: "How often to re-verify stored credentials. This is what actually detects an expired subscription token, because its expiry is an estimate.",
@@ -97,7 +109,20 @@ type ConfigService interface {
 	Set(ctx context.Context, values map[string]json.RawMessage) ([]domain.SettingView, error)
 	// Reset removes a stored value so the key falls back to its default.
 	Reset(ctx context.Context, key string) error
+
+	// ReadSecret returns a secret setting's stored value, or ErrNotSet.
+	//
+	// Secret settings are invisible to every other method here: they are not
+	// configuration knobs, and the config API must not be able to read, write or
+	// even discover them. This is the only door, and it is not reachable from a
+	// handler — the API package has no reason to call it and does not.
+	ReadSecret(ctx context.Context, key string) (string, error)
+	// WriteSecret stores a secret setting's value.
+	WriteSecret(ctx context.Context, key, value string) error
 }
+
+// ErrNotSet is returned by ReadSecret when a secret has never been written.
+var ErrNotSet = errors.New("not set")
 
 type configService struct {
 	repo repository.ConfigRepository
@@ -116,13 +141,30 @@ func NewConfigService(repo repository.ConfigRepository, tx repository.Txer) Conf
 }
 
 func (s *configService) Definitions() []domain.SettingDefinition {
-	out := make([]domain.SettingDefinition, len(settingDefinitions))
-	copy(out, settingDefinitions)
+	out := make([]domain.SettingDefinition, 0, len(settingDefinitions))
+	for _, d := range settingDefinitions {
+		if !d.Secret {
+			out = append(out, d)
+		}
+	}
 	return out
 }
 
-func (s *configService) Get(ctx context.Context, key string) (domain.SettingView, error) {
+// public looks up a definition that the config API is allowed to touch.
+//
+// A secret setting is reported as unknown rather than forbidden. "You may not
+// read this" still confirms it exists; for a credential store, not confirming is
+// the better answer, and the config API has no legitimate use for it either way.
+func (s *configService) public(key string) (domain.SettingDefinition, bool) {
 	def, ok := s.defs[key]
+	if !ok || def.Secret {
+		return domain.SettingDefinition{}, false
+	}
+	return def, true
+}
+
+func (s *configService) Get(ctx context.Context, key string) (domain.SettingView, error) {
+	def, ok := s.public(key)
 	if !ok {
 		return domain.SettingView{}, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
 	}
@@ -150,6 +192,9 @@ func (s *configService) List(ctx context.Context) ([]domain.SettingView, error) 
 
 	out := make([]domain.SettingView, 0, len(settingDefinitions))
 	for _, def := range settingDefinitions {
+		if def.Secret {
+			continue
+		}
 		out = append(out, viewOf(def, byKey[def.Key]))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
@@ -175,7 +220,7 @@ func (s *configService) Set(ctx context.Context, values map[string]json.RawMessa
 	changes := make([]change, 0, len(values))
 
 	for key, raw := range values {
-		def, ok := s.defs[key]
+		def, ok := s.public(key)
 		if !ok {
 			return nil, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
 		}
@@ -213,10 +258,46 @@ func (s *configService) Set(ctx context.Context, values map[string]json.RawMessa
 }
 
 func (s *configService) Reset(ctx context.Context, key string) error {
-	if _, ok := s.defs[key]; !ok {
+	if _, ok := s.public(key); !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownSetting, key)
 	}
 	return s.repo.Delete(ctx, key)
+}
+
+func (s *configService) ReadSecret(ctx context.Context, key string) (string, error) {
+	def, ok := s.defs[key]
+	if !ok || !def.Secret {
+		return "", fmt.Errorf("%w: %q is not a secret setting", ErrUnknownSetting, key)
+	}
+
+	stored, err := s.repo.Get(ctx, key)
+	if errors.Is(err, domain.ErrNotFound) {
+		return "", ErrNotSet
+	}
+	if err != nil {
+		return "", err
+	}
+
+	var value string
+	if err := json.Unmarshal(stored.Value, &value); err != nil {
+		return "", fmt.Errorf("%w: %s is not a string", ErrInvalidSetting, key)
+	}
+	if value == "" {
+		return "", ErrNotSet
+	}
+	return value, nil
+}
+
+func (s *configService) WriteSecret(ctx context.Context, key, value string) error {
+	def, ok := s.defs[key]
+	if !ok || !def.Secret {
+		return fmt.Errorf("%w: %q is not a secret setting", ErrUnknownSetting, key)
+	}
+	return s.repo.Upsert(ctx, domain.Setting{
+		Key:       key,
+		Value:     mustMarshal(value),
+		UpdatedAt: time.Now(),
+	})
 }
 
 func viewOf(def domain.SettingDefinition, stored []byte) domain.SettingView {

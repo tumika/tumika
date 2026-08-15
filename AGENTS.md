@@ -28,6 +28,10 @@ sqlc generate                     # regenerate repository/sqlite from queries/ +
 sqlc diff                         # fail if the committed generated code is stale (the CI gate)
 go run ./source/cmd/tumika        # run the CLI locally
 
+# First run: the daemon refuses to serve without an API token.
+go run ./source/cmd/tumika token rotate   # mint one, printed once
+go run ./source/cmd/tumika serve          # run the daemon in the foreground
+
 # Release build dry-run (produces dist/):
 go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean
 ```
@@ -177,6 +181,28 @@ that changes `buildinfo.PinnedClaudeCodeVersion` **and** re-establishes that cla
 If the transcripts still match, the bump is boring — which is the intended outcome most of the
 time. If they do not, the parser changes in the same commit as the pin, so a released binary and
 the TUI it parses are never out of step.
+
+## HTTP API
+
+Every route is behind a bearer token — there are no exemptions, including
+`/v1/health`. Only the token's SHA-256 is stored, so a lost token is replaced
+(`tumika token rotate`), never recovered, and the daemon refuses to start rather
+than listen unauthenticated.
+
+Middleware, outermost first:
+
+| Order | Middleware | Why there |
+|---|---|---|
+| 1 | recovery | outermost, so a panic *anywhere* below becomes a 500 rather than a dropped connection |
+| 2 | logging | above the security checks, so refusals are logged — a burst of 401s is what a probe looks like from the inside |
+| 3 | Host allowlist | the DNS-rebinding defence; runs before auth because it exists to turn away unauthenticated probes. Literal IPs pass: they cannot be rebound |
+| 4 | Origin check | no `Origin` (curl, the CLI) passes; a browser origin must be allowed. No CORS headers are set anywhere |
+| 5 | bearer token | constant-time compare against the stored hash |
+
+Note this differs from the plan's literal ordering, which put recovery and
+logging innermost. Placed there, recovery would not cover a panic in the layers
+above it and logging would never see a rejected request — both of which defeat
+the point of having them.
 
 ## Conventions
 

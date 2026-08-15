@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/tumika/tumika/source/internal/domain"
@@ -72,6 +73,77 @@ func newService(t *testing.T) (service.ConfigService, *fakeConfigRepo, *fakeTxer
 	t.Helper()
 	repo, tx := newFakeRepo(), &fakeTxer{}
 	return service.NewConfigService(repo, tx), repo, tx
+}
+
+// A secret setting must be invisible to the config API — not merely
+// value-redacted. Reporting it as unknown avoids confirming it exists at all,
+// and the config API has no legitimate use for it either way.
+func TestSecretSettingsAreInvisibleToTheConfigAPI(t *testing.T) {
+	svc, repo, _ := newService(t)
+	ctx := t.Context()
+
+	if _, err := svc.Get(ctx, service.KeyAPITokenHash); !errors.Is(err, service.ErrUnknownSetting) {
+		t.Errorf("Get(secret) = %v, want ErrUnknownSetting", err)
+	}
+	_, err := svc.Set(ctx, map[string]json.RawMessage{service.KeyAPITokenHash: json.RawMessage(`"x"`)})
+	if !errors.Is(err, service.ErrUnknownSetting) {
+		t.Errorf("Set(secret) = %v, want ErrUnknownSetting", err)
+	}
+	if err := svc.Reset(ctx, service.KeyAPITokenHash); !errors.Is(err, service.ErrUnknownSetting) {
+		t.Errorf("Reset(secret) = %v, want ErrUnknownSetting", err)
+	}
+	if repo.writes != 0 {
+		t.Errorf("the config API wrote %d rows to a secret setting", repo.writes)
+	}
+
+	// Even once written internally, it must not appear in a listing.
+	if err := svc.WriteSecret(ctx, service.KeyAPITokenHash, "deadbeef"); err != nil {
+		t.Fatalf("WriteSecret: %v", err)
+	}
+	views, err := svc.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, v := range views {
+		if v.Key == service.KeyAPITokenHash {
+			t.Error("a secret setting appeared in List")
+		}
+		if strings.Contains(string(v.Value), "deadbeef") {
+			t.Errorf("a secret value leaked into a view: %+v", v)
+		}
+	}
+	for _, d := range svc.Definitions() {
+		if d.Key == service.KeyAPITokenHash {
+			t.Error("a secret setting appeared in Definitions")
+		}
+	}
+}
+
+func TestSecretRoundTrip(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := t.Context()
+
+	if _, err := svc.ReadSecret(ctx, service.KeyAPITokenHash); !errors.Is(err, service.ErrNotSet) {
+		t.Errorf("ReadSecret before writing = %v, want ErrNotSet", err)
+	}
+	if err := svc.WriteSecret(ctx, service.KeyAPITokenHash, "abc123"); err != nil {
+		t.Fatalf("WriteSecret: %v", err)
+	}
+	got, err := svc.ReadSecret(ctx, service.KeyAPITokenHash)
+	if err != nil {
+		t.Fatalf("ReadSecret: %v", err)
+	}
+	if got != "abc123" {
+		t.Errorf("ReadSecret = %q", got)
+	}
+
+	// The secret door only opens for secret keys.
+	if _, err := svc.ReadSecret(ctx, service.KeyServerListen); !errors.Is(err, service.ErrUnknownSetting) {
+		t.Errorf("ReadSecret(public key) = %v, want ErrUnknownSetting", err)
+	}
+	if err := svc.WriteSecret(ctx, service.KeyServerListen, "x"); !errors.Is(err, service.ErrUnknownSetting) {
+		t.Errorf("WriteSecret(public key) = %v, want ErrUnknownSetting", err)
+	}
 }
 
 func TestGetFallsBackToTheDefault(t *testing.T) {

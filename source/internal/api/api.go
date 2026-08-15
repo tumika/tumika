@@ -26,7 +26,16 @@ const maxBodyBytes = 256 << 10 // 256 KiB
 // handler tests need no database.
 type Deps struct {
 	Config service.ConfigService
+	Health service.HealthService
+	Auth   TokenVerifier
 	Logger *slog.Logger
+
+	// AllowedHosts are the Host header values accepted for a name-based
+	// request. Literal IPs are always accepted — they cannot be rebound.
+	AllowedHosts []string
+	// AllowedOrigins are the browser origins accepted. Empty means none, which
+	// is the intended state: this API is not called from a web page.
+	AllowedOrigins []string
 }
 
 // NewRouter builds the HTTP handler.
@@ -41,11 +50,23 @@ func NewRouter(deps Deps) http.Handler {
 	h := &handlers{deps: deps}
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /v1/health", h.health)
+	mux.HandleFunc("GET /v1/version", h.version)
 	mux.HandleFunc("GET /v1/config", h.listConfig)
 	mux.HandleFunc("PATCH /v1/config", h.patchConfig)
 	mux.HandleFunc("DELETE /v1/config/{key}", h.resetConfig)
 
-	return mux
+	// Outermost first. Recovery wraps everything so a panic anywhere becomes a
+	// 500; logging sits above the security checks so refusals are recorded;
+	// Host runs before Origin and both run before authentication, because an
+	// unauthenticated probe is exactly what they exist to turn away.
+	return chain(mux,
+		recovering(deps.Logger),
+		logging(deps.Logger),
+		hostAllowlist(deps.AllowedHosts, deps.Logger),
+		originCheck(deps.AllowedOrigins, deps.Logger),
+		requireToken(deps.Auth, deps.Logger),
+	)
 }
 
 type handlers struct{ deps Deps }

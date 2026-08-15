@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -56,6 +58,24 @@ func (f *fakeConfigService) Reset(_ context.Context, key string) error {
 	return f.resetErr
 }
 
+// Secret settings exist for the API token's hash and are unreachable from a
+// handler. The API package never calls these; they are here only to satisfy the
+// interface, and returning a sentinel makes an accidental call loud.
+func (f *fakeConfigService) ReadSecret(context.Context, string) (string, error) {
+	return "", errors.New("a handler must never read a secret setting")
+}
+
+func (f *fakeConfigService) WriteSecret(context.Context, string, string) error {
+	return errors.New("a handler must never write a secret setting")
+}
+
+// allowAll is a verifier that accepts any token, so handler tests exercise the
+// handler rather than re-testing authentication. The middleware has its own
+// tests.
+type allowAll struct{}
+
+func (allowAll) Verify(context.Context, string) (bool, error) { return true, nil }
+
 func do(t *testing.T, svc *fakeConfigService, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -66,10 +86,25 @@ func do(t *testing.T, svc *fakeConfigService, method, target, body string) *http
 		reader = strings.NewReader(body)
 	}
 
-	req := httptest.NewRequest(method, target, reader)
+	// A literal IP for the Host: it cannot be DNS-rebound, so the host allowlist
+	// passes it and these tests stay about the handlers.
+	req := httptest.NewRequest(method, "http://127.0.0.1:8737"+target, reader)
+	req.Header.Set("Authorization", "Bearer tmk_test")
+
 	rec := httptest.NewRecorder()
-	api.NewRouter(api.Deps{Config: svc}).ServeHTTP(rec, req)
+	api.NewRouter(api.Deps{
+		Config: svc,
+		Health: stubHealth{},
+		Auth:   allowAll{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).ServeHTTP(rec, req)
 	return rec
+}
+
+type stubHealth struct{}
+
+func (stubHealth) Snapshot(context.Context) domain.Health {
+	return domain.Health{Status: "ok"}
 }
 
 func TestListConfig(t *testing.T) {

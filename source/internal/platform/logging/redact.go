@@ -31,7 +31,11 @@ var authHeaderPattern = regexp.MustCompile(
 // credentialPrefixes are the credential families tumika recognises by shape:
 // sk-ant-oat01-… is the subscription OAuth token minted by `claude setup-token`,
 // sk-ant-api03-… is an API key.
-var credentialPrefixes = []string{"sk-ant-"}
+//
+// tmk_ is tumika's own API token: it gets the same shape-based protection as
+// the provider credentials, because it grants full access to everything they
+// protect.
+var credentialPrefixes = []string{"sk-ant-", "tmk_"}
 
 const (
 	// minTokenChars is how much credential-shaped material must follow a prefix
