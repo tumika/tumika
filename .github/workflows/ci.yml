@@ -118,6 +118,16 @@ jobs:
         with:
           tests-mode: skip
           go-report: coverage.out
+          # With a Semgrep token bulwark runs `semgrep ci` — Semgrep's own
+          # diff-aware mode — instead of `semgrep scan`, and reports to the
+          # AppSec Platform dashboard. GitHub withholds secrets from Dependabot
+          # events, so those PRs fall back to the token-less path; bulwark scopes
+          # that one to the PR's diff itself, which is what the `fetch-depth: 0`
+          # above is for.
+          semgrep-app-token: ${{ secrets.SEMGREP_APP_TOKEN }}
+          # Codecov is dashboard and history only, and is non-blocking. The
+          # pass/fail coverage gate is `bulwark coverage` itself.
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
   # The single job the branch-protection ruleset actually requires. Individual
   # job names are an implementation detail that changes as CI evolves —
