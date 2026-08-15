@@ -1,0 +1,113 @@
+// Package cli implements tumika's command-line interface.
+//
+// The CLI is an HTTP client of the daemon, not a second entry point into the
+// services (ADR-0004). Commands that act on daemon state talk to the API; only
+// the commands that must run before a daemon exists — install, version — touch
+// the local machine directly.
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+
+	"github.com/spf13/cobra"
+
+	"github.com/tumika/tumika/source/internal/platform/buildinfo"
+	"github.com/tumika/tumika/source/internal/platform/logging"
+	"github.com/tumika/tumika/source/internal/platform/paths"
+)
+
+// globals holds what every command needs, populated once in the root command's
+// PersistentPreRunE so that subcommands never re-parse flags or re-resolve the
+// layout.
+type globals struct {
+	home      string
+	logLevel  string
+	logFormat string
+
+	paths  paths.Paths
+	logger *slog.Logger
+}
+
+// Execute runs the CLI and returns the process exit code. ctx is cancelled on
+// SIGINT/SIGTERM, so a command that respects it shuts down gracefully.
+func Execute(ctx context.Context) int {
+	cmd := newRootCmd()
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		// Cancellation is how a graceful shutdown ends; it is not a failure to
+		// report as one, and cobra has already printed anything else.
+		if errors.Is(err, context.Canceled) {
+			return 0
+		}
+		return 1
+	}
+	return 0
+}
+
+func newRootCmd() *cobra.Command {
+	g := &globals{}
+
+	cmd := &cobra.Command{
+		Use:   "tumika",
+		Short: "A self-hostable personal assistant daemon",
+		Long: "tumika runs deterministic workflows on a schedule or on events.\n\n" +
+			"It installs and supervises itself, serves a token-authenticated HTTP API,\n" +
+			"and installs and authenticates the LLM providers it drives.",
+		Version:       buildinfo.Version(),
+		SilenceUsage:  true,
+		SilenceErrors: false,
+		// Errors are returned, not printed and exited, so Execute owns the exit
+		// code and a cancelled context can be distinguished from a real failure.
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return g.setup(cmd)
+		},
+	}
+
+	flags := cmd.PersistentFlags()
+	flags.StringVar(&g.home, "home", "",
+		"tumika home directory (overrides $"+paths.HomeEnv+" and the platform default)")
+	flags.StringVar(&g.logLevel, "log-level", "info", "log level: debug, info, warn, error")
+	flags.StringVar(&g.logFormat, "log-format", string(logging.FormatText), "log format: text or json")
+
+	cmd.SetOut(os.Stdout)
+	cmd.SetErr(os.Stderr)
+
+	cmd.AddCommand(newVersionCmd(g))
+
+	return cmd
+}
+
+// setup resolves the filesystem layout and installs the redacting logger. It
+// creates no directories: a read-only command such as `version` must work on a
+// machine where tumika has never been installed.
+func (g *globals) setup(cmd *cobra.Command) error {
+	p, err := paths.Resolve(g.home)
+	if err != nil {
+		return err
+	}
+	g.paths = p
+
+	logger, err := logging.Setup(logging.Options{
+		Level:  g.logLevel,
+		Format: logging.Format(g.logFormat),
+		Output: cmd.ErrOrStderr(),
+	})
+	if err != nil {
+		return err
+	}
+	g.logger = logger
+
+	return nil
+}
+
+// printf writes to the command's configured stdout.
+//
+// errcheck is on, and a failed write to stdout is not something a CLI command
+// can act on — the discard is explicit here, once, rather than at every call
+// site.
+func printf(cmd *cobra.Command, format string, args ...any) {
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), format, args...)
+}

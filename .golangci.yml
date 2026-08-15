@@ -1,0 +1,109 @@
+# golangci-lint configuration (v2 schema).
+#
+# Note: in golangci-lint v2 the old `gosimple` linter was merged into
+# `staticcheck`, so enabling `staticcheck` covers the gosimple checks too.
+#
+# `depguard` is the load-bearing linter here. It is the mechanical enforcement
+# of the layering rules documented in .agents/rules/ and ADR-0004: a forbidden
+# import is a red build rather than a review argument. When a layering rule
+# changes, this file and the corresponding rule file change in the same commit.
+version: "2"
+
+linters:
+  enable:
+    - depguard
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+
+  settings:
+    depguard:
+      rules:
+        # LAYER 1 — API is transport only: decode, call one service method,
+        # encode. It never reaches the database.
+        # See .agents/rules/all-business-logic-lives-in-the-service-layer.md
+        api:
+          files:
+            - "**/source/internal/api/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/repository
+              desc: >-
+                API is transport only. Handlers call exactly one service method;
+                business logic and data access belong in the service layer.
+
+        # LAYER 3 — repositories are data access. They know nothing about the
+        # callers above them.
+        repository:
+          files:
+            - "**/source/internal/repository/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/service
+              desc: >-
+                A repository must not call a service. Data access returns domain
+                types; business logic lives above it.
+            - pkg: github.com/tumika/tumika/source/internal/api
+              desc: >-
+                A repository must not know about transport.
+            - pkg: github.com/tumika/tumika/source/internal/runner
+              desc: >-
+                A repository must not know about its callers.
+
+        # RUNNER — supervised long-lived processes depend on services only.
+        # See .agents/rules/runners-depend-on-services-never-repositories.md
+        runner:
+          files:
+            - "**/source/internal/runner/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/repository
+              desc: >-
+                A runner supplies the schedule, not the query. Call the owning
+                service (UpdateService, ProviderService) instead.
+            - pkg: github.com/tumika/tumika/source/internal/api
+              desc: >-
+                A runner is a caller of services, not of transport.
+
+        # PLATFORM — infrastructure abstractions. Services depend on platform
+        # interfaces; implementations are injected in daemon, the composition
+        # root. The dependency never points the other way.
+        platform:
+          files:
+            - "**/source/internal/platform/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/service
+              desc: >-
+                Platform is infrastructure. Services depend on platform
+                interfaces, never the reverse.
+            - pkg: github.com/tumika/tumika/source/internal/repository
+              desc: >-
+                Platform must not read or write application state.
+            - pkg: github.com/tumika/tumika/source/internal/api
+              desc: >-
+                Platform must not know about transport.
+            - pkg: github.com/tumika/tumika/source/internal/runner
+              desc: >-
+                Platform must not know about its callers.
+
+        # DOMAIN — shared types. Every layer may import it; it imports nothing
+        # of ours, which is what keeps it importable from everywhere without
+        # creating a cycle.
+        domain:
+          files:
+            - "**/source/internal/domain/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal
+              desc: >-
+                domain holds shared types and imports nothing of ours. Anything
+                it needs from another package belongs in domain itself.
+
+        # No cgo, anywhere. Every build is CGO_ENABLED=0 so cross-compiling for
+        # linux/arm64 is free — which is also why the SQLite driver is the pure
+        # Go modernc.org/sqlite.
+        nocgo:
+          files:
+            - "$all"
+          deny:
+            - pkg: "C"
+              desc: >-
+                tumika builds with CGO_ENABLED=0 so its binaries are statically
+                linked and cross-compile for linux/arm64. Do not introduce cgo.
