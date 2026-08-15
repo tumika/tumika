@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tumika/tumika/source/internal/api"
+	"github.com/tumika/tumika/source/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/internal/service"
@@ -37,10 +38,13 @@ type Options struct {
 
 // Daemon owns the process-wide resources: the database and the HTTP server.
 type Daemon struct {
-	opts   Options
-	store  *sqlite.Store
-	config service.ConfigService
-	log    *slog.Logger
+	opts    Options
+	store   *sqlite.Store
+	config  service.ConfigService
+	auth    service.AuthService
+	health  service.HealthService
+	log     *slog.Logger
+	started time.Time
 }
 
 // New opens the database, migrates it, and wires the object graph.
@@ -81,11 +85,24 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// check it in review.
 	configRepo := sqlite.NewConfigRepo(store)
 
+	config := service.NewConfigService(configRepo, store)
+	// AuthService reaches settings through ConfigService rather than taking the
+	// repository: it is owned there, and a second writer would bypass the rules
+	// that live with it.
+	auth := service.NewAuthService(config)
+
+	schemaVersion := func(ctx context.Context) (int64, error) {
+		return sqlite.SchemaVersion(ctx, store)
+	}
+
 	return &Daemon{
-		opts:   opts,
-		store:  store,
-		config: service.NewConfigService(configRepo, store),
-		log:    opts.Logger,
+		opts:    opts,
+		store:   store,
+		config:  config,
+		auth:    auth,
+		health:  service.NewHealthService(buildinfo.Version(), time.Now(), schemaVersion, auth),
+		log:     opts.Logger,
+		started: time.Now(),
 	}, nil
 }
 
@@ -95,6 +112,11 @@ func (d *Daemon) Close() error { return d.store.Close() }
 // ConfigService exposes the config service for the CLI's in-process uses.
 func (d *Daemon) ConfigService() service.ConfigService { return d.config }
 
+// AuthService exposes token management to `tumika token`, which has to work
+// before a daemon is running — on a fresh install there is no token, so there is
+// nothing to authenticate an HTTP call with.
+func (d *Daemon) AuthService() service.AuthService { return d.auth }
+
 // Serve runs the HTTP API until ctx is cancelled, then drains.
 func (d *Daemon) Serve(ctx context.Context) error {
 	addr := d.opts.Listen
@@ -103,6 +125,21 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		if addr, err = service.String(ctx, d.config, service.KeyServerListen); err != nil {
 			return fmt.Errorf("resolve listen address: %w", err)
 		}
+	}
+
+	// Refuse to serve without a token, rather than listening unauthenticated.
+	//
+	// The alternative — minting one automatically at startup — would have to put
+	// the plaintext somewhere the operator can read it, which means a log line
+	// or a file. Both create a copy of a full-access credential that nobody
+	// asked for. Failing with an instruction is worse UX for exactly one command
+	// and better for everything after it.
+	configured, err := d.auth.Configured(ctx)
+	if err != nil {
+		return fmt.Errorf("check the API token: %w", err)
+	}
+	if !configured {
+		return fmt.Errorf("%w: run `tumika token rotate` to create one", service.ErrNoToken)
 	}
 
 	// Listen before announcing, so "listening" in the log means the port is
@@ -127,7 +164,16 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 	warnIfExposed(ctx, d.log, addr)
 
 	srv := &http.Server{
-		Handler: api.NewRouter(api.Deps{Config: d.config, Logger: d.log}),
+		Handler: api.NewRouter(api.Deps{
+			Config:       d.config,
+			Health:       d.health,
+			Auth:         d.auth,
+			Logger:       d.log,
+			AllowedHosts: allowedHosts(listener.Addr().String()),
+			// No browser origin is accepted. The API is not called from a web
+			// page, and there are no CORS headers anywhere to make one work.
+			AllowedOrigins: nil,
+		}),
 		// A client that opens a connection and sends nothing must not hold a
 		// slot indefinitely.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -185,4 +231,20 @@ func warnIfExposed(ctx context.Context, log *slog.Logger, addr string) {
 
 	log.WarnContext(ctx, "listening beyond loopback on plain HTTP; the API token and any submitted credential cross the network in clear text — keep this on a trusted network until TLS lands",
 		"addr", addr)
+}
+
+// allowedHosts is the set of Host header values accepted for a name-based
+// request.
+//
+// Literal IPs are accepted unconditionally by the middleware, so this only has
+// to cover names. "localhost" is the one that matters: it is what a browser and
+// most clients send for a loopback address, and it is also the name an attacker
+// would have to get past to mount a DNS-rebinding attack.
+func allowedHosts(addr string) []string {
+	hosts := []string{"localhost"}
+
+	if host, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) == nil && host != "" {
+		hosts = append(hosts, host)
+	}
+	return hosts
 }

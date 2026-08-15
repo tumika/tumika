@@ -3,6 +3,7 @@ package daemon_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -23,7 +24,7 @@ import (
 // The layer tests use fakes; this one deliberately does not. It is the only
 // thing that proves the wiring between them is right, which is the whole point
 // of building this slice before anything complicated arrives.
-func start(t *testing.T) string {
+func start(t *testing.T) (string, string) {
 	t.Helper()
 
 	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
@@ -43,6 +44,13 @@ func start(t *testing.T) string {
 			t.Errorf("Close: %v", err)
 		}
 	})
+
+	// Every route is authenticated, so a usable daemon needs a token first —
+	// the same order an operator follows on a fresh install.
+	token, err := d.AuthService().Rotate(ctx)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -64,10 +72,10 @@ func start(t *testing.T) string {
 		}
 	})
 
-	return "http://" + listener.Addr().String()
+	return "http://" + listener.Addr().String(), token
 }
 
-func request(t *testing.T, method, url, body string) (int, string) {
+func request(t *testing.T, token, method, url, body string) (int, string) {
 	t.Helper()
 
 	var reader io.Reader
@@ -77,6 +85,9 @@ func request(t *testing.T, method, url, body string) (int, string) {
 	req, err := http.NewRequestWithContext(t.Context(), method, url, reader)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -112,9 +123,9 @@ func settings(t *testing.T, body string) map[string]domain.SettingView {
 // The full round trip: HTTP in, through the service's validation and
 // transaction, into SQLite, and back out again on a fresh request.
 func TestConfigRoundTripsThroughEveryLayer(t *testing.T) {
-	base := start(t)
+	base, token := start(t)
 
-	status, body := request(t, http.MethodGet, base+"/v1/config", "")
+	status, body := request(t, token, http.MethodGet, base+"/v1/config", "")
 	if status != http.StatusOK {
 		t.Fatalf("GET /v1/config = %d: %s", status, body)
 	}
@@ -131,7 +142,7 @@ func TestConfigRoundTripsThroughEveryLayer(t *testing.T) {
 		t.Errorf("default listen = %s", listen.Value)
 	}
 
-	status, body = request(t, http.MethodPatch, base+"/v1/config",
+	status, body = request(t, token, http.MethodPatch, base+"/v1/config",
 		`{"settings":{"update.check_interval":"30m","update.auto_apply":true}}`)
 	if status != http.StatusOK {
 		t.Fatalf("PATCH /v1/config = %d: %s", status, body)
@@ -139,7 +150,7 @@ func TestConfigRoundTripsThroughEveryLayer(t *testing.T) {
 
 	// Read back on a NEW request, so the value has genuinely been through
 	// SQLite rather than being echoed from the write.
-	status, body = request(t, http.MethodGet, base+"/v1/config", "")
+	status, body = request(t, token, http.MethodGet, base+"/v1/config", "")
 	if status != http.StatusOK {
 		t.Fatalf("GET after PATCH = %d: %s", status, body)
 	}
@@ -161,12 +172,12 @@ func TestConfigRoundTripsThroughEveryLayer(t *testing.T) {
 		t.Errorf("auto_apply = %s", after[service.KeyUpdateAutoApply].Value)
 	}
 
-	status, body = request(t, http.MethodDelete, base+"/v1/config/"+service.KeyUpdateCheckInterval, "")
+	status, body = request(t, token, http.MethodDelete, base+"/v1/config/"+service.KeyUpdateCheckInterval, "")
 	if status != http.StatusNoContent {
 		t.Fatalf("DELETE = %d: %s", status, body)
 	}
 
-	_, body = request(t, http.MethodGet, base+"/v1/config", "")
+	_, body = request(t, token, http.MethodGet, base+"/v1/config", "")
 	reset := settings(t, body)[service.KeyUpdateCheckInterval]
 	if reset.IsSet || string(reset.Value) != `"6h"` {
 		t.Errorf("after reset: %+v, want the default and IsSet false", reset)
@@ -176,15 +187,15 @@ func TestConfigRoundTripsThroughEveryLayer(t *testing.T) {
 // Validation has to hold through the real stack, not only against a fake
 // repository — a rejected batch must leave the database untouched.
 func TestInvalidPatchChangesNothing(t *testing.T) {
-	base := start(t)
+	base, token := start(t)
 
-	status, body := request(t, http.MethodPatch, base+"/v1/config",
+	status, body := request(t, token, http.MethodPatch, base+"/v1/config",
 		`{"settings":{"update.auto_apply":true,"update.check_interval":"soon"}}`)
 	if status != http.StatusBadRequest {
 		t.Fatalf("PATCH with a bad duration = %d, want 400: %s", status, body)
 	}
 
-	_, body = request(t, http.MethodGet, base+"/v1/config", "")
+	_, body = request(t, token, http.MethodGet, base+"/v1/config", "")
 	after := settings(t, body)
 	if after[service.KeyUpdateAutoApply].IsSet {
 		t.Error("the valid half of a rejected batch was persisted")
@@ -192,9 +203,9 @@ func TestInvalidPatchChangesNothing(t *testing.T) {
 }
 
 func TestUnknownSettingIsNotFound(t *testing.T) {
-	base := start(t)
+	base, token := start(t)
 
-	status, body := request(t, http.MethodPatch, base+"/v1/config",
+	status, body := request(t, token, http.MethodPatch, base+"/v1/config",
 		`{"settings":{"server.lister":"127.0.0.1:1"}}`)
 	if status != http.StatusNotFound {
 		t.Errorf("PATCH with an unknown key = %d, want 404: %s", status, body)
@@ -209,7 +220,7 @@ func TestSettingsSurviveARestart(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	run := func(fn func(base string)) {
+	run := func(fn func(base, token string)) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -223,6 +234,11 @@ func TestSettingsSurviveARestart(t *testing.T) {
 			}
 		}()
 
+		token, err := d.AuthService().Rotate(ctx)
+		if err != nil {
+			t.Fatalf("Rotate: %v", err)
+		}
+
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("listen: %v", err)
@@ -230,7 +246,7 @@ func TestSettingsSurviveARestart(t *testing.T) {
 		served := make(chan error, 1)
 		go func() { served <- d.ServeListener(ctx, listener) }()
 
-		fn("http://" + listener.Addr().String())
+		fn("http://"+listener.Addr().String(), token)
 
 		cancel()
 		select {
@@ -243,8 +259,8 @@ func TestSettingsSurviveARestart(t *testing.T) {
 		}
 	}
 
-	run(func(base string) {
-		status, body := request(t, http.MethodPatch, base+"/v1/config",
+	run(func(base, token string) {
+		status, body := request(t, token, http.MethodPatch, base+"/v1/config",
 			`{"settings":{"provider.selected":"claude-code"}}`)
 		if status != http.StatusOK {
 			t.Fatalf("PATCH = %d: %s", status, body)
@@ -253,11 +269,92 @@ func TestSettingsSurviveARestart(t *testing.T) {
 
 	// Second daemon, same home: re-opens the database and re-runs migrations,
 	// which must be a no-op.
-	run(func(base string) {
-		_, body := request(t, http.MethodGet, base+"/v1/config", "")
+	run(func(base, token string) {
+		_, body := request(t, token, http.MethodGet, base+"/v1/config", "")
 		selected := settings(t, body)[service.KeyProviderSelected]
 		if !selected.IsSet || string(selected.Value) != `"claude-code"` {
 			t.Errorf("after restart: %+v, want the value written by the previous run", selected)
 		}
 	})
+}
+
+// The daemon refuses to listen without a token rather than serving
+// unauthenticated. Minting one automatically would have to put a full-access
+// credential somewhere readable — a log line or a file — that nobody asked for.
+func TestServeRefusesWithoutAToken(t *testing.T) {
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	defer func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	err = d.Serve(ctx)
+	if !errors.Is(err, service.ErrNoToken) {
+		t.Fatalf("Serve = %v, want service.ErrNoToken", err)
+	}
+	if !strings.Contains(err.Error(), "tumika token rotate") {
+		t.Errorf("the error should say how to fix it, got: %v", err)
+	}
+}
+
+func TestHealthAndVersionEndToEnd(t *testing.T) {
+	base, token := start(t)
+
+	status, body := request(t, token, http.MethodGet, base+"/v1/health", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/health = %d: %s", status, body)
+	}
+
+	var health domain.Health
+	if err := json.Unmarshal([]byte(body), &health); err != nil {
+		t.Fatalf("health is not valid JSON (%v): %s", err, body)
+	}
+	if health.Status != "ok" {
+		t.Errorf("Status = %q, warnings %v", health.Status, health.Warnings)
+	}
+	if !health.Database.Reachable || health.Database.SchemaVersion == 0 {
+		t.Errorf("Database = %+v", health.Database)
+	}
+	if !health.Auth.TokenConfigured {
+		t.Error("TokenConfigured = false, but a token was minted")
+	}
+	// Whatever else health reports, it must never carry the credential itself.
+	if strings.Contains(body, token) {
+		t.Error("the API token appears in the health response")
+	}
+
+	status, body = request(t, token, http.MethodGet, base+"/v1/version", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/version = %d: %s", status, body)
+	}
+	if !strings.Contains(body, `"claude_cli"`) {
+		t.Errorf("version response is missing the pinned Claude Code version: %s", body)
+	}
+}
+
+// A rotation through the running daemon's own service invalidates the token the
+// caller is holding, immediately.
+func TestRotatingInvalidatesALiveToken(t *testing.T) {
+	base, token := start(t)
+
+	if status, _ := request(t, token, http.MethodGet, base+"/v1/health", ""); status != http.StatusOK {
+		t.Fatalf("the token should work before rotation, got %d", status)
+	}
+
+	status, body := request(t, "", http.MethodGet, base+"/v1/health", "")
+	if status != http.StatusUnauthorized {
+		t.Errorf("no token = %d, want 401: %s", status, body)
+	}
 }
