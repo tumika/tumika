@@ -94,6 +94,7 @@ func newRootCmd() *cobra.Command {
 	cmd.SetErr(os.Stderr)
 
 	cmd.AddCommand(newVersionCmd(g))
+	cmd.AddCommand(newServeCmd(g))
 
 	return cmd
 }

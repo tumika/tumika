@@ -32,6 +32,22 @@ linters:
                 API is transport only. Handlers call exactly one service method;
                 business logic and data access belong in the service layer.
 
+        # LAYER 2 — services own business logic, and depend on repository
+        # INTERFACES rather than on whichever database implements them.
+        service:
+          files:
+            - "**/source/internal/service/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/repository/sqlite
+              desc: >-
+                A service takes the repository interfaces it owns; only daemon,
+                the composition root, knows which implementation is behind them.
+                This is what lets business logic be tested against in-memory
+                fakes with no database — the payoff the layering exists for.
+            - pkg: github.com/tumika/tumika/source/internal/api
+              desc: >-
+                A service must not know about transport.
+
         # LAYER 3 — repositories are data access. They know nothing about the
         # callers above them.
         repository:

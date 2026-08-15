@@ -101,7 +101,19 @@ Each repository has exactly one owning service:
 | `UpdateService` | `UpdateStateRepository` |
 
 These are not aspirations. `depguard` in `.golangci.yml` fails the build on a forbidden
-import, so a layering violation is a red pipeline rather than a review argument.
+import, so a layering violation is a red pipeline rather than a review argument:
+
+| Layer | May not import |
+|---|---|
+| `api` | `repository`, in any form |
+| `service` | `repository/sqlite`, `api` — it takes repository *interfaces*, never an implementation |
+| `repository` | `service`, `api`, `runner` |
+| `runner` | `repository`, `api` |
+| `platform` | `service`, `repository`, `api`, `runner` |
+| `domain` | anything but the standard library and itself |
+
+`daemon` is the exception, and that is the point: it is the composition root, so it is the only
+package that may name a concrete implementation.
 
 ## Rules
 
