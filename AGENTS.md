@@ -180,7 +180,9 @@ the TUI it parses are never out of step.
 - **Always:** run `go build ./...`, `go test -race ./...`, `golangci-lint run ./...` and
   `bulwark scan` before proposing a PR; write a goose migration and regenerate sqlc in the same
   commit as any schema change; keep `.golangci.yml`'s depguard rules in step with
-  `.agents/rules/`.
+  `.agents/rules/`; write commit messages **and pull request titles** as
+  [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) — PRs are squash-merged,
+  so the title is the commit that lands on `main`.
 - **Ask first:** changing the Go version, moving code out of `/source`, adding a third
   provider, altering the release archive layout (the raw-binary archive is what self-update
   fetches), or editing CI.
