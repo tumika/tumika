@@ -1,0 +1,62 @@
+# Repository governance for gt. This file is the source of truth; run
+# 'gt repo sync' to render it, and 'gt repo check' to verify.
+#
+# Shared policy (Dependabot cooldown, commit-message prefixes, the weekly sync
+# schedule) lives in gt's templates, not here, so it stays consistent across
+# every governed repo.
+#
+# checks.required lists the checks gt's gate waits on. Do not list the gate
+# itself — it is the aggregator, and branch protection requires only it.
+
+gt_version: v0.7.0
+dependabot:
+  - ecosystem: github-actions
+    directory: /
+  - ecosystem: gomod
+    directory: /
+checks:
+  timeout_minutes: 30
+  # Only ci.yml's own aggregator. It already requires lint, sqlc, build & test
+  # and bulwark through `needs:`, so listing those leaves would make gt's gate
+  # poll five checks to learn what one of them already reports.
+  #
+  # `conventional commit` is gone along with pr-title.yml: gt's gate performs
+  # that check now, including the revert allowance and case-insensitive
+  # matching that workflow was written for.
+  required:
+    - PR Gate
+  optional: []
+dependabot_auto_merge:
+  enabled: true
+  schedule: 0 1 * * *
+  max_bump: minor
+  delete_branch: true
+conventional_commits:
+  enabled: true
+  scope: pr_title
+  types:
+    - feat
+    - fix
+    - docs
+    - style
+    - refactor
+    - perf
+    - test
+    - build
+    - ci
+    - chore
+    - revert
+settings:
+  merge:
+    squash: true
+    merge_commit: false
+    rebase: false
+    delete_branch_on_merge: true
+  branch_protection:
+    branch: main
+    required_approvals: 0
+    require_up_to_date: true
+files:
+  - gate
+  - sync
+  - dependabot-auto-merge

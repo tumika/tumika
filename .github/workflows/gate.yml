@@ -1,0 +1,34 @@
+# Managed by gt — edit .gt-repo.yaml, then run `gt repo sync`.
+#
+# Thin caller. All gate logic lives in gt's reusable workflow, pinned to the
+# moving v0 tag, so gate changes reach this repo without editing this file.
+# That matters: GITHUB_TOKEN cannot write .github/workflows/**, so a workflow
+# that had to be rewritten on every policy change could never self-update.
+#
+# Branch protection requires exactly one check: "PR / Gate".
+# Reusable workflows report as "<caller job> / <called job>", which is why the
+# caller job below is named PR and gt's called job is named Gate.
+name: PR
+
+on:
+  pull_request:
+    branches: [main]
+    # `edited` is load-bearing when the PR title is enforced: without it,
+    # correcting a rejected title leaves the check red until an unrelated push.
+    # The gate runs no builds of its own — those live in the repo's own
+    # workflows with their own triggers — so re-running it on a title edit is
+    # cheap, and the aggregation step finds the other checks already concluded.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+# A called reusable workflow can only narrow these, never widen them.
+# pull-requests: read is what lets the gate read the PR's own check results;
+# without it the aggregation sees nothing and waits out the full timeout.
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  pull-requests: read
+
+jobs:
+  PR:
+    uses: pedromvgomes/gt/.github/workflows/reusable-gate.yml@v0

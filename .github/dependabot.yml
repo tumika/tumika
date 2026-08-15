@@ -1,40 +1,40 @@
-# Dependabot's commit message is also its PR title, and PRs here are
-# squash-merged — so without `commit-message.prefix` every dependency update
-# would land on main outside the Conventional Commits convention
-# (.agents/rules/every-commit-and-pr-title-is-a-conventional-commit.md), and
-# would be rejected by the PR Title workflow. `include: scope` appends the
-# dependency scope, producing e.g. `build(deps): bump golang.org/x/mod …`.
+# Managed by gt — edit .gt-repo.yaml, then run `gt repo sync`.
+#
+# Shared policy (cooldown, commit-message prefix, schedule) lives in gt's
+# template, not here, so changing it for every repo is a one-line edit in gt.
+#
+# The 7-day cooldown is the supply-chain guard: by the time a PR exists,
+# the upstream release has been in the wild long enough to surface yanks and
+# compromised publishers before an auto-merge-eligible PR lands on the default
+# branch.
 version: 2
 updates:
-  # Go module dependencies.
-  - package-ecosystem: gomod
-    directory: /
+  - package-ecosystem: "github-actions"
+    directory: "/"
     schedule:
-      interval: weekly
-    # Wait a week after a release is published before opening an update PR,
-    # so freshly-cut versions have time to be yanked or superseded.
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `ci(deps): bump …`.
+    commit-message:
+      prefix: "ci"
+      include: scope
     cooldown:
       default-days: 7
-    open-pull-requests-limit: 10
-    # `build` rather than `chore`: these are external dependencies, which is
-    # exactly what the type is for.
-    commit-message:
-      prefix: build
-      prefix-development: build
-      include: scope
+    open-pull-requests-limit: 25
 
-  # GitHub Actions used in our workflows. Every third-party action is
-  # SHA-pinned with a version comment, because a tag their owner controls can
-  # be silently repointed at code we never reviewed; dependabot is what keeps
-  # those pins from going stale.
-  - package-ecosystem: github-actions
-    directory: /
+  - package-ecosystem: "gomod"
+    directory: "/"
     schedule:
-      interval: weekly
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
     cooldown:
       default-days: 7
-    open-pull-requests-limit: 10
-    # `ci`, not `build`: these updates only ever touch workflow files.
-    commit-message:
-      prefix: ci
-      include: scope
+    open-pull-requests-limit: 25
