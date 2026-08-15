@@ -1,0 +1,29 @@
+# sqlc generates compile-time-checked Go from the SQL in
+# source/internal/repository/queries, against the schema in
+# source/internal/repository/migrations (sqlc reads goose migrations natively and
+# ignores their Down sections).
+#
+# The generated code and the queries move together, in one commit — CI runs
+# `sqlc diff` and fails when they disagree. See
+# .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md.
+#
+# Nothing here is hand-edited. The repository wrappers that turn these row
+# structs into domain types live beside the generated files and are.
+version: "2"
+sql:
+  - engine: sqlite
+    schema: source/internal/repository/migrations
+    queries: source/internal/repository/queries
+    gen:
+      go:
+        package: sqlite
+        out: source/internal/repository/sqlite
+        # A List that finds nothing returns an empty slice rather than nil, so
+        # the layers above do not each have to decide what nil means.
+        emit_empty_slices: true
+        # We declare our own interfaces in the repository package; a generated
+        # Querier would be a second, competing definition.
+        emit_interface: false
+        # Row structs never cross the API boundary — handlers encode domain
+        # types — so JSON tags on them would only invite that mistake.
+        emit_json_tags: false
