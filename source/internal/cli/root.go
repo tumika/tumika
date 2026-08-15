@@ -53,13 +53,21 @@ func (g *globals) Paths() (paths.Paths, error) {
 // Execute runs the CLI and returns the process exit code. ctx is cancelled on
 // SIGINT/SIGTERM, so a command that respects it shuts down gracefully.
 func Execute(ctx context.Context) int {
-	cmd := newRootCmd()
+	return execute(ctx, newRootCmd())
+}
+
+// execute is Execute with the command injected, so the exit-code and
+// error-reporting rules can be tested without building the real command tree.
+func execute(ctx context.Context, cmd *cobra.Command) int {
 	if err := cmd.ExecuteContext(ctx); err != nil {
-		// Cancellation is how a graceful shutdown ends; it is not a failure to
-		// report as one, and cobra has already printed anything else.
+		// Cancellation is how a graceful shutdown ends. Reported as neither an
+		// error line nor a non-zero exit: a journal that logs "Error: context
+		// canceled" on every clean stop teaches operators to ignore the word,
+		// and any log-scraping alert fires on every restart.
 		if errors.Is(err, context.Canceled) {
 			return 0
 		}
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Error:", err)
 		return 1
 	}
 	return 0
@@ -74,9 +82,12 @@ func newRootCmd() *cobra.Command {
 		Long: "tumika runs deterministic workflows on a schedule or on events.\n\n" +
 			"It installs and supervises itself, serves a token-authenticated HTTP API,\n" +
 			"and installs and authenticates the LLM providers it drives.",
-		Version:       buildinfo.Version(),
-		SilenceUsage:  true,
-		SilenceErrors: false,
+		Version:      buildinfo.Version(),
+		SilenceUsage: true,
+		// Errors are printed by Execute, not by cobra: cobra prints before
+		// returning, so a cancelled context produced an "Error:" line on stderr
+		// AND exit code 0. See Execute.
+		SilenceErrors: true,
 		// Errors are returned, not printed and exited, so Execute owns the exit
 		// code and a cancelled context can be distinguished from a real failure.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {

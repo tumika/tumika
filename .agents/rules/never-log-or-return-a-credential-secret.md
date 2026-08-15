@@ -51,6 +51,15 @@ The one thing a writer-level scrub cannot catch is an encoding that transforms t
 to any pattern and trivially reversible. That case is handled in `redactAttr`, before an encoder
 sees it. Both halves are covered by tests that were verified to fail when either is removed.
 
+**A credential is protected by its shape OR by its name, and the name check has to reach
+everywhere a name appears.** `sk-ant-…` is caught by shape. Anything else — a future provider's
+token, tumika's own API token — is caught only because it was logged under an honest name, so
+that check applies to the attribute key, to a group's own key, and to struct fields and map keys
+inside a logged value. All three of the latter leaked at one point: a group key was skipped on
+the reasoning that its sub-keys would be checked, and a value's fields were never inspected at
+all. Numeric and boolean fields are exempt, because redacting a struct wholesale for having a
+`TokenCount int` costs real information and protects nothing.
+
 **Sealing is bound to its row.** `Sealer.Seal(plaintext, aad)` takes the AAD
 `provider_id|kind`, so ciphertext cannot be transplanted from one credential row to another —
 opening it against a different row fails authentication rather than yielding a token under the

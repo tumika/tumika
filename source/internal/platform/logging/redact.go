@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"strings"
 )
@@ -334,7 +335,13 @@ func (h *redactHandler) WithGroup(name string) slog.Handler {
 func redactAttr(a slog.Attr) slog.Attr {
 	v := a.Value.Resolve()
 
-	if isSensitiveKey(a.Key) && v.Kind() != slog.KindGroup {
+	// A sensitive key redacts whatever it holds, groups included.
+	//
+	// Groups used to be exempted here, on the reasoning that the recursion
+	// below would check their sub-keys. It does — but the GROUP's own key was
+	// then never checked at all, so slog.Group("token", "value", secret)
+	// passed: "token" was skipped, and "value" is not itself a sensitive name.
+	if isSensitiveKey(a.Key) {
 		return slog.String(a.Key, Placeholder)
 	}
 
@@ -359,6 +366,17 @@ func redactAttr(a slog.Attr) slog.Attr {
 			return slog.String(a.Key, Redact(string(b)))
 		}
 
+		// Name-based protection has to reach INSIDE the value, not just its
+		// attribute key. A struct with a Secret field, or a map with an
+		// "api_key" entry, carries a credential under an honest name — and if
+		// its format is one no pattern recognises, shape-based redaction cannot
+		// help. This is the case the package doc calls "logs a whole struct",
+		// and it is exactly when the format is unfamiliar that the backstop has
+		// to work.
+		if hasSensitiveName(reflect.ValueOf(v.Any()), 0) {
+			return slog.String(a.Key, Placeholder)
+		}
+
 		// Otherwise keep the value's own type, so structured output stays
 		// structured, and let the writer-level scrub in New catch anything whose
 		// serialised form reveals more than %+v does. Deciding here on the
@@ -373,5 +391,87 @@ func redactAttr(a slog.Attr) slog.Attr {
 
 	default:
 		return slog.Attr{Key: a.Key, Value: v}
+	}
+}
+
+// maxReflectDepth bounds how far into a value the name search descends. It is
+// also the cycle guard: a self-referential pointer terminates here rather than
+// spinning.
+const maxReflectDepth = 6
+
+// hasSensitiveName reports whether v is, or contains, a field or map key whose
+// NAME says it holds a credential.
+//
+// The whole value is then redacted rather than the offending field. A struct
+// carrying a secret should not be logged wholesale in the first place; replacing
+// it entirely is both simpler and safer than reconstructing a partially-scrubbed
+// copy, and the call site that wanted detail can log a hint instead.
+func hasSensitiveName(v reflect.Value, depth int) bool {
+	if depth > maxReflectDepth || !v.IsValid() {
+		return false
+	}
+
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return false
+		}
+		return hasSensitiveName(v.Elem(), depth+1)
+
+	case reflect.Struct:
+		t := v.Type()
+		for i := range t.NumField() {
+			f := t.Field(i)
+			if isSensitiveKey(f.Name) && mayHoldSecret(f.Type) {
+				return true
+			}
+			// Unexported fields cannot be read, but %+v prints them, so their
+			// contents still reach the log and still have to be searched. Only
+			// exported ones can be descended into.
+			if f.IsExported() && hasSensitiveName(v.Field(i), depth+1) {
+				return true
+			}
+		}
+		return false
+
+	case reflect.Map:
+		for _, key := range v.MapKeys() {
+			if key.Kind() == reflect.String && isSensitiveKey(key.String()) &&
+				mayHoldSecret(v.Type().Elem()) {
+				return true
+			}
+			if hasSensitiveName(v.MapIndex(key), depth+1) {
+				return true
+			}
+		}
+		return false
+
+	case reflect.Slice, reflect.Array:
+		for i := range v.Len() {
+			if hasSensitiveName(v.Index(i), depth+1) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+// mayHoldSecret reports whether a type could carry credential material.
+//
+// Numbers and booleans cannot, which keeps an honest field like `TokenCount int`
+// or `HasCredential bool` from redacting the struct it lives in — over-redaction
+// is a real cost, not a free safety margin.
+func mayHoldSecret(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return false
+	default:
+		return true
 	}
 }

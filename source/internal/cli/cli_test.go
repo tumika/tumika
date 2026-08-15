@@ -2,9 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 
 	"github.com/tumika/tumika/source/internal/platform/paths"
 )
@@ -126,5 +131,56 @@ func TestInvalidLogLevelIsRejected(t *testing.T) {
 func TestInvalidLogFormatIsRejected(t *testing.T) {
 	if _, _, err := run(t, "--log-format", "yaml", "version"); err == nil {
 		t.Fatal("an unknown log format must be an error")
+	}
+}
+
+// A cancelled context is how a graceful shutdown ends. It must produce neither a
+// non-zero exit nor an "Error:" line: a journal that logs one on every clean
+// stop teaches operators to ignore the word, and log-scraping alerts fire on
+// every restart.
+func TestCancellationIsNotReportedAsAFailure(t *testing.T) {
+	var errOut bytes.Buffer
+	cmd := &cobra.Command{
+		Use:           "fake",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE:          func(*cobra.Command, []string) error { return context.Canceled },
+	}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(&errOut)
+
+	if code := execute(context.Background(), cmd); code != 0 {
+		t.Errorf("exit code = %d, want 0 for a cancelled context", code)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("cancellation printed to stderr: %q", errOut.String())
+	}
+}
+
+// A real failure still has to be both reported and non-zero — the previous
+// behaviour relied on cobra printing, which is what caused the cancellation
+// case above to print too.
+func TestRealErrorsAreReportedAndNonZero(t *testing.T) {
+	var errOut bytes.Buffer
+	cmd := &cobra.Command{
+		Use:           "fake",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE:          func(*cobra.Command, []string) error { return errors.New("the disk is full") },
+	}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(&errOut)
+
+	if code := execute(context.Background(), cmd); code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "the disk is full") {
+		t.Errorf("stderr = %q, want the error reported", errOut.String())
+	}
+}
+
+func TestRootCommandSilencesCobrasOwnErrorPrinting(t *testing.T) {
+	if !newRootCmd().SilenceErrors {
+		t.Error("cobra must not print errors itself; Execute decides what is a failure")
 	}
 }

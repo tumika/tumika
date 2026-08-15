@@ -14,14 +14,17 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 )
 
 // HomeEnv overrides the resolved home directory. The systemd unit and the
 // container image both set it explicitly rather than relying on detection.
 const HomeEnv = "TUMIKA_HOME"
 
-// ContainerEnv forces containerised behaviour. Detection is a heuristic; this
-// is the escape hatch when it is wrong.
+// ContainerEnv overrides container detection, in BOTH directions. Detection is
+// a heuristic, and an escape hatch that only forces the behaviour on is half an
+// escape hatch: an operator running in a container with a bind-mounted host home
+// has an equally real need to turn it off.
 const ContainerEnv = "TUMIKA_CONTAINER"
 
 // dirPerm is used for every directory tumika creates. The database, the sealed
@@ -140,7 +143,15 @@ func defaultHome() (string, error) {
 // disables itself when it is true: the image is the unit of deployment, and a
 // container that rewrites itself no longer matches its tag (ADR-0003).
 func InContainer() bool {
-	if os.Getenv(ContainerEnv) != "" {
+	// Parsed rather than tested for emptiness. `TUMIKA_CONTAINER=0` previously
+	// meant "yes", which silently relocated the home directory and disabled
+	// self-update for someone who had asked for the opposite.
+	if v := os.Getenv(ContainerEnv); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+		// Unparseable but set — "yes", "on", "1 " — is taken as intent to force
+		// it on. Someone who set the variable at all meant something by it.
 		return true
 	}
 	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
