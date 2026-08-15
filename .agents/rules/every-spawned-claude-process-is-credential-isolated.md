@@ -26,9 +26,20 @@ settings files does.
 reads or mutates the operator's personal Claude Code configuration.
 
 **4. Set `DISABLE_AUTOUPDATER=1`.** Claude Code updates itself by default. tumika pins an exact
-version (currently **2.1.232**) because the login flow parses that version's TUI output; a
-silent self-update is a silent break. The pin is also why the binary is executed by **absolute
-path** — no launcher symlink that could be repointed.
+version — `buildinfo.PinnedClaudeCodeVersion`, the only place that number lives — because the
+login flow parses that version's TUI output; a silent self-update is a silent break. The pin is
+also why the binary is executed by **absolute path**, with no launcher symlink that could be
+repointed.
+
+Bumping the pin is routine and expected (see `AGENTS.md`, "Bumping the pin"). What must never
+happen is the version moving **without** the transcripts and the parser moving with it.
+
+> This one is not hypothetical either, and it did not take long. The version pinned during the
+> design session was 2.1.232. By the time the scaffold was written, the `claude` on that same
+> machine had already moved itself to 2.1.233 — nobody upgraded it, and nothing announced it.
+> That is the entire failure mode, observed once before a single line of the login parser
+> existed. Whatever version the constant names, it is only still true because the autoupdater
+> is off.
 
 **5. Never pass `--bare`.** It does not read `CLAUDE_CODE_OAUTH_TOKEN`, so it silently falls
 through the precedence chain to whatever is next.

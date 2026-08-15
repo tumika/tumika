@@ -123,8 +123,13 @@ implements neither `Installer` nor `InteractiveAuthenticator`.
 
 ## Claude Code facts that are load-bearing
 
-These were probed against the real CLI (pinned at **2.1.232**), and several contradict the
-obvious implementation:
+tumika drives a **pinned** Claude Code build, never whatever is on `PATH`. The exact version is
+the compile-time constant `buildinfo.PinnedClaudeCodeVersion`, which is the single source of
+truth — no document restates the number. The pin moves on a regular cadence, and a version
+copied into prose is a version that goes stale.
+
+The facts below were probed against the real CLI, and several contradict the obvious
+implementation:
 
 - `claude setup-token` prints a ~1-year OAuth token to the terminal and **saves it nowhere**.
   It is an Ink TUI with no flags, so capturing it requires a PTY and text parsing. This is the
@@ -139,6 +144,22 @@ obvious implementation:
 - Claude Code auto-updates itself; that must be disabled (`DISABLE_AUTOUPDATER=1`), because an
   auto-update would silently break the login scrape.
 - `--bare` does not read `CLAUDE_CODE_OAUTH_TOKEN`. Never pass it.
+
+### Bumping the pin
+
+Moving to a newer Claude Code is **routine and expected** — it is part of the ordinary update
+cycle, not a rare event. What is not routine is doing it blind: the pin's whole purpose is that
+the login parser was written against a build we have actually observed. So a bump is one commit
+that changes `buildinfo.PinnedClaudeCodeVersion` **and** re-establishes that claim:
+
+1. Install the new version and re-capture the `setup-token` PTY transcript into `testdata/`.
+2. Re-run the transcript-driven parser tests against it. A changed auth-URL prefix or paste
+   prompt shows up here, which is the point.
+3. Re-run the two-stage `Verify` against a real credential.
+
+If the transcripts still match, the bump is boring — which is the intended outcome most of the
+time. If they do not, the parser changes in the same commit as the pin, so a released binary and
+the TUI it parses are never out of step.
 
 ## Conventions
 
@@ -161,8 +182,8 @@ obvious implementation:
   commit as any schema change; keep `.golangci.yml`'s depguard rules in step with
   `.agents/rules/`.
 - **Ask first:** changing the Go version, moving code out of `/source`, adding a third
-  provider, changing the pinned Claude Code version, altering the release archive layout (the
-  raw-binary archive is what self-update fetches), or editing CI.
+  provider, altering the release archive layout (the raw-binary archive is what self-update
+  fetches), or editing CI.
 - **Never:** introduce cgo; commit `dist/`, a real credential, or a `tumika.db`; log or return
   a credential secret; skip the lint/test gates; merge a PR without being told to.
 

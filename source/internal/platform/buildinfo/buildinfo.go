@@ -29,7 +29,7 @@ var current = Info{
 // drives. It is a compile-time constant on purpose: the interactive login flow
 // parses this version's terminal output, so changing it is a deliberate, tested
 // change rather than a dependency bump.
-const PinnedClaudeCodeVersion = "2.1.232"
+const PinnedClaudeCodeVersion = "2.1.233"
 
 // Info is the complete build identity of the running binary.
 type Info struct {

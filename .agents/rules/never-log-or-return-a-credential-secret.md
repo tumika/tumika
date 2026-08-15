@@ -29,6 +29,16 @@ The PTY transcript is the sharp edge here: it is raw terminal output that *conta
 by construction*. It is redacted **at capture time**, before it reaches `login_sessions.transcript`,
 and again by the log handler. Not one or the other.
 
+**A credential in a transcript is not contiguous, and pattern-matching one is not enough.** Ink
+wraps the token at the terminal width and emits a cursor move in the middle of it, so the bytes
+read `sk-ant-oat01-<65 chars>ESC[1B <29 chars>`. A regex anchored on the prefix matches up to
+the escape and stops. `logging.Redact` therefore *walks* the token across the wrap — continuing
+only when the separator shows evidence of terminal wrapping (an escape sequence or a line
+break) **and** the following run is long enough to be a continuation rather than the next word.
+Both conditions are load-bearing: escapes alone swallow the prose after the token, and length
+alone swallows ordinary words after a space. Anything new that redacts credential material out
+of terminal output goes through `Redact` rather than growing its own pattern.
+
 **Sealing is bound to its row.** `Sealer.Seal(plaintext, aad)` takes the AAD
 `provider_id|kind`, so ciphertext cannot be transplanted from one credential row to another —
 opening it against a different row fails authentication rather than yielding a token under the
