@@ -17,8 +17,9 @@ than the default.
 ## Decisions
 
 - **tumika vendors its own copy of Claude Code** rather than using whatever is on `PATH`. It
-  downloads a **pinned version** (currently `2.1.232`) directly from Anthropic's release
-  bucket, verifies the GPG signature on `manifest.json` against fingerprint
+  downloads a **pinned version** — the compile-time constant
+  `buildinfo.PinnedClaudeCodeVersion`, which is the only place the number lives — directly from
+  Anthropic's release bucket, verifies the GPG signature on `manifest.json` against fingerprint
   `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE` and then the per-platform SHA, and executes it by
   absolute path. No `curl | bash`, no npm, no apt, no launcher symlink.
 - **The auto-updater is disabled** (`DISABLE_AUTOUPDATER=1`). The pin is the contract: the
@@ -66,5 +67,9 @@ than the default.
 - Verification cannot use the obvious signals: `claude auth status --json` returns
   `loggedIn: true` for a bogus token, and `claude -p` returns `subtype: "success"` alongside
   `is_error: true`. Verification keys on `is_error`.
-- Upgrading the pinned Claude Code version is a deliberate, tested change — it can invalidate
-  the golden PTY transcripts — not a routine dependency bump.
+- **Bumping the pin is part of the ordinary update cycle**, and is expected to happen regularly
+  — a pin that never moves is just an old Claude Code. What the pin buys is not immobility but
+  *knowing when the TUI changed*: a bump re-captures the golden PTY transcripts and re-runs the
+  parser against them, so a breaking change to `setup-token`'s output surfaces as a failing test
+  at bump time instead of as a broken login on a user's machine. The version number therefore
+  lives in exactly one place, `buildinfo.PinnedClaudeCodeVersion`; no document restates it.
