@@ -92,11 +92,35 @@ func Resolve(override string) (Paths, error) {
 	}, nil
 }
 
-// MkdirAll creates every directory in the layout, owner-only.
+// MkdirAll creates every directory in the layout, owner-only — and enforces
+// that on directories it did not create.
+//
+// os.MkdirAll applies its mode only to directories it actually creates and is a
+// silent no-op for one that already exists. A distro package, a Docker VOLUME or
+// an admin pre-creating /var/lib/tumika at 0755 would therefore leave the whole
+// tree — the database, the sealed credentials, the fallback master key — readable
+// by every user on the host, with MkdirAll returning nil.
+//
+// A directory that is already owner-only is left untouched, so a correctly
+// prepared volume needs no chmod permission. One that is too permissive is
+// tightened, and a failure to tighten it is fatal: the alternative is carrying
+// on while the guarantee this function exists to provide is false.
 func (p Paths) MkdirAll() error {
 	for _, dir := range []string{p.Home, p.Bin, p.Providers, p.ClaudeConfig, p.Backups, p.Logs, p.Run} {
 		if err := os.MkdirAll(dir, dirPerm); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
+		}
+
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", dir, err)
+		}
+
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			if err := os.Chmod(dir, dirPerm); err != nil {
+				return fmt.Errorf("%s is group- or world-accessible (%#o) and could not be tightened to %#o: %w",
+					dir, perm, dirPerm, err)
+			}
 		}
 	}
 	return nil
@@ -112,11 +136,29 @@ func defaultHome() (string, error) {
 	if v := os.Getenv(HomeEnv); v != "" {
 		return v, nil
 	}
-	if InContainer() {
+	return platformHome(runtime.GOOS, InContainer())
+}
+
+// platformHome is defaultHome with its two environment inputs injected, so the
+// precedence between them can be tested rather than only reasoned about.
+func platformHome(goos string, inContainer bool) (string, error) {
+
+	// Platform support is checked BEFORE container detection. The other order
+	// let a /.dockerenv marker answer for an unsupported OS, so
+	// ErrUnsupportedPlatform became unreachable in exactly the environment where
+	// a wrong answer is hardest to notice — tumika would build its whole state
+	// tree on a platform it does not support.
+	switch goos {
+	case "darwin", "linux":
+	default:
+		return "", fmt.Errorf("%w: %s (tumika supports linux and darwin)", ErrUnsupportedPlatform, goos)
+	}
+
+	if inContainer {
 		return "/var/lib/tumika", nil
 	}
 
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -135,7 +177,8 @@ func defaultHome() (string, error) {
 		return filepath.Join(home, ".local", "state", "tumika"), nil
 
 	default:
-		return "", fmt.Errorf("%w: %s (tumika supports linux and darwin)", ErrUnsupportedPlatform, runtime.GOOS)
+		// Unreachable: the switch above already rejected anything else.
+		return "", fmt.Errorf("%w: %s", ErrUnsupportedPlatform, goos)
 	}
 }
 

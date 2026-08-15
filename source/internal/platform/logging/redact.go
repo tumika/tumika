@@ -339,13 +339,21 @@ func (h *redactHandler) WithGroup(name string) slog.Handler {
 func redactAttr(a slog.Attr) slog.Attr {
 	v := a.Value.Resolve()
 
-	// A sensitive key redacts whatever it holds, groups included.
+	// A sensitive key redacts whatever it holds — unless the value is a kind
+	// that cannot carry a credential.
+	//
+	// isSensitiveKey matches substrings, so "token" also matches input_tokens,
+	// output_tokens and cache_read_tokens. Redacting those destroyed the most
+	// operationally useful telemetry a daemon whose job is driving an LLM will
+	// ever emit, and changed the attribute's type from a number to the string
+	// "[REDACTED]" while doing it. A count is not a credential, and the same
+	// reasoning already exempts numeric struct fields in mayHoldSecret.
 	//
 	// Groups used to be exempted here, on the reasoning that the recursion
 	// below would check their sub-keys. It does — but the GROUP's own key was
 	// then never checked at all, so slog.Group("token", "value", secret)
 	// passed: "token" was skipped, and "value" is not itself a sensitive name.
-	if isSensitiveKey(a.Key) {
+	if isSensitiveKey(a.Key) && valueMayHoldSecret(v) {
 		return slog.String(a.Key, Placeholder)
 	}
 
@@ -460,6 +468,19 @@ func hasSensitiveName(v reflect.Value, depth int) bool {
 
 	default:
 		return false
+	}
+}
+
+// valueMayHoldSecret reports whether a logged value's kind could carry
+// credential material. Groups and KindAny can; a number, a boolean, a duration
+// or a timestamp cannot.
+func valueMayHoldSecret(v slog.Value) bool {
+	switch v.Kind() {
+	case slog.KindInt64, slog.KindUint64, slog.KindFloat64,
+		slog.KindBool, slog.KindDuration, slog.KindTime:
+		return false
+	default:
+		return true
 	}
 }
 

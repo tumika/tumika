@@ -109,3 +109,51 @@ func TestOrdinaryValuesAreUntouched(t *testing.T) {
 		}
 	}
 }
+
+// isSensitiveKey matches substrings, so "token" also matches input_tokens and
+// friends. A count is not a credential, and redacting it destroyed the most
+// operationally useful telemetry a daemon driving an LLM emits — while also
+// changing the attribute from a number to a string.
+func TestUsageCountersSurviveRedaction(t *testing.T) {
+	out := logged(t, func(l *slog.Logger) {
+		l.Info("inference complete",
+			"provider", "claude-code",
+			"input_tokens", 1200,
+			"output_tokens", 340,
+			"cache_read_tokens", 8000,
+			"total_tokens", 9540,
+			"token_count", 42,
+			"credential_age_seconds", 86400,
+			"has_secret", true,
+			"duration_ms", 812)
+	})
+
+	for _, want := range []string{
+		`"input_tokens":1200`,
+		`"output_tokens":340`,
+		`"cache_read_tokens":8000`,
+		`"total_tokens":9540`,
+		`"token_count":42`,
+		`"credential_age_seconds":86400`,
+		`"has_secret":true`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %s to survive — a number cannot be a credential:\n%s", want, out)
+		}
+	}
+}
+
+// The exemption is by VALUE KIND, not by key spelling: a sensitively-named key
+// holding a string is still redacted.
+func TestSensitiveKeysHoldingStringsAreStillRedacted(t *testing.T) {
+	out := logged(t, func(l *slog.Logger) {
+		l.Info("x", "token", unknownFormat, "api_key", unknownFormat, "input_tokens", 5)
+	})
+
+	if strings.Contains(out, unknownFormat) {
+		t.Errorf("a string under a sensitive key survived:\n%s", out)
+	}
+	if !strings.Contains(out, `"input_tokens":5`) {
+		t.Errorf("the counter should have survived alongside:\n%s", out)
+	}
+}

@@ -32,6 +32,27 @@ linters:
                 API is transport only. Handlers call exactly one service method;
                 business logic and data access belong in the service layer.
 
+        # CLI — an HTTP client of the daemon, not a second entry point.
+        #
+        # `daemon` is permitted: `tumika token` and `tumika install` have to work
+        # before a daemon is running, and on a fresh install there is no token to
+        # authenticate an HTTP call with. Everything else goes over the API, so
+        # that one set of business rules serves both a local and a remote daemon
+        # (ADR-0004).
+        cli:
+          files:
+            - "**/source/internal/cli/**"
+          deny:
+            - pkg: github.com/tumika/tumika/source/internal/repository
+              desc: >-
+                The CLI must not reach the database. Commands that need daemon
+                state call the API; the two that run before a daemon exists go
+                through the daemon package's composition root.
+            - pkg: github.com/tumika/tumika/source/internal/api
+              desc: >-
+                The CLI is a CLIENT of the HTTP API, not a caller of its
+                handlers.
+
         # LAYER 2 — services own business logic, and depend on repository
         # INTERFACES rather than on whichever database implements them.
         service:
