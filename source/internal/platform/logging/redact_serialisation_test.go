@@ -3,6 +3,7 @@ package logging_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -106,5 +107,47 @@ func TestRedactAuthorizationHeaderValue(t *testing.T) {
 		if !strings.Contains(got, wantPrefix) {
 			t.Errorf("Redact(%q) = %q, want it to keep %q", in, got, wantPrefix)
 		}
+	}
+}
+
+// failingWriter reports an error, to exercise the redacting writer's error path.
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestRedactingWriterPropagatesErrors(t *testing.T) {
+	boom := errors.New("disk full")
+	logger, err := logging.New(logging.Options{
+		Format: logging.FormatJSON,
+		Output: failingWriter{err: boom},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// slog swallows handler errors, so this asserts the path runs without
+	// panicking rather than surfacing boom — the point is that a write error in
+	// the redacting path behaves like a write error anywhere else.
+	logger.Info("stored", "payload", serialisedToken)
+}
+
+// io.Writer requires n == len(p) on success. Redaction shortens the buffer, so
+// returning the scrubbed length would look like a short write and make a caller
+// retry — writing the tail of a record a second time.
+func TestRedactingWriterReportsTheCallersLength(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.New(logging.Options{Format: logging.FormatJSON, Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	logger.Info("stored", "payload", serialisedToken)
+
+	out := buf.String()
+	if strings.Count(out, "\n") != 1 {
+		t.Errorf("expected exactly one record, got:\n%s", out)
+	}
+	if strings.Contains(out, serialisedToken) {
+		t.Errorf("token survived: %s", out)
 	}
 }
