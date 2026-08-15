@@ -38,6 +38,32 @@ jobs:
         with:
           version: v2.12.2
 
+  sqlc:
+    name: sqlc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      # Installed from source at a pinned version rather than via a third-party
+      # setup action: one fewer action to trust, and the version that generated
+      # the committed code is visible right here. Keep it in step with the
+      # version stamped in the generated files' header.
+      - name: install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+
+      # Fails when the committed generated code disagrees with the queries or
+      # the schema. That is what makes
+      # .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md
+      # mechanical rather than a habit — stale generated code otherwise fails at
+      # the exact query, at runtime, on the one path nobody exercised.
+      - name: sqlc diff
+        run: sqlc diff
+
   build-test:
     name: build & test
     # Both supported platforms, because a meaningful amount of this codebase is
@@ -137,7 +163,6 @@ jobs:
   # gate covers it automatically; the ruleset itself never needs to change.
   #
   # Jobs still to join this list as the capabilities they test arrive:
-  #   sqlc          — `sqlc diff`, with persistence
   #   build         — `goreleaser build --snapshot --clean`, with .goreleaser.yml
   #   images        — shipped image + systemd test-harness image
   #   linux-install — the integration gate that makes the Pi deployment
@@ -145,7 +170,7 @@ jobs:
   pr-gate:
     name: PR Gate
     if: always()
-    needs: [lint, build-test, bulwark]
+    needs: [lint, sqlc, build-test, bulwark]
     runs-on: ubuntu-latest
     steps:
       - name: Require all upstream jobs to have succeeded
