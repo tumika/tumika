@@ -3,6 +3,7 @@ package logging
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -11,14 +12,20 @@ import (
 // Placeholder replaces anything the redactor recognises as a secret.
 const Placeholder = "[REDACTED]"
 
-// secretPatterns match secret material whose shape survives a regex — currently
-// just an Authorization header carrying tumika's own API token.
+// authHeaderPattern matches the credential inside an Authorization header —
+// tumika's own API token, as it would appear in a logged request.
 //
-// Anthropic credentials are NOT matched here; see redactPrefixedTokens for why a
-// pattern cannot do that job.
-var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}`),
-}
+// It is deliberately anchored on the header name. An earlier version matched a
+// bare `(bearer|basic)\s+<8 or more chars>`, which also matches ordinary prose:
+// "basic authentication required" redacted to "[REDACTED] required", and
+// "bearer capability negotiation failed" to "[REDACTED] negotiation failed".
+// Silently eating log content is its own failure — the point of redaction is
+// that the surviving line still says what happened.
+//
+// Anthropic credentials are NOT matched by any pattern; see redactPrefixedTokens
+// for why a regex cannot do that job.
+var authHeaderPattern = regexp.MustCompile(
+	`(?i)((?:proxy-)?authorization"?\s*[:=]\s*"?(?:bearer|basic)\s+)[A-Za-z0-9._\-+/=]{8,}`)
 
 // credentialPrefixes are the credential families tumika recognises by shape:
 // sk-ant-oat01-… is the subscription OAuth token minted by `claude setup-token`,
@@ -219,9 +226,9 @@ var sensitiveKeys = []string{
 // against mistakes, never a licence to pass a secret to a log call.
 func Redact(s string) string {
 	s = redactPrefixedTokens(s)
-	for _, re := range secretPatterns {
-		s = re.ReplaceAllString(s, Placeholder)
-	}
+	// ${1} keeps the header name and scheme, so the line still shows that an
+	// Authorization header was present and what kind — only its value goes.
+	s = authHeaderPattern.ReplaceAllString(s, "${1}"+Placeholder)
 	return s
 }
 
@@ -243,6 +250,42 @@ func isSensitiveKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// redactWriter scrubs the bytes a handler has already serialised.
+//
+// This is the layer that actually closes the hole, and it exists because
+// attribute-level redaction fundamentally cannot: the handler serialises the
+// ORIGINAL value, so any inspection we do beforehand is a guess about what the
+// encoder will produce. A type whose %+v masks a secret but whose MarshalJSON
+// reveals it passed every attribute check and then wrote the token verbatim.
+//
+// Scrubbing the encoded output makes that class of mistake impossible for
+// anything that appears literally, whatever its Go type and whichever handler
+// encoded it. It does not help when the encoding transforms the bytes — base64
+// of a []byte being the case that matters — which is why redactAttr still
+// handles that one before it reaches an encoder.
+//
+// slog's built-in handlers assemble a whole record in a buffer and issue exactly
+// one Write per record, so a credential cannot be split across two calls here.
+// A custom handler that wrote a record piecemeal would break that assumption;
+// tumika does not have one, and this comment is why it should not grow one.
+type redactWriter struct {
+	inner io.Writer
+}
+
+func (w redactWriter) Write(p []byte) (int, error) {
+	scrubbed := Redact(string(p))
+	if scrubbed == string(p) {
+		return w.inner.Write(p)
+	}
+	if _, err := w.inner.Write([]byte(scrubbed)); err != nil {
+		return 0, err
+	}
+	// Report the caller's length, not the scrubbed one. io.Writer requires
+	// n == len(p) on success, and redaction changes the length — returning the
+	// shorter count would look like a short write and make callers retry.
+	return len(p), nil
 }
 
 // redactHandler wraps another slog.Handler and scrubs every record passing
@@ -308,6 +351,20 @@ func redactAttr(a slog.Attr) slog.Attr {
 		return slog.String(a.Key, Redact(v.String()))
 
 	case slog.KindAny:
+		// []byte is the case that defeats every textual scrub downstream: a JSON
+		// handler base64-encodes it, so a token leaves as
+		// "c2stYW50LW9hdDAx…" — which no pattern recognises and anyone can
+		// reverse. Render it as text here, before an encoder ever sees it.
+		if b, ok := v.Any().([]byte); ok {
+			return slog.String(a.Key, Redact(string(b)))
+		}
+
+		// Otherwise keep the value's own type, so structured output stays
+		// structured, and let the writer-level scrub in New catch anything whose
+		// serialised form reveals more than %+v does. Deciding here on the
+		// strength of %+v alone was a real hole: a type with a masking String()
+		// and a revealing MarshalJSON passed this check and then serialised the
+		// secret verbatim.
 		rendered := fmt.Sprintf("%+v", v.Any())
 		if scrubbed := Redact(rendered); scrubbed != rendered {
 			return slog.String(a.Key, scrubbed)

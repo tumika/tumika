@@ -49,6 +49,11 @@ func New(opts Options) (*slog.Logger, error) {
 	if out == nil {
 		out = os.Stderr
 	}
+	// Every handler writes through the redacting writer. Attribute-level
+	// redaction cannot see what an encoder will produce from a value it did not
+	// serialise, so this is the layer that makes the guarantee hold regardless
+	// of type or handler. See redactWriter.
+	out = redactWriter{inner: out}
 
 	handlerOpts := &slog.HandlerOptions{Level: level, AddSource: opts.AddSource}
 

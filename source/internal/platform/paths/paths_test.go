@@ -62,6 +62,8 @@ func TestEverythingLivesUnderHome(t *testing.T) {
 }
 
 func TestResolveMakesRelativePathsAbsolute(t *testing.T) {
+	t.Setenv(paths.HomeEnv, "")
+
 	p, err := paths.Resolve("relative-home")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -117,6 +119,7 @@ func TestMkdirAllIsIdempotent(t *testing.T) {
 }
 
 func TestInContainerHonoursEnv(t *testing.T) {
+	t.Setenv(paths.HomeEnv, "")
 	t.Setenv(paths.ContainerEnv, "1")
 	if !paths.InContainer() {
 		t.Errorf("InContainer() = false with %s set", paths.ContainerEnv)
@@ -126,6 +129,11 @@ func TestInContainerHonoursEnv(t *testing.T) {
 // A container resolves to a fixed home rather than a user directory: the daemon
 // there has no user session, and the data volume is mounted at a known place.
 func TestContainerHomeIsFixed(t *testing.T) {
+	// TUMIKA_HOME is checked before container detection, so without clearing it
+	// this test reads the developer's ambient environment — and TUMIKA_HOME is
+	// precisely the variable the systemd unit sets, so anyone who exports it
+	// would get a red suite unrelated to their change.
+	t.Setenv(paths.HomeEnv, "")
 	t.Setenv(paths.ContainerEnv, "1")
 
 	p, err := paths.Resolve("")

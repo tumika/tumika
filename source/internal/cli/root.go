@@ -28,8 +28,26 @@ type globals struct {
 	logLevel  string
 	logFormat string
 
-	paths  paths.Paths
-	logger *slog.Logger
+	resolved    paths.Paths
+	resolvedErr error
+	didResolve  bool
+	logger      *slog.Logger
+}
+
+// Paths resolves the filesystem layout on first use.
+//
+// Deliberately lazy. Resolving in PersistentPreRunE meant every command failed
+// when the home directory could not be determined — including `version`, which
+// needs no paths at all. That is not just a developer-ergonomics problem: the
+// updater execs `<staged> version` to assert the semver before replacing the
+// live binary (ADR-0003), and a supervised daemon may have no HOME set. A
+// pre-flight that cannot run is an update that cannot happen.
+func (g *globals) Paths() (paths.Paths, error) {
+	if !g.didResolve {
+		g.resolved, g.resolvedErr = paths.Resolve(g.home)
+		g.didResolve = true
+	}
+	return g.resolved, g.resolvedErr
 }
 
 // Execute runs the CLI and returns the process exit code. ctx is cancelled on
@@ -80,16 +98,10 @@ func newRootCmd() *cobra.Command {
 	return cmd
 }
 
-// setup resolves the filesystem layout and installs the redacting logger. It
-// creates no directories: a read-only command such as `version` must work on a
-// machine where tumika has never been installed.
+// setup installs the redacting logger, and nothing else. Path resolution is
+// deferred to Paths so that a command which does not need the filesystem cannot
+// be broken by it.
 func (g *globals) setup(cmd *cobra.Command) error {
-	p, err := paths.Resolve(g.home)
-	if err != nil {
-		return err
-	}
-	g.paths = p
-
 	logger, err := logging.Setup(logging.Options{
 		Level:  g.logLevel,
 		Format: logging.Format(g.logFormat),
