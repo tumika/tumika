@@ -64,15 +64,69 @@ var ErrNoKey = errors.New("no master key available")
 // LaunchAgent precisely so a session exists, and TUMIKA_MASTER_KEY is the answer
 // where it does not.
 //
-// The Linux systemd-creds backend joins at the service-manager step; until then
-// Linux gets the file, which is what a container would use anyway.
+// On Linux, systemd-creds is preferred when the host actually supports it, and
+// the file store is the fallback — which is what a container gets, and what a
+// non-systemd distribution gets. Availability is PROBED rather than attempted,
+// for the same reason macOS fails closed: a host that briefly cannot reach its
+// TPM must not quietly mint a new key in a file and orphan everything sealed
+// under the old one.
+//
+// The probe is skipped once a sealed blob already exists. A machine that has
+// been running on systemd-creds must keep trying it and FAIL if it cannot — the
+// alternative is a daemon that starts happily on a fresh file key and cannot
+// read a single stored credential.
 func OpenKeyStore(keyFile string) (KeyStore, error) {
+	return chooseKeyStore(runtime.GOOS, keyFile)
+}
+
+// chooseKeyStore is OpenKeyStore with the platform injected.
+//
+// Split out so the Linux branches — including the fail-closed rule below, which
+// is the one that protects against silent data loss — are testable on a Mac.
+// Guarding them behind runtime.GOOS meant a mutation that removed the rule
+// entirely broke no test on the machine this was written on. Mirrors
+// paths.platformHome, which is split for the same reason.
+func chooseKeyStore(goos, keyFile string) (KeyStore, error) {
 	if raw := os.Getenv(MasterKeyEnv); raw != "" {
 		return newEnvKeyStore(raw)
 	}
 
-	if runtime.GOOS == "darwin" {
+	// systemd handed us a decrypted key. It did that because the unit says
+	// LoadCredentialEncrypted=, which `tumika install` only writes after sealing
+	// one — so its presence is as deliberate as the environment override above,
+	// and is checked before any platform default for the same reason.
+	if path := handedOverKeyPath(); path != "" {
+		return newCredsKeyStore(path)
+	}
+
+	if goos == "darwin" {
 		return newKeychainKeyStore()
+	}
+
+	// A sealed blob exists but systemd did not hand anything over.
+	//
+	// Try to open it directly, which succeeds only as root — so `tumika install`
+	// and `tumika token rotate` can still reach the database on a host that has
+	// sealed a key, while the unprivileged daemon cannot.
+	//
+	// If that fails, FAIL. Falling back would mint a fresh key in a file and
+	// produce a daemon that starts cleanly, reports backend "file", and cannot
+	// open a single stored credential — the same data-loss shape macOS already
+	// refuses.
+	if goos == "linux" {
+		sealed := CredentialPathFor(keyFile)
+		if _, err := os.Stat(sealed); err == nil {
+			store, openErr := openSealedDirectly(sealed, nil)
+			if openErr == nil {
+				return store, nil
+			}
+			return nil, fmt.Errorf(
+				"%s exists, so this host seals its master key with systemd-creds, but it "+
+					"could not be opened: %w\nsystemd provides it to the service via "+
+					"LoadCredentialEncrypted=, so run tumika under its unit — or re-run "+
+					"`tumika install` as root to rewrite the unit",
+				sealed, openErr)
+		}
 	}
 
 	return newFileKeyStore(keyFile)
@@ -172,9 +226,9 @@ func (s *fileKeyStore) load() ([]byte, error) {
 }
 
 func (s *fileKeyStore) create() ([]byte, error) {
-	key := make([]byte, KeySize)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate master key: %w", err)
+	key, err := newKey()
+	if err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
@@ -200,7 +254,7 @@ func (s *fileKeyStore) create() ([]byte, error) {
 	if err := tmp.Chmod(0o600); err != nil {
 		return nil, fmt.Errorf("set permissions on %s: %w", tmp.Name(), err)
 	}
-	if _, err := tmp.WriteString(base64.StdEncoding.EncodeToString(key)); err != nil {
+	if _, err := tmp.WriteString(encodeKey(key)); err != nil {
 		return nil, fmt.Errorf("write %s: %w", tmp.Name(), err)
 	}
 	if err := tmp.Sync(); err != nil {
@@ -238,6 +292,20 @@ func (s *fileKeyStore) create() ([]byte, error) {
 func (s *fileKeyStore) Key() ([]byte, error) { return s.key, nil }
 func (s *fileKeyStore) Backend() string      { return BackendFile }
 func (s *fileKeyStore) KeyRef() string       { return BackendFile + ":" + s.path }
+
+// newKey mints a fresh master key. Shared by every store that is allowed to
+// create one, so they cannot drift on length or source of randomness.
+func newKey() ([]byte, error) {
+	key := make([]byte, KeySize)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate master key: %w", err)
+	}
+	return key, nil
+}
+
+// encodeKey is the on-disk and on-the-wire form. Standard base64, which
+// decodeKey accepts alongside three other flavours.
+func encodeKey(key []byte) string { return base64.StdEncoding.EncodeToString(key) }
 
 // decodeKey accepts base64 in any of its four flavours and insists on exactly
 // KeySize bytes.
