@@ -567,6 +567,8 @@ type stubUpdates struct {
 	confirmBoot  int
 	confirmed    int
 	confirmBootE error
+	available    string
+	applied      []string
 }
 
 func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) {
@@ -575,8 +577,18 @@ func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) {
 	return s.state, nil
 }
 
-func (s *stubUpdates) Check(context.Context) (string, bool, error) { return "", false, nil }
-func (s *stubUpdates) Apply(context.Context, string) error         { return nil }
+func (s *stubUpdates) Check(context.Context) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.available, s.available != "", nil
+}
+
+func (s *stubUpdates) Apply(_ context.Context, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = append(s.applied, version)
+	return nil
+}
 
 func (s *stubUpdates) ConfirmBoot(context.Context) (bool, error) {
 	s.mu.Lock()
@@ -590,6 +602,12 @@ func (s *stubUpdates) Confirm(context.Context) error {
 	defer s.mu.Unlock()
 	s.confirmed++
 	return nil
+}
+
+func (s *stubUpdates) appliedVersions() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.applied...)
 }
 
 func (s *stubUpdates) counts() (boots, confirms int) {
@@ -731,5 +749,61 @@ func TestAnUnreadableUpdateStateDoesNotStopTheDaemon(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the daemon did not shut down")
+	}
+}
+
+// An operator applying an update over HTTP gets a response FIRST, and then the
+// daemon shuts down so the supervisor relaunches onto the new binary.
+//
+// The order matters: exiting inside the handler would drop the connection, and
+// the operator could not tell a successful update from a crash.
+func TestApplyingAnUpdateOverHTTPRestartsTheDaemon(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{available: "0.2.0"}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	token, err := d.AuthService().Rotate(ctx)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- d.ServeListener(ctx, listener) }()
+
+	base := "http://" + listener.Addr().String()
+	status, body := request(t, token, http.MethodPost, base+"/v1/update/apply", "")
+	if status != http.StatusOK {
+		t.Fatalf("apply = %d: %s", status, body)
+	}
+	if got := updates.appliedVersions(); len(got) != 1 || got[0] != "0.2.0" {
+		t.Errorf("applied %v, want [0.2.0]", got)
+	}
+
+	// The daemon drains and then asks to be restarted — WITHOUT the context
+	// being cancelled, which is what distinguishes this from a shutdown.
+	select {
+	case err := <-served:
+		if !errors.Is(err, daemon.ErrRestartRequired) {
+			t.Errorf("ServeListener = %v, want ErrRestartRequired", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the daemon kept serving after an update was applied")
 	}
 }
