@@ -96,13 +96,15 @@ func validateVersion(version string) error {
 	if version == "" {
 		return fmt.Errorf("%w: no version specified", ErrInvalidVersion)
 	}
-	if !semver.IsValid("v" + version) {
-		return fmt.Errorf("%w: %q is not a version", ErrInvalidVersion, version)
-	}
-	// semver.IsValid already excludes separators, but the intent is worth
-	// stating where a reader is looking for it.
+	// Separators first. semver.IsValid would reject these too, but only as a
+	// side effect of the grammar — and a check that can never fire is a check
+	// nobody can test. This order means the traversal refusal is exercised by
+	// the traversal cases, and says so in the error the operator reads.
 	if strings.ContainsAny(version, `/\`) || version != filepath.Base(version) {
 		return fmt.Errorf("%w: %q contains a path separator", ErrInvalidVersion, version)
+	}
+	if !semver.IsValid("v" + version) {
+		return fmt.Errorf("%w: %q is not a version", ErrInvalidVersion, version)
 	}
 	return nil
 }

@@ -935,3 +935,226 @@ func TestASignatureFromAnExtraKeyInTheRingIsRefused(t *testing.T) {
 		t.Errorf("the error should name the actual signer, got: %v", err)
 	}
 }
+
+// The destination can become usable BETWEEN the fast path and the rename — two
+// daemons installing the same pin at once. That is the real race, and it is
+// fine: whoever won it verified their copy the same way. The distinction the
+// collision branch has to draw is between this and debris, so it is worth
+// exercising the half that a sequential test cannot reach.
+func TestACollisionThatAppearsMidInstallIsAccepted(t *testing.T) {
+	b := newBucket(t)
+	server := b.serve(t)
+	root := t.TempDir()
+
+	inst, err := NewInstaller(root, WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	trust(inst, b.entity)
+
+	// Stand in for the other daemon: it finishes while our download is in
+	// flight, so the destination is empty at the fast path and complete by the
+	// time we rename.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+BinaryName) {
+			dir := filepath.Join(inst.root, b.version)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Errorf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, BinaryName), b.binary, 0o700); err != nil {
+				t.Errorf("write: %v", err)
+			}
+		}
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	proxy := httptest.NewServer(mux)
+	t.Cleanup(proxy.Close)
+	inst.release.baseURL = proxy.URL
+	inst.release.client = proxy.Client()
+
+	result, err := inst.Install(t.Context(), b.version)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !result.AlreadyPresent {
+		t.Error("the winner's complete install was not recognised")
+	}
+	if !usable(result.Path) {
+		t.Errorf("reported %s as installed, but it is not runnable", result.Path)
+	}
+}
+
+// Installed() decides what Path() may hand to the daemon and what Prune() may
+// delete, so it has to ignore everything that is not a published version — not
+// merely the incomplete ones.
+func TestInstalledIgnoresWhatIsNotAVersion(t *testing.T) {
+	root := t.TempDir()
+	inst, err := NewInstaller(root)
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+
+	if err := os.MkdirAll(inst.root, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// A stray file where a version directory would be.
+	if err := os.WriteFile(filepath.Join(inst.root, "README"), []byte("notes"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// A directory whose name is not a version at all.
+	for _, name := range []string{"tmp-download", ".staging-leftover"} {
+		dir := filepath.Join(inst.root, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, BinaryName), []byte("unverified"), 0o700); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	// And one real install, so a test that simply returned nothing would fail.
+	dir := filepath.Join(inst.root, "2.1.233")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, BinaryName), []byte("verified"), 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	installed, err := inst.Installed(t.Context())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if len(installed) != 1 || installed[0] != "2.1.233" {
+		t.Errorf("Installed() = %v, want only the published version", installed)
+	}
+}
+
+// A manifest can carry a good signature and still be unusable. Refusing it as a
+// parse error rather than crashing matters because the bytes are attacker-chosen
+// only up to whatever the signer signed.
+func TestAValidlySignedManifestThatIsNotJSON(t *testing.T) {
+	b := newBucket(t)
+	entity := b.entity
+
+	raw := []byte("this is signed, and it is not a manifest")
+	var sig bytes.Buffer
+	if err := openpgp.ArmoredDetachSign(&sig, entity, bytes.NewReader(raw), nil); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/9.9.9/manifest.json", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(raw)
+	})
+	mux.HandleFunc("/9.9.9/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(sig.Bytes())
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	trust(inst, entity)
+
+	_, err = inst.Install(t.Context(), "9.9.9")
+	if err == nil {
+		t.Fatal("a manifest that is not JSON was accepted")
+	}
+	if !strings.Contains(err.Error(), "parse the manifest") {
+		t.Errorf("the error should name the parse failure, got: %v", err)
+	}
+}
+
+// The manifest verifying says nothing about the binary being served. A bucket
+// missing the artifact must fail, and must leave nothing behind.
+func TestABinaryTheBucketDoesNotServe(t *testing.T) {
+	b := newBucket(t)
+	server := b.serve(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+BinaryName) {
+			http.Error(w, "no such object", http.StatusNotFound)
+			return
+		}
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	proxy := httptest.NewServer(mux)
+	t.Cleanup(proxy.Close)
+
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL(proxy.URL), WithHTTPClient(proxy.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	trust(inst, b.entity)
+
+	if _, err := inst.Install(t.Context(), b.version); err == nil {
+		t.Fatal("a missing binary was not reported")
+	}
+
+	installed, err := inst.Installed(t.Context())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if len(installed) != 0 {
+		t.Errorf("a failed download left something behind: %v", installed)
+	}
+}
+
+// Staging is created under the providers root, so a root the daemon cannot write
+// to has to surface as an error rather than a partial install.
+func TestAStagingDirectoryThatCannotBeCreated(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this test relies on")
+	}
+
+	b := newBucket(t)
+	inst, root := installerFor(t, b)
+
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+
+	if _, err := inst.Install(t.Context(), b.version); err == nil {
+		t.Fatal("an unwritable providers root produced no error")
+	}
+}
+
+// A retention of zero would leave the daemon with no binary to run — an empty
+// SD card and a broken install, which is the worse of the two failures Prune
+// exists to balance. Taken literally it would also delete the version currently
+// executing. It is clamped to one instead.
+func TestPruneNeverEmptiesTheRoot(t *testing.T) {
+	for _, keep := range []int{0, -1} {
+		inst, err := NewInstaller(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewInstaller: %v", err)
+		}
+
+		for _, v := range []string{"2.1.230", "2.1.233"} {
+			dir := filepath.Join(inst.root, v)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, BinaryName), []byte("verified"), 0o700); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+		}
+
+		if err := inst.Prune(t.Context(), keep); err != nil {
+			t.Fatalf("Prune(keep=%d): %v", keep, err)
+		}
+
+		installed, err := inst.Installed(t.Context())
+		if err != nil {
+			t.Fatalf("Installed: %v", err)
+		}
+		if len(installed) != 1 || installed[0] != "2.1.233" {
+			t.Errorf("Prune(keep=%d) left %v, want only the newest", keep, installed)
+		}
+	}
+}
