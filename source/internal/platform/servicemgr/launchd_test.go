@@ -422,3 +422,74 @@ func TestLaunchdEnabledReflectsWhetherLaunchdWillStartIt(t *testing.T) {
 		}
 	}
 }
+
+// A LaunchAgent runs as the operator, who necessarily exists, so there is
+// nothing to prepare — and it must not fail for a platform that has no service
+// account to create.
+func TestLaunchdPrepareIsANoOp(t *testing.T) {
+	rec := newRecorder()
+	mgr, agentDir := newTestLaunchd(t, rec)
+
+	if err := mgr.Prepare(t.Context(), testConfig(t)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("Prepare called launchctl: %v", rec.joined())
+	}
+	entries, err := os.ReadDir(agentDir)
+	if err != nil {
+		t.Fatalf("read the agent directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Prepare wrote %d file(s)", len(entries))
+	}
+}
+
+// An install onto an unwritable agent directory must fail rather than report a
+// service that was never written.
+func TestLaunchdInstallReportsAnUnwritableAgentDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	rec := newRecorder()
+	parent := t.TempDir()
+	agentDir := filepath.Join(parent, "LaunchAgents")
+	if err := os.MkdirAll(agentDir, 0o500); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(agentDir, 0o700) })
+
+	mgr, _ := newTestLaunchd(t, rec, withLaunchdAgentDir(agentDir))
+
+	if err := mgr.Install(t.Context(), testConfig(t)); err == nil {
+		t.Fatal("an install onto an unwritable directory reported success")
+	}
+}
+
+// detail bounds what a runaway supervisor can print into a warning.
+func TestDetailIsBounded(t *testing.T) {
+	if got := detail(nil); got != "" {
+		t.Errorf("detail(nil) = %q, want empty", got)
+	}
+	if got := detail([]byte("   ")); got != "" {
+		t.Errorf("detail(whitespace) = %q, want empty", got)
+	}
+
+	long := detail([]byte(strings.Repeat("x", 5000)))
+	if len(long) > 260 {
+		t.Errorf("detail is %d chars; a runaway supervisor could fill a terminal", len(long))
+	}
+	if !strings.HasSuffix(long, "…") {
+		t.Error("a truncated detail does not say it was truncated")
+	}
+}
+
+// The plist renderer refuses a type it cannot express, rather than emitting
+// something launchd will silently misread.
+func TestWritePlistKeyRefusesAnUnknownType(t *testing.T) {
+	var b strings.Builder
+	if err := writePlistKey(&b, "Count", 42); err == nil {
+		t.Fatal("an unsupported type was rendered into the plist")
+	}
+}

@@ -434,3 +434,79 @@ func TestRootCanStillOpenTheDatabaseAfterCommittingToSystemdCreds(t *testing.T) 
 		t.Error("the installer and the service would use different keys")
 	}
 }
+
+// The real probe runs the command it is given. Exercised with `true`/`false`
+// rather than systemd-run, so the wiring is checked on any machine.
+func TestExecHandoverProbe(t *testing.T) {
+	if err := ExecHandoverProbe(t.Context(), "true"); err != nil {
+		t.Errorf("a succeeding command was reported as a failure: %v", err)
+	}
+	if err := ExecHandoverProbe(t.Context(), "false"); err == nil {
+		t.Error("a failing command was reported as a success")
+	}
+}
+
+// HandoverWorks builds the probe as a real transient unit: the credential
+// directive, and the account the unit will run as.
+func TestHandoverWorksBuildsACredentialProbe(t *testing.T) {
+	var args []string
+	probe := func(_ context.Context, name string, a ...string) error {
+		args = append([]string{name}, a...)
+		return nil
+	}
+
+	if !HandoverWorks(t.Context(), "/var/lib/tumika/master.cred", "", probe) {
+		t.Fatal("a succeeding probe was reported as a failure")
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "systemd-run") {
+		t.Errorf("the probe does not use a transient unit: %s", joined)
+	}
+	// No account given, so no User= — otherwise the probe would name an empty
+	// user and fail for a reason that says nothing about the handover.
+	if strings.Contains(joined, "User=") {
+		t.Errorf("the probe names a user that was not asked for: %s", joined)
+	}
+}
+
+// A blob that cannot be written is an error, not a silent fallback to no
+// custody at all.
+func TestSealMasterKeyReportsAnUnwritableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	fake := &fakeCreds{}
+	if err := SealMasterKey(t.Context(), filepath.Join(dir, CredentialFileName), fake.run); err == nil {
+		t.Fatal("sealing into an unwritable directory reported success")
+	}
+}
+
+// An empty blob from systemd-creds is refused rather than written out as a key
+// nothing will ever open.
+func TestSealMasterKeyRefusesAnEmptyBlob(t *testing.T) {
+	empty := func(context.Context, []byte, ...string) ([]byte, error) { return nil, nil }
+	path := filepath.Join(t.TempDir(), CredentialFileName)
+
+	if err := SealMasterKey(t.Context(), path, empty); err == nil {
+		t.Fatal("an empty blob was accepted")
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("an empty blob was written to disk")
+	}
+}
+
+// SystemdCredsUsable must report false when the tool produces nothing, not just
+// when it errors.
+func TestSystemdCredsUsableRefusesAnEmptyResult(t *testing.T) {
+	empty := func(context.Context, []byte, ...string) ([]byte, error) { return nil, nil }
+	if SystemdCredsUsable(t.Context(), empty) {
+		t.Error("a tool that sealed nothing was reported as usable")
+	}
+}

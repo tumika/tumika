@@ -674,3 +674,86 @@ func TestStatusDoesNotCallAStartingServiceRunning(t *testing.T) {
 		t.Errorf("the operator is not told what a stuck 'starting' means:\n%s", out)
 	}
 }
+
+// The copy is what the service executes, so a failure to stage it must stop the
+// install rather than leave a unit pointing at nothing.
+func TestInstallReportsAnUnwritableBinDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+
+	p, err := paths.Resolve(home)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if _, err := installedBinary(p); err == nil {
+		t.Fatal("staging into an unwritable home reported success")
+	}
+}
+
+// A binary that is already the daemon-owned copy is left exactly where it is:
+// copying a file over itself would truncate the binary a running daemon is
+// executing.
+func TestInstalledBinaryIsANoOpWhenAlreadyInPlace(t *testing.T) {
+	home := t.TempDir()
+	p, err := paths.Resolve(home)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	first, err := installedBinary(p)
+	if err != nil {
+		t.Fatalf("installedBinary: %v", err)
+	}
+	before, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	second, err := installedBinary(p)
+	if err != nil {
+		t.Fatalf("installedBinary (again): %v", err)
+	}
+	after, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if first != second || len(before) != len(after) {
+		t.Error("a second install changed the binary it had already staged")
+	}
+}
+
+// copyExecutable reports a source it cannot read rather than writing an empty
+// binary the service would fail to execute.
+func TestCopyExecutableReportsAMissingSource(t *testing.T) {
+	dir := t.TempDir()
+	if err := copyExecutable(filepath.Join(dir, "absent"), filepath.Join(dir, "target")); err == nil {
+		t.Fatal("copying a missing source reported success")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "target")); err == nil {
+		t.Error("an empty binary was written")
+	}
+}
+
+// Uninstall and stop must surface a manager failure rather than printing a
+// reassuring message over it.
+func TestUninstallAndStopReportFailures(t *testing.T) {
+	for _, command := range []string{"uninstall", "stop"} {
+		mgr := &fakeManager{err: servicemgr.ErrNotInstalled}
+		useFakeManager(t, mgr)
+
+		out, _, err := run(t, command)
+		if !errors.Is(err, servicemgr.ErrNotInstalled) {
+			t.Errorf("%s = %v, want ErrNotInstalled", command, err)
+		}
+		if strings.Contains(out, "untouched") {
+			t.Errorf("%s printed a success message on failure: %s", command, out)
+		}
+	}
+}
