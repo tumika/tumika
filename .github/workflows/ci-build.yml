@@ -1,0 +1,60 @@
+# ci-build — this file is yours.
+#
+# gt created it once and will never modify or delete it again. It is called by
+# ci-orchestration.yml and must keep `workflow_call`.
+name: ci-build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # golangci-lint runs depguard, which is the mechanical enforcement of the
+      # layering rules in .agents/rules/ and ADR-0004. A forbidden import fails
+      # the build here rather than becoming a review argument.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  sqlc:
+    name: sqlc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      # Installed from source at a pinned version rather than via a third-party
+      # setup action: one fewer action to trust, and the version that generated
+      # the committed code is visible right here. Keep it in step with the
+      # version stamped in the generated files' header.
+      - name: install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+
+      # Fails when the committed generated code disagrees with the queries or
+      # the schema. That is what makes
+      # .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md
+      # mechanical rather than a habit — stale generated code otherwise fails at
+      # the exact query, at runtime, on the one path nobody exercised.
+      - name: sqlc diff
+        run: sqlc diff

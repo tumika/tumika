@@ -1,0 +1,132 @@
+# Managed by gt — edit .gt-repo.yaml, then run `gt repo sync`.
+#
+# gt owns the orchestration; the ci-* stages it calls are yours. Because every
+# stage is a job in this one workflow, `ci-gate` aggregates them with
+# `needs:` rather than polling the checks API — no timeout, and no way to
+# confuse "absent" with "not started yet".
+#
+# Branch protection requires exactly one check: "ci-gate".
+name: CI
+
+on:
+  # No `branches:` filter: a PR stacked onto a feature branch must run CI too.
+  pull_request:
+    # `edited` is load-bearing: without it, correcting a rejected title leaves
+    # the check red until an unrelated push.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  # On the default branch an already-validated tree skips every stage.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Reports whether this exact tree already passed the gate, so a push that
+  # merely squashed an already-validated PR does not run everything again.
+  attest:
+    uses: pedromvgomes/gt/.github/workflows/reusable-attest.yml@v1
+    # A called workflow may only narrow these. Granting less than
+    # reusable-attest declares fails the run at parse time, before any job
+    # starts — so ci-gate never reports and every PR blocks.
+    permissions:
+      contents: read
+      statuses: read
+      pull-requests: read
+
+  preflight:
+    needs: [attest]
+    if: needs.attest.outputs.validated != 'true'
+    uses: ./.github/workflows/ci-preflight.yml
+    secrets: inherit
+
+  build:
+    needs: [attest, preflight]
+    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-build != 'false'
+    uses: ./.github/workflows/ci-build.yml
+    secrets: inherit
+
+  test:
+    needs: [attest, build, preflight]
+    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-test != 'false'
+    uses: ./.github/workflows/ci-test.yml
+    secrets: inherit
+
+  conventional-commits:
+    needs: [attest]
+    if: needs.attest.outputs.validated != 'true'
+    uses: pedromvgomes/gt/.github/workflows/reusable-conventional-commits.yml@v1
+    permissions:
+      contents: read
+      pull-requests: read
+
+  governance:
+    needs: [attest]
+    if: needs.attest.outputs.validated != 'true'
+    uses: pedromvgomes/gt/.github/workflows/reusable-governance.yml@v1
+
+  bulwark:
+    needs: [attest, test]
+    # `!cancelled()` because a job whose needs were skipped is skipped too, and
+    # ci-gate counts skipped as a pass. Without it a preflight that skips tests
+    # would silently disable the security gate while the required check stayed
+    # green. bulwark still runs *after* tests, to consume their coverage.
+    if: "!cancelled() && needs.attest.outputs.validated != 'true'"
+    uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write
+
+  # The single required check. `if: always()` so it still reports when a stage
+  # was skipped, and a skipped stage passes — that is the point of preflight.
+  ci-gate:
+    name: ci-gate
+    needs: [attest, preflight, build, test, conventional-commits, governance, bulwark]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Verify every stage succeeded or was legitimately skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          set -euo pipefail
+          echo "stage results: ${RESULTS}"
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::error::a required stage failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::a required stage was cancelled"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Records the tree this run validated, so a later push or tag can prove
+      # the same content already passed rather than re-running to find out.
+      - name: Attest the validated tree
+        # Read-only GITHUB_TOKEN (fork PRs, and every Dependabot event) cannot
+        # POST a status. Losing the attestation only costs a re-run on the
+        # default branch; failing the gate would block the PR entirely.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # For a pull_request event HEAD is refs/pull/N/merge, so this is the
+          # tree of the merged result — which is exactly what a squash merge
+          # puts on the default branch.
+          tree=$(git rev-parse "HEAD^{tree}")
+          gh api "repos/${REPO}/statuses/${SHA}" \
+            -f state=success \
+            -f context=gt/validated-tree \
+            -f description="$tree" >/dev/null
+          echo "attested tree ${tree} on ${SHA}"
