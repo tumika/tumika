@@ -13,7 +13,11 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    # download, NOT tidy. `go mod tidy` rewrites go.mod and go.sum in place, so a
+    # tagged tree that is not already tidy would be published as a binary built
+    # against a different dependency set than the commit the release claims to
+    # be — and the tag would no longer describe what was shipped.
+    - go mod download
 
 builds:
   - id: tumika
@@ -87,6 +91,23 @@ release:
   github:
     owner: tumika
     name: tumika
+
+  # The tag glob in release.yml is v*.*.*, which also matches v1.0.0-rc1.
+  # goreleaser publishes a full release by default, and GitHub then resolves
+  # /releases/latest to it — so an RC would be served to every new user by
+  # install.sh AND by the documented
+  # releases/latest/download/install.sh URL. `auto` marks any tag with a
+  # prerelease segment as one.
+  prerelease: auto
+
+  # Published as a DRAFT, then promoted by the workflow only after the assets
+  # have been verified.
+  #
+  # Without this the verification runs after `release --clean` has already made
+  # everything public: a missing raw asset or an untaken ldflag would turn the
+  # workflow red while the broken release stayed downloadable. A gate that
+  # reports rather than prevents is not a gate.
+  draft: true
   # Shipped with every release so it can be fetched from the stable
   # releases/latest/download/install.sh URL.
   extra_files:

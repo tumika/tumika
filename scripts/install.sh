@@ -8,13 +8,27 @@
 #   TUMIKA_VERSION      version to install, e.g. 0.1.0 or v0.1.0 (default: latest)
 #   TUMIKA_INSTALL_DIR  install directory (default: $HOME/.local/bin)
 #
-# This installs the BINARY. To run tumika as a supervised service afterwards:
+# This installs the BINARY. Running it as a supervised service is a second step,
+# and it differs by platform:
 #
-#   sudo tumika install
+#   Linux:  sudo <install-dir>/tumika install   # writes a systemd unit, creates
+#                                               # the service account
+#   macOS:  tumika install                      # a LaunchAgent, which must run
+#                                               # as YOU — it needs your login
+#                                               # session to reach the Keychain
 #
-# which needs root on Linux — it writes a systemd unit and creates the service
-# account. On macOS it installs a LaunchAgent and needs no privileges.
+# The script prints whichever applies when it finishes.
 set -eu
+
+# Everything lives in main(), called on the LAST line.
+#
+# `curl … | sh` executes statements as they arrive, so a connection dropped
+# mid-transfer runs whatever prefix landed. The ordering happens to be safe today
+# — every mutating statement is after the checksum comparison — but that is
+# incidental, and one future edit that moves a mutation earlier loses it
+# silently. With a wrapper, a truncated download parses to a function definition
+# that is never called, and does nothing at all.
+main() {
 
 REPO_URL="https://github.com/tumika/tumika"
 INSTALL_DIR="${TUMIKA_INSTALL_DIR:-$HOME/.local/bin}"
@@ -98,5 +112,23 @@ case ":$PATH:" in
   *) echo "note: $INSTALL_DIR is not on your PATH" ;;
 esac
 
+# The next step differs by platform, and the obvious hint is wrong on both.
+#
+# On Linux the install needs root — but sudo's secure_path replaces PATH on
+# Debian, Ubuntu and RHEL, so a bare `sudo tumika install` is
+# "sudo: tumika: command not found" even when the PATH note above stays quiet.
+# The full path is what actually works.
+#
+# On macOS it installs a LaunchAgent, which must run as the OPERATOR: sudo there
+# would install the agent for root, and the daemon would never see the login
+# Keychain that holds its credentials.
 echo
-echo "next: sudo tumika install   # run it as a supervised service"
+if [ "$OS" = "darwin" ]; then
+  echo "next: tumika install   # run it as a LaunchAgent (no sudo: it needs your login session)"
+else
+  echo "next: sudo $INSTALL_DIR/tumika install   # run it as a systemd service"
+fi
+
+}
+
+main "$@"
