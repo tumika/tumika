@@ -17,16 +17,29 @@ import (
 // fakeManager stands in for the platform's supervisor, so the command tree is
 // exercised without touching launchctl or systemctl — and without needing root.
 type fakeManager struct {
-	installed  bool
-	status     servicemgr.Status
-	err        error
-	lastConfig servicemgr.Config
-	calls      []string
+	installed bool
+	status    servicemgr.Status
+	err       error
+	// installErr fails only Install, so a test can reach the steps that run
+	// between Prepare and Install — which is where the token is minted.
+	installErr   error
+	lastConfig   servicemgr.Config
+	calls        []string
+	preparedUser string
+}
+
+func (f *fakeManager) Prepare(_ context.Context, cfg servicemgr.Config) error {
+	f.calls = append(f.calls, "prepare")
+	f.preparedUser = cfg.User
+	return f.err
 }
 
 func (f *fakeManager) Install(_ context.Context, cfg servicemgr.Config) error {
 	f.calls = append(f.calls, "install")
 	f.lastConfig = cfg
+	if f.installErr != nil {
+		return f.installErr
+	}
 	if f.err != nil {
 		return f.err
 	}
@@ -285,8 +298,10 @@ func TestInstallMintsAndPrintsATokenOnAFreshHost(t *testing.T) {
 	if !strings.Contains(out, "tmk_") {
 		t.Errorf("no token was printed:\n%s", out)
 	}
-	if len(mgr.calls) == 0 || mgr.calls[0] != "install" {
-		t.Errorf("the manager was not asked to install: %v", mgr.calls)
+	// prepare first: the handover probe runs a transient unit AS the service
+	// account, so that account has to exist before custody is decided.
+	if len(mgr.calls) < 2 || mgr.calls[0] != "prepare" || mgr.calls[1] != "install" {
+		t.Errorf("calls = %v, want prepare then install", mgr.calls)
 	}
 	if mgr.lastConfig.Home != home {
 		t.Errorf("home = %q, want %q", mgr.lastConfig.Home, home)
@@ -531,4 +546,131 @@ func sealStub(t *testing.T, fn func(context.Context, string, secrets.CredsRunner
 	original := sealMasterKey
 	sealMasterKey = fn
 	t.Cleanup(func() { sealMasterKey = original })
+}
+
+// A system unit runs as an unprivileged account that cannot reach a per-user
+// directory. `sudo tumika install` resolves ROOT's home, so without this the
+// unit named /root/.local/state/tumika and the service died at 203/EXEC while
+// the command printed "state running". The container hid it, because
+// InContainer() forces the system path anyway.
+func TestASystemInstallUsesTheSystemHome(t *testing.T) {
+	useTestKeyCustody(t)
+	t.Setenv(paths.HomeEnv, "")
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	// The real system home is not writable in a test, so only the DECISION is
+	// checked — which is the part that was wrong.
+	_, _, _ = run(t, "install")
+
+	if mgr.lastConfig.Home != "" && mgr.lastConfig.Home != paths.SystemHome {
+		t.Errorf("home = %q, want %q", mgr.lastConfig.Home, paths.SystemHome)
+	}
+	if strings.Contains(mgr.lastConfig.Home, ".local/state") {
+		t.Errorf("home = %q, which the service account cannot reach", mgr.lastConfig.Home)
+	}
+}
+
+// An explicit --home still wins: an operator who said where meant it.
+func TestAnExplicitHomeBeatsTheSystemDefault(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if mgr.lastConfig.Home != home {
+		t.Errorf("home = %q, want the explicit %q", mgr.lastConfig.Home, home)
+	}
+}
+
+// The handover is probed as the account the unit will ACTUALLY run as. Probing
+// the default while the unit runs as someone else verifies delivery to an
+// account that never runs the service.
+func TestTheHandoverIsProbedAsTheConfiguredUser(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	var probedAs string
+	credsUsableStub(t, true)
+	sealStub(t, func(_ context.Context, path string, _ secretsRunner) error {
+		return os.WriteFile(path, []byte("sealed"), 0o600)
+	})
+	original := handoverWorks
+	handoverWorks = func(_ context.Context, _, user string, _ secrets.HandoverProbe) bool {
+		probedAs = user
+		return true
+	}
+	t.Cleanup(func() { handoverWorks = original })
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install", "--user", "assistant"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if probedAs != "assistant" {
+		t.Errorf("probed as %q, want the account the unit runs as", probedAs)
+	}
+	if mgr.preparedUser != "assistant" {
+		t.Errorf("prepared %q, want the account that will be probed", mgr.preparedUser)
+	}
+}
+
+// The token's hash is stored the moment it is minted, so an install that fails
+// afterwards — the common "try sudo" path — must still have printed it. A re-run
+// finds one configured and prints nothing, leaving a daemon with a token nobody
+// has ever seen.
+func TestTheTokenIsPrintedEvenIfTheInstallFails(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	mgr := &fakeManager{installErr: servicemgr.ErrPrivilegesRequired}
+	useFakeManager(t, mgr)
+
+	out, _, err := run(t, "--home", home, "install")
+	if err == nil {
+		t.Fatal("a failing install reported success")
+	}
+	if !strings.Contains(out, "tmk_") {
+		t.Errorf("the minted token was lost when the install failed:\n%s", out)
+	}
+}
+
+// Starting is not running, and the operator is told what to do about it.
+func TestStatusDoesNotCallAStartingServiceRunning(t *testing.T) {
+	mgr := &fakeManager{status: servicemgr.Status{
+		Manager: "systemd",
+		State:   servicemgr.StateStarting,
+		Enabled: true,
+		Path:    "/etc/systemd/system/tumika.service",
+	}}
+	useFakeManager(t, mgr)
+
+	out, _, err := run(t, "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if strings.Contains(out, "state   running") {
+		t.Errorf("a starting service is reported as running:\n%s", out)
+	}
+	if !strings.Contains(out, "restarting in a loop") {
+		t.Errorf("the operator is not told what a stuck 'starting' means:\n%s", out)
+	}
 }

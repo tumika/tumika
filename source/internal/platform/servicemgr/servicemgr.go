@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -50,6 +51,13 @@ const (
 	StateStopped State = "stopped"
 	// StateRunning means the supervisor has it up.
 	StateRunning State = "running"
+	// StateStarting means the supervisor is trying, and has not got there yet.
+	//
+	// Deliberately NOT folded into running. "activating" is what a unit stuck in
+	// a Restart=always crash loop reports forever — it never reaches "failed",
+	// because the supervisor keeps trying — so calling it running is the exact
+	// lie that made a dead install report success.
+	StateStarting State = "starting"
 	// StateFailed means it is installed, not running, and the supervisor
 	// considers that an error rather than a choice.
 	StateFailed State = "failed"
@@ -112,6 +120,17 @@ var (
 
 // Manager installs and supervises tumika as a service.
 type Manager interface {
+	// Prepare makes the things an install depends on exist, without installing
+	// anything: on Linux, the service account.
+	//
+	// Separate from Install because the caller has work to do BETWEEN the two —
+	// key custody is probed by running a transient unit AS the service account,
+	// so that account has to exist first. Folding it into Install made every
+	// first install probe a user that did not exist yet, report no handover, and
+	// drop to the file key permanently.
+	//
+	// Idempotent, and a no-op where there is nothing to prepare.
+	Prepare(ctx context.Context, cfg Config) error
 	// Install writes the unit and enables it. Idempotent: installing over an
 	// existing service rewrites the unit and reloads, which is what an upgrade
 	// needs.
@@ -154,9 +173,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("home %q is not absolute", c.Home)
 	}
 
-	// These land inside a unit file as `ExecStart=` and `Environment=` values,
-	// and inside a plist as XML. A newline would let a path append a directive
-	// of its own choosing to a file that runs as root.
+	// A newline would let a path append a directive of its own choosing to a
+	// unit file that runs as root, or break out of a plist string.
+	//
+	// Whitespace and `%` are checked separately, by the systemd driver only:
+	// they are unit-file grammar, and macOS's own default home is
+	// ~/Library/Application Support/tumika — a perfectly valid path with a space
+	// in it that a plist handles without complaint. Rejecting it here would
+	// break every Mac install to protect Linux.
 	for _, field := range []struct{ name, value string }{
 		{"binary path", c.Binary},
 		{"home", c.Home},
@@ -216,6 +240,31 @@ func execRunner(ctx context.Context, name string, args ...string) ([]byte, error
 	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- see the audit above: literal command names, args from a validated Config
 	return cmd.CombinedOutput()
+}
+
+// Warnf receives non-fatal problems worth telling an operator about.
+//
+// A package-level sink rather than a returned error, because these are cases
+// where the operation SUCCEEDED and something alongside it did not — a stop that
+// timed out during an uninstall that still removed the unit. Returning an error
+// would make the caller treat a completed removal as a failure; discarding it
+// silently is how a surviving daemon process goes unnoticed.
+var Warnf = func(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
+
+// detail renders a command's output for a warning, bounded so a runaway
+// supervisor cannot fill a terminal.
+func detail(out []byte) string {
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return ""
+	}
+	const max = 200
+	if len(text) > max {
+		text = text[:max] + "…"
+	}
+	return ": " + text
 }
 
 // commandError renders a failed supervisor call with its own output.
