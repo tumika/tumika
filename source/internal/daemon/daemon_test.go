@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -555,7 +556,12 @@ func vendorFakeClaude(t *testing.T, p paths.Paths, authStatus ...string) {
 }
 
 // stubUpdates drives the daemon's update paths without a network or a release.
+//
+// The counters are mutex-guarded because the daemon calls these from its own
+// goroutine while the test reads them — `go test -race` catches that, and it is
+// the test's bug rather than the daemon's.
 type stubUpdates struct {
+	mu           sync.Mutex
 	state        domain.UpdateState
 	rollBack     bool
 	confirmBoot  int
@@ -563,18 +569,33 @@ type stubUpdates struct {
 	confirmBootE error
 }
 
-func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) { return s.state, nil }
-func (s *stubUpdates) Check(context.Context) (string, bool, error)       { return "", false, nil }
-func (s *stubUpdates) Apply(context.Context, string) error               { return nil }
+func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state, nil
+}
+
+func (s *stubUpdates) Check(context.Context) (string, bool, error) { return "", false, nil }
+func (s *stubUpdates) Apply(context.Context, string) error         { return nil }
 
 func (s *stubUpdates) ConfirmBoot(context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.confirmBoot++
 	return s.rollBack, s.confirmBootE
 }
 
 func (s *stubUpdates) Confirm(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.confirmed++
 	return nil
+}
+
+func (s *stubUpdates) counts() (boots, confirms int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.confirmBoot, s.confirmed
 }
 
 // A rolled-back update must stop the daemon BEFORE it binds a port, so the
@@ -606,10 +627,11 @@ func TestARolledBackUpdateStopsBeforeServing(t *testing.T) {
 	if !errors.Is(err, daemon.ErrRestartRequired) {
 		t.Fatalf("Serve = %v, want ErrRestartRequired", err)
 	}
-	if updates.confirmBoot != 1 {
-		t.Errorf("ConfirmBoot ran %d times, want 1", updates.confirmBoot)
+	boots, confirms := updates.counts()
+	if boots != 1 {
+		t.Errorf("ConfirmBoot ran %d times, want 1", boots)
 	}
-	if updates.confirmed != 0 {
+	if confirms != 0 {
 		t.Error("a rolled-back update was confirmed")
 	}
 }
@@ -649,7 +671,10 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 	// the API answers.
 	base := "http://" + listener.Addr().String()
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && updates.confirmed == 0 {
+	for time.Now().Before(deadline) {
+		if _, confirms := updates.counts(); confirms > 0 {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	_ = base
@@ -661,8 +686,8 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 		t.Fatal("the daemon did not shut down")
 	}
 
-	if updates.confirmed != 1 {
-		t.Errorf("Confirm ran %d times, want 1", updates.confirmed)
+	if _, confirms := updates.counts(); confirms != 1 {
+		t.Errorf("Confirm ran %d times, want 1", confirms)
 	}
 }
 
