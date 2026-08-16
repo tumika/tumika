@@ -86,8 +86,15 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # -coverpkg=./... credits coverage across package boundaries.
+      #
+      # Without it a profile only records the package under test, so code
+      # exercised by another package's tests reads as zero — the daemon's
+      # end-to-end tests drive the API handlers and the service layer, and none
+      # of it counted. That understated the real figure by about five points and
+      # made the coverage gates argue with reality rather than with the code.
       - name: go test
-        run: go test -race -coverprofile=coverage.out ./...
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       # Only the Linux profile feeds the coverage gate, so the baseline is
       # measured the same way every time. Build-tagged files for the other
