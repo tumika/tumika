@@ -111,6 +111,99 @@ jobs:
           path: coverage.out
           retention-days: 1
 
+  # Builds the DEPLOYMENT TARGET, which nothing else does: `build & test`
+  # compiles for whatever the runner happens to be, and tumika is written for a
+  # Raspberry Pi. A break in linux/arm64 would otherwise ship green.
+  #
+  # It also enforces the no-cgo invariant, which `.golangci.yml`'s nocgo rule
+  # documents and cannot enforce — depguard never sees `import "C"` in either
+  # cgo mode.
+  #
+  # The enforcement is `go list`, NOT the build. `CGO_ENABLED=0 go build ./...`
+  # looks like it would catch a cgo package and does not: build constraints
+  # exclude the file, the pattern match skips the package, and the build exits
+  # zero. Verified by adding one. `go list` reporting a non-empty CgoFiles is
+  # the check that actually fires.
+  cross-compile:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: go build ./...
+
+      - name: no cgo
+        # Only once, on the native target: CgoFiles is a property of the source,
+        # and asking four times would report the same package four times.
+        if: matrix.target.goos == 'linux' && matrix.target.goarch == 'amd64'
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          cgo=$(go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
+          if [ -n "$cgo" ]; then
+            echo "these packages use cgo, which breaks the static cross-compile:" >&2
+            echo "$cgo" >&2
+            exit 1
+          fi
+
+  # Both container artifacts (ADR: D9). The shipped image is what a user runs;
+  # the harness is CI-only and exists to exercise `tumika install`.
+  #
+  # verify-image.sh does more than build it: an image that compiles and cannot
+  # run the binary, write its volume as an unprivileged account, or answer the
+  # API is an image nobody can use.
+  images:
+    name: images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: build and exercise the shipped image
+        run: deploy/verify-image.sh
+
+      - name: build the test-harness image
+        run: podman build -t tumika-harness -f deploy/testharness/Dockerfile deploy/testharness
+
+  # THE integration gate, and the one job allowed to be slow. It is what makes
+  # the Pi deployment trustworthy without a Pi.
+  #
+  # Every assertion in verify.sh is there because it caught something that a
+  # fully green unit-test suite did not: the service account, the ownership
+  # handover, the unit systemd actually accepts, an upgrade that restarts onto
+  # the new binary, a system install that does not use a per-user home, and a
+  # crash loop that must not be reported as running.
+  linux-install:
+    name: linux-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: install under a real systemd
+        run: deploy/testharness/verify.sh
+
   bulwark:
     name: bulwark
     # Fail fast: bulwark's coverage step parses the profile build-test produced,
@@ -177,7 +270,7 @@ jobs:
   pr-gate:
     name: PR Gate
     if: always()
-    needs: [lint, sqlc, build-test, bulwark]
+    needs: [lint, sqlc, build-test, cross-compile, images, linux-install, bulwark]
     runs-on: ubuntu-latest
     steps:
       - name: Require all upstream jobs to have succeeded
