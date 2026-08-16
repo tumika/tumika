@@ -10,6 +10,7 @@ import (
 	"github.com/tumika/tumika/source/internal/domain"
 	"github.com/tumika/tumika/source/internal/platform/provider"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
+	"github.com/tumika/tumika/source/internal/repository"
 	"github.com/tumika/tumika/source/internal/service"
 )
 
@@ -204,6 +205,17 @@ func (f *fakeProviderRepo) SetEnabled(_ context.Context, id string, enabled bool
 
 func newProviderService(t *testing.T, driver *fakeDriver) (service.ProviderService, *fakeCredRepo) {
 	t.Helper()
+	return newProviderServiceWith(t, driver, nil)
+}
+
+// newProviderServiceWith allows the credential repository to be wrapped, so
+// storage failures can be injected.
+func newProviderServiceWith(
+	t *testing.T,
+	driver *fakeDriver,
+	wrap func(*fakeCredRepo) repository.CredentialRepository,
+) (service.ProviderService, *fakeCredRepo) {
+	t.Helper()
 
 	registry, err := provider.NewRegistry(driver)
 	if err != nil {
@@ -223,7 +235,12 @@ func newProviderService(t *testing.T, driver *fakeDriver) (service.ProviderServi
 	creds := newCredRepo()
 	repo := &fakeProviderRepo{rows: map[string]domain.Provider{}}
 
-	svc := service.NewProviderService(registry, repo, creds, sealer, cfg, &fakeTxer{})
+	var credRepo repository.CredentialRepository = creds
+	if wrap != nil {
+		credRepo = wrap(creds)
+	}
+
+	svc := service.NewProviderService(registry, repo, credRepo, sealer, cfg, &fakeTxer{})
 	if err := svc.Seed(t.Context()); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -510,5 +527,117 @@ func TestPreflightAndSeedAreIdempotent(t *testing.T) {
 	}
 	if _, err := svc.Preflight(ctx, "nope"); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("Preflight(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+// failingCredRepo lets the storage error paths be reached, which are otherwise
+// only visible when a database is genuinely broken.
+type failingCredRepo struct {
+	*fakeCredRepo
+	insertErr error
+	listErr   error
+	retireErr error
+}
+
+func (f *failingCredRepo) Insert(ctx context.Context, c domain.SealedCredential) (int64, error) {
+	if f.insertErr != nil {
+		return 0, f.insertErr
+	}
+	return f.fakeCredRepo.Insert(ctx, c)
+}
+
+func (f *failingCredRepo) ListLive(ctx context.Context) ([]domain.SealedCredential, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.fakeCredRepo.ListLive(ctx)
+}
+
+func (f *failingCredRepo) Retire(ctx context.Context, providerID, kind string, status domain.CredentialStatus) error {
+	if f.retireErr != nil {
+		return f.retireErr
+	}
+	return f.fakeCredRepo.Retire(ctx, providerID, kind, status)
+}
+
+func TestStorageFailuresPropagate(t *testing.T) {
+	boom := errors.New("the disk is gone")
+
+	t.Run("insert fails", func(t *testing.T) {
+		svc, creds := newProviderServiceWith(t, &fakeDriver{}, func(c *fakeCredRepo) repository.CredentialRepository {
+			return &failingCredRepo{fakeCredRepo: c, insertErr: boom}
+		})
+		_ = creds
+
+		if _, err := svc.SubmitSecret(t.Context(), fakeProviderID, domain.AuthAPIKey, goodSecret); !errors.Is(err, boom) {
+			t.Errorf("= %v, want the storage error", err)
+		}
+	})
+
+	t.Run("listing fails", func(t *testing.T) {
+		svc, _ := newProviderServiceWith(t, &fakeDriver{}, func(c *fakeCredRepo) repository.CredentialRepository {
+			return &failingCredRepo{fakeCredRepo: c, listErr: boom}
+		})
+
+		if _, err := svc.List(t.Context()); !errors.Is(err, boom) {
+			t.Errorf("= %v, want the storage error", err)
+		}
+	})
+
+	t.Run("retiring fails during a delete", func(t *testing.T) {
+		svc, _ := newProviderServiceWith(t, &fakeDriver{}, func(c *fakeCredRepo) repository.CredentialRepository {
+			return &failingCredRepo{fakeCredRepo: c, retireErr: boom}
+		})
+
+		if err := svc.DeleteCredential(t.Context(), fakeProviderID); !errors.Is(err, boom) {
+			t.Errorf("= %v, want the storage error", err)
+		}
+	})
+}
+
+// Every credential-facing method must refuse an unknown provider before doing
+// anything else — otherwise a typo reaches the sealer or the database.
+func TestUnknownProviderIsRefusedEverywhere(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+	ctx := t.Context()
+
+	if _, err := svc.SubmitSecret(ctx, "nope", domain.AuthAPIKey, goodSecret); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("SubmitSecret = %v", err)
+	}
+	if _, err := svc.VerifyCredential(ctx, "nope"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("VerifyCredential = %v", err)
+	}
+	if err := svc.DeleteCredential(ctx, "nope"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("DeleteCredential = %v", err)
+	}
+	if _, err := svc.StoreCredential(ctx, domain.Credential{
+		ProviderID: "nope", Kind: domain.CredentialAPIKey, Secret: goodSecret,
+	}); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("StoreCredential = %v", err)
+	}
+}
+
+func TestStoreCredentialRejectsIncompleteInput(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+	ctx := t.Context()
+
+	for name, cred := range map[string]domain.Credential{
+		"no provider": {Kind: domain.CredentialAPIKey, Secret: goodSecret},
+		"no secret":   {ProviderID: fakeProviderID, Kind: domain.CredentialAPIKey},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := svc.StoreCredential(ctx, cred); !errors.Is(err, domain.ErrCredentialInvalid) {
+				t.Errorf("= %v, want ErrCredentialInvalid", err)
+			}
+		})
+	}
+}
+
+// Verifying with nothing stored is a not-found, not a crash.
+func TestVerifyWithNoStoredCredential(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+
+	if _, err := svc.VerifyCredential(t.Context(), fakeProviderID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("= %v, want ErrNotFound", err)
 	}
 }
