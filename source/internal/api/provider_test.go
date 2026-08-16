@@ -25,10 +25,13 @@ type fakeProviderService struct {
 	preflight domain.Preflight
 	err       error
 
-	lastID     string
-	lastMethod domain.AuthMethod
-	lastSecret string
-	calls      int
+	install domain.InstallResult
+
+	lastID      string
+	lastMethod  domain.AuthMethod
+	lastSecret  string
+	lastVersion string
+	calls       int
 }
 
 func (f *fakeProviderService) Seed(context.Context) error { return f.err }
@@ -53,6 +56,12 @@ func (f *fakeProviderService) Preflight(_ context.Context, id string) (domain.Pr
 func (f *fakeProviderService) Select(_ context.Context, id string) error {
 	f.lastID = id
 	return f.err
+}
+
+func (f *fakeProviderService) Install(_ context.Context, id, version string) (domain.InstallResult, error) {
+	f.calls++
+	f.lastID, f.lastVersion = id, version
+	return f.install, f.err
 }
 
 func (f *fakeProviderService) SubmitSecret(
@@ -248,6 +257,79 @@ func TestPutCredentialRejectsAMalformedBody(t *testing.T) {
 		}
 		if svc.calls != 0 {
 			t.Error("a malformed request reached the service")
+		}
+	}
+}
+
+// An install with no body means the pinned version, so a client can ask for
+// "install it" without knowing which number that is.
+func TestInstallWithoutABodyMeansThePinnedVersion(t *testing.T) {
+	svc := &fakeProviderService{install: domain.InstallResult{
+		Version: "2.1.233",
+		Path:    "/var/lib/tumika/providers/claude-code/2.1.233/claude",
+	}}
+
+	rec := doProvider(t, svc, http.MethodPost, "/v1/providers/claude-code/install", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	if svc.calls != 1 {
+		t.Fatalf("service called %d times, want 1", svc.calls)
+	}
+	if svc.lastID != "claude-code" {
+		t.Errorf("id = %q", svc.lastID)
+	}
+	if svc.lastVersion != "" {
+		t.Errorf("version = %q, want empty so the driver chooses its pin", svc.lastVersion)
+	}
+	if !strings.Contains(rec.Body.String(), "2.1.233") {
+		t.Errorf("the response does not say what was installed: %s", rec.Body)
+	}
+}
+
+// An explicit version is passed through, so an operator can stage a bump ahead
+// of the daemon that will run it.
+func TestInstallPassesAnExplicitVersionThrough(t *testing.T) {
+	svc := &fakeProviderService{install: domain.InstallResult{Version: "2.1.240"}}
+
+	rec := doProvider(t, svc, http.MethodPost, "/v1/providers/claude-code/install",
+		`{"version":"2.1.240"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	if svc.lastVersion != "2.1.240" {
+		t.Errorf("version = %q, want it passed through", svc.lastVersion)
+	}
+}
+
+// A provider that vendors nothing is a client mistake, not a server failure —
+// and the registry answers that by type assertion, so the handler only encodes.
+func TestInstallOnAProviderThatVendorsNothing(t *testing.T) {
+	svc := &fakeProviderService{err: domain.ErrInstallUnsupported}
+
+	rec := doProvider(t, svc, http.MethodPost, "/v1/providers/anthropic-api/install", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "install_unsupported") {
+		t.Errorf("body = %s, want the documented code", rec.Body)
+	}
+}
+
+func TestInstallRejectsAMalformedBody(t *testing.T) {
+	for _, body := range []string{`{`, `{"version":"2.1.240","unknown":1}`} {
+		svc := &fakeProviderService{}
+
+		rec := doProvider(t, svc, http.MethodPost, "/v1/providers/claude-code/install", body)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %q = %d, want 400", body, rec.Code)
+		}
+		if svc.calls != 0 {
+			t.Errorf("body %q reached the service", body)
 		}
 	}
 }

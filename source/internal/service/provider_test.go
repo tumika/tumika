@@ -232,7 +232,7 @@ func (f *fakeProviderRepo) SetEnabled(_ context.Context, id string, enabled bool
 	return nil
 }
 
-func newProviderService(t *testing.T, driver *fakeDriver) (service.ProviderService, *fakeCredRepo) {
+func newProviderService(t *testing.T, driver provider.Provider) (service.ProviderService, *fakeCredRepo) {
 	t.Helper()
 	return newProviderServiceWith(t, driver, nil)
 }
@@ -241,7 +241,7 @@ func newProviderService(t *testing.T, driver *fakeDriver) (service.ProviderServi
 // storage failures can be injected.
 func newProviderServiceWith(
 	t *testing.T,
-	driver *fakeDriver,
+	driver provider.Provider,
 	wrap func(*fakeCredRepo) repository.CredentialRepository,
 ) (service.ProviderService, *fakeCredRepo) {
 	t.Helper()
@@ -808,5 +808,84 @@ func TestStoreCredentialRejectsAnUnknownKind(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrCredentialInvalid) {
 		t.Errorf("= %v, want ErrCredentialInvalid rather than a constraint violation", err)
+	}
+}
+
+// installingDriver is a fakeDriver that also vendors a binary. Managed and the
+// Installer interface must agree, and the registry checks that at construction.
+type installingDriver struct {
+	fakeDriver
+	result  domain.InstallResult
+	err     error
+	version string
+}
+
+func (d *installingDriver) Descriptor() domain.Descriptor {
+	desc := d.fakeDriver.Descriptor()
+	desc.Managed = true
+	return desc
+}
+
+func (d *installingDriver) Install(_ context.Context, version string) (domain.InstallResult, error) {
+	d.version = version
+	return d.result, d.err
+}
+
+func (d *installingDriver) Installed(context.Context) ([]string, error) { return nil, nil }
+func (d *installingDriver) Prune(context.Context, int) error            { return nil }
+
+// The version is passed through untouched, INCLUDING the empty one. The service
+// must not substitute a default: only the driver knows its pin, and a default
+// chosen here would be a second place the version number lives.
+func TestInstallPassesTheVersionToTheDriver(t *testing.T) {
+	for _, version := range []string{"", "2.1.240"} {
+		driver := &installingDriver{result: domain.InstallResult{Version: "2.1.233"}}
+		svc, _ := newProviderService(t, driver)
+
+		result, err := svc.Install(t.Context(), fakeProviderID, version)
+		if err != nil {
+			t.Fatalf("Install(%q): %v", version, err)
+		}
+		if driver.version != version {
+			t.Errorf("the driver saw %q, want %q", driver.version, version)
+		}
+		if result.Version != "2.1.233" {
+			t.Errorf("result = %+v, want the driver's own answer", result)
+		}
+	}
+}
+
+// A driver failure is passed on rather than translated. The service knows
+// nothing about why a download failed, and inventing a reason here would hide
+// the signed-manifest refusal the installer exists to produce.
+func TestInstallReportsADriverFailure(t *testing.T) {
+	driver := &installingDriver{err: errors.New("manifest signature is not from Anthropic's release key")}
+	svc, _ := newProviderService(t, driver)
+
+	_, err := svc.Install(t.Context(), fakeProviderID, "")
+	if err == nil {
+		t.Fatal("a failed install reported success")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("the driver's reason was lost: %v", err)
+	}
+}
+
+// A provider that vendors nothing implements no Installer at all — it does not
+// implement one that refuses. The registry answers by type assertion, and the
+// service passes that answer on unchanged.
+func TestInstallOnAProviderThatVendorsNothing(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+
+	if _, err := svc.Install(t.Context(), fakeProviderID, ""); !errors.Is(err, domain.ErrInstallUnsupported) {
+		t.Fatalf("= %v, want ErrInstallUnsupported", err)
+	}
+}
+
+func TestInstallOnAnUnknownProvider(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+
+	if _, err := svc.Install(t.Context(), "nobody", ""); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("= %v, want ErrNotFound", err)
 	}
 }

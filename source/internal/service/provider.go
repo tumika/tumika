@@ -31,6 +31,13 @@ type ProviderService interface {
 	// Select records which provider inference should use.
 	Select(ctx context.Context, id string) error
 
+	// Install vendors a provider's binary. An empty version means the driver's
+	// pinned one, so a client can ask for "install it" without knowing the
+	// number — which is the point of that number living in exactly one place.
+	//
+	// Returns domain.ErrInstallUnsupported for a provider that vendors nothing.
+	Install(ctx context.Context, id, version string) (domain.InstallResult, error)
+
 	// SubmitSecret is the non-interactive path: the caller already holds the
 	// secret. Validate, seal, store, verify.
 	SubmitSecret(ctx context.Context, id string, method domain.AuthMethod, secret string) (domain.CredentialMeta, error)
@@ -168,6 +175,21 @@ func (s *providerService) Select(ctx context.Context, id string) error {
 	}
 	_, err = s.config.Set(ctx, map[string]json.RawMessage{KeyProviderSelected: encoded})
 	return err
+}
+
+// Install vendors the provider's binary.
+//
+// Nothing is written to the database: an installed binary is filesystem state
+// the driver can enumerate at any time, and a second record of it could only
+// ever disagree. It is deliberately not wrapped in a transaction either — this
+// downloads hundreds of megabytes, and SQLite has one write lock for the whole
+// daemon.
+func (s *providerService) Install(ctx context.Context, id, version string) (domain.InstallResult, error) {
+	installer, err := s.registry.Installer(id)
+	if err != nil {
+		return domain.InstallResult{}, err
+	}
+	return installer.Install(ctx, version)
 }
 
 func (s *providerService) SubmitSecret(

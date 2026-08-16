@@ -21,6 +21,7 @@ import (
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/provider"
 	"github.com/tumika/tumika/source/internal/platform/provider/anthropicapi"
+	"github.com/tumika/tumika/source/internal/platform/provider/claudecode"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/internal/service"
@@ -127,7 +128,17 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// api.anthropic.com.
 	drivers := opts.Providers
 	if drivers == nil {
-		drivers = []provider.Provider{anthropicapi.New()}
+		// The pin is passed IN rather than read inside the driver, so the
+		// version number keeps living in exactly one place.
+		claude, err := claudecode.NewDriver(
+			opts.Paths.Providers, opts.Paths.ClaudeConfig, buildinfo.PinnedClaudeCodeVersion)
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("build the Claude Code driver: %w", err)
+		}
+		// Claude Code first: it is the provider tumika exists to drive, and the
+		// order is what a client renders.
+		drivers = []provider.Provider{claude, anthropicapi.New()}
 	}
 	registry, err := provider.NewRegistry(drivers...)
 	if err != nil {

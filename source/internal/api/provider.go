@@ -45,6 +45,41 @@ func (h *handlers) selectProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNoContent, nil)
 }
 
+// installRequest asks for a provider's binary to be vendored.
+//
+// version is optional and normally omitted: an empty one means the driver's
+// pinned version, so a client installs the right one without having to know
+// which. It exists at all so an operator can stage a bump ahead of the daemon
+// that will run it.
+type installRequest struct {
+	Version string `json:"version,omitempty"`
+}
+
+// installProvider is synchronous, and deliberately so.
+//
+// It downloads ~307 MB, which is minutes on a domestic connection — long enough
+// to want a job queue, and not worth one yet: there is no scheduler to run it
+// on, nowhere to report progress, and the operator is sitting in front of the
+// call they just made. A 202 with nothing to poll would be worse than a slow
+// 200.
+func (h *handlers) installProvider(w http.ResponseWriter, r *http.Request) {
+	var req installRequest
+	// An absent body is a valid request: "install the pinned version".
+	if r.ContentLength != 0 {
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+	}
+
+	result, err := h.deps.Providers.Install(r.Context(), r.PathValue("id"), req.Version)
+	if err != nil {
+		writeServiceError(w, h.deps.Logger, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 // putCredentialRequest is the non-interactive submission: the caller already
 // holds the secret.
 //

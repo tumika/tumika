@@ -1,12 +1,14 @@
 package daemon_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/tumika/tumika/source/internal/daemon"
 	"github.com/tumika/tumika/source/internal/domain"
+	"github.com/tumika/tumika/source/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/service"
@@ -40,11 +43,26 @@ func useTestKeyCustody(t *testing.T) {
 
 func start(t *testing.T) (string, string) {
 	t.Helper()
+	base, token, _ := startWith(t, nil)
+	return base, token
+}
+
+// startWith is start, with a chance to prepare the tumika home first — used to
+// vendor a stand-in `claude` where the real driver will look for it. It also
+// returns the layout, so a test can read the database file the daemon wrote.
+func startWith(t *testing.T, prepare func(paths.Paths)) (string, string, paths.Paths) {
+	t.Helper()
 	useTestKeyCustody(t)
 
 	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
+	}
+	if prepare != nil {
+		if err := p.MkdirAll(); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		prepare(p)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,7 +105,7 @@ func start(t *testing.T) (string, string) {
 		}
 	})
 
-	return "http://" + listener.Addr().String(), token
+	return "http://" + listener.Addr().String(), token, p
 }
 
 func request(t *testing.T, token, method, url, body string) (int, string) {
@@ -375,5 +393,163 @@ func TestRotatingInvalidatesALiveToken(t *testing.T) {
 	status, body := request(t, "", http.MethodGet, base+"/v1/health", "")
 	if status != http.StatusUnauthorized {
 		t.Errorf("no token = %d, want 401: %s", status, body)
+	}
+}
+
+// A subscription token pasted at the API, end to end: real HTTP, real
+// migrations, real sealing, and a real spawned process.
+//
+// This is the slice tumika exists for. The only stand-in is the `claude` binary
+// itself — vendoring 307 MB in a unit test would be absurd — and it is placed
+// exactly where the driver looks for the pinned version, so everything between
+// the HTTP request and the child process is the production path.
+func TestAPastedSubscriptionTokenIsSealedVerifiedAndNeverReturned(t *testing.T) {
+	const token = "sk-ant-oat01-0123456789abcdefghijklmnopqrstuvwxyz"
+
+	base, apiToken, p := startWith(t, func(p paths.Paths) {
+		vendorFakeClaude(t, p)
+	})
+
+	status, body := request(t, apiToken, http.MethodPut,
+		base+"/v1/providers/claude-code/credential",
+		`{"method":"manual_token","secret":"`+token+`"}`)
+
+	if status != http.StatusOK {
+		t.Fatalf("PUT credential = %d: %s", status, body)
+	}
+
+	var meta domain.CredentialMeta
+	if err := json.Unmarshal([]byte(body), &meta); err != nil {
+		t.Fatalf("response is not valid JSON (%v): %s", err, body)
+	}
+	if meta.Status != string(domain.CredentialActive) {
+		t.Fatalf("status = %q, want active: %s", meta.Status, body)
+	}
+	if meta.Hint == "" || strings.Contains(body, token) {
+		t.Errorf("the response carries the token rather than a hint: %s", body)
+	}
+
+	// SEALED, not merely stored. The database file is read as bytes, because
+	// that is what an operator's backup contains and what a stolen disk gives
+	// up. Asking the repository would only prove the repository agrees with
+	// itself.
+	raw, err := os.ReadFile(p.DB)
+	if err != nil {
+		t.Fatalf("read the database: %v", err)
+	}
+	if bytes.Contains(raw, []byte(token)) {
+		t.Error("the token is in the database in the clear")
+	}
+
+	// The provider view carries the credential's non-secret half, and a client
+	// reads it to decide what to render.
+	status, body = request(t, apiToken, http.MethodGet, base+"/v1/providers/claude-code", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET provider = %d: %s", status, body)
+	}
+	if strings.Contains(body, token) {
+		t.Errorf("the provider view carries the token: %s", body)
+	}
+	if !strings.Contains(body, `"manual_token"`) {
+		t.Errorf("the descriptor does not offer the method that just worked: %s", body)
+	}
+	if !strings.Contains(body, `"requires_interactive_auth":false`) {
+		t.Errorf("the provider claims an interactive login that does not exist yet: %s", body)
+	}
+
+	// And the daemon is still healthy, which is the plan's definition of done
+	// for this slice.
+	status, body = request(t, apiToken, http.MethodGet, base+"/v1/health", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/health = %d: %s", status, body)
+	}
+	var health domain.Health
+	if err := json.Unmarshal([]byte(body), &health); err != nil {
+		t.Fatalf("health is not valid JSON (%v): %s", err, body)
+	}
+	if health.Status != "ok" {
+		t.Errorf("health = %q, warnings %v", health.Status, health.Warnings)
+	}
+}
+
+// Verification asserts the OUTCOME, so a claude that resolved somebody else's
+// credential is refused even though it answers perfectly.
+//
+// The failure this guards has no symptom: the daemon starts, the workflow runs,
+// the reply is correct, and the operator is billed API rates for a subscription
+// they installed tumika to use.
+func TestATokenThatWouldBillAtAPIRatesIsRefusedEndToEnd(t *testing.T) {
+	const token = "sk-ant-oat01-0123456789abcdefghijklmnopqrstuvwxyz"
+
+	base, apiToken, _ := startWith(t, func(p paths.Paths) {
+		vendorFakeClaude(t, p,
+			`{"loggedIn":true,"authMethod":"api_key","apiKeySource":"ANTHROPIC_API_KEY"}`)
+	})
+
+	status, body := request(t, apiToken, http.MethodPut,
+		base+"/v1/providers/claude-code/credential",
+		`{"method":"manual_token","secret":"`+token+`"}`)
+
+	// 502: the provider could not be used, which is not tumika failing and not
+	// a bad credential either.
+	if status != http.StatusBadGateway {
+		t.Fatalf("PUT credential = %d, want 502: %s", status, body)
+	}
+	if !strings.Contains(body, "API rates") {
+		t.Errorf("the refusal does not say what it would have cost: %s", body)
+	}
+}
+
+// A managed provider can be asked to install its binary; one that vendors
+// nothing says so, and says it as a client error rather than a server failure.
+func TestInstallEndpointReachesTheRightDriver(t *testing.T) {
+	base, apiToken, _ := startWith(t, func(p paths.Paths) {
+		vendorFakeClaude(t, p)
+	})
+
+	// Already vendored at the pinned version, so this is the cheap answer
+	// rather than a 307 MB download in a unit test.
+	status, body := request(t, apiToken, http.MethodPost,
+		base+"/v1/providers/claude-code/install", "")
+	if status != http.StatusOK {
+		t.Fatalf("POST install = %d: %s", status, body)
+	}
+	if !strings.Contains(body, `"already_present":true`) {
+		t.Errorf("an installed version was not recognised: %s", body)
+	}
+	if !strings.Contains(body, buildinfo.PinnedClaudeCodeVersion) {
+		t.Errorf("the install did not resolve to the pinned version: %s", body)
+	}
+
+	status, body = request(t, apiToken, http.MethodPost,
+		base+"/v1/providers/anthropic-api/install", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("POST install on an HTTP provider = %d, want 400: %s", status, body)
+	}
+	if !strings.Contains(body, "install_unsupported") {
+		t.Errorf("body = %s, want the documented code", body)
+	}
+}
+
+// vendorFakeClaude writes a stand-in binary where the driver looks for the
+// pinned version. authStatus overrides what `auth status --json` reports.
+func vendorFakeClaude(t *testing.T, p paths.Paths, authStatus ...string) {
+	t.Helper()
+
+	status := `{"loggedIn":true,"authMethod":"oauth_token","apiKeySource":"CLAUDE_CODE_OAUTH_TOKEN"}`
+	if len(authStatus) > 0 {
+		status = authStatus[0]
+	}
+
+	dir := filepath.Join(p.Providers, "claude-code", buildinfo.PinnedClaudeCodeVersion)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	script := "#!/bin/sh\ncase \"$3\" in\n  auth) cat <<'JSON'\n" + status + "\nJSON\n  ;;\n" +
+		"  -p) cat <<'JSON'\n{\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\nJSON\n  ;;\nesac\n"
+
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write the stand-in claude: %v", err)
 	}
 }
