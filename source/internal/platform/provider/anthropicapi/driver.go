@@ -214,9 +214,22 @@ func describe(resp *http.Response) string {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Message != "" {
-		return logging.Redact(payload.Error.Message)
+		return truncate(logging.Redact(payload.Error.Message))
 	}
-	return logging.Redact(strings.TrimSpace(string(body)))
+	return truncate(logging.Redact(strings.TrimSpace(string(body))))
+}
+
+// maxDescription bounds what a remote error can push into stored metadata and
+// into a response. A non-JSON body — an HTML error page from a proxy, say —
+// would otherwise put kilobytes of someone else's markup into the database and
+// hand it to a client.
+const maxDescription = 256
+
+func truncate(s string) string {
+	if len(s) <= maxDescription {
+		return s
+	}
+	return s[:maxDescription] + "…"
 }
 
 // hint is the only part of a key that may be shown or stored in the clear.

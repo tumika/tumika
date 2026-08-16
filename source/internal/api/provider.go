@@ -71,6 +71,15 @@ func (h *handlers) putCredential(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, meta)
 }
 
+// verifyCredential answers 200 with the metadata even when the credential is
+// rejected.
+//
+// The caller asked "does this still work"; "no" is an answer, and it comes with
+// the hint, status and timestamp they need. Reporting it as a 4xx would discard
+// all of that and leave a client unable to tell "the key is bad" from "my
+// request was bad". Submission is the opposite case — there the caller was
+// trying to establish a credential and did not succeed — so it does report an
+// error.
 func (h *handlers) verifyCredential(w http.ResponseWriter, r *http.Request) {
 	meta, err := h.deps.Providers.VerifyCredential(r.Context(), r.PathValue("id"))
 	if err != nil {

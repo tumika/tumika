@@ -147,6 +147,15 @@ func validate(p Provider, d domain.Descriptor) error {
 			d.ID, domain.AuthInteractiveCLI)
 	}
 
+	// Managed says tumika installs a binary for this provider, and clients render
+	// an install affordance from it. The conformance suite already required the
+	// pair to agree; checking it here makes a mismatch a startup failure rather
+	// than something only a test would catch.
+	if _, isInstaller := p.(Installer); isInstaller != d.Managed {
+		return fmt.Errorf("provider %q has Managed=%v but Installer implemented=%v; they must agree",
+			d.ID, d.Managed, isInstaller)
+	}
+
 	if hasStatic {
 		accepted := static.AcceptedMethods()
 		for _, m := range declaredStatic {

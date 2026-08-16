@@ -196,7 +196,7 @@ func (q *Queries) RetireCredentials(ctx context.Context, arg RetireCredentialsPa
 	return err
 }
 
-const updateCredentialMeta = `-- name: UpdateCredentialMeta :exec
+const updateCredentialMeta = `-- name: UpdateCredentialMeta :execrows
 UPDATE provider_credentials
 SET hint               = ?,
     account_email      = ?,
@@ -206,6 +206,7 @@ SET hint               = ?,
     last_verified_at   = ?,
     updated_at         = ?
 WHERE id = ?
+  AND status IN ('active', 'unverified')
 `
 
 type UpdateCredentialMetaParams struct {
@@ -219,8 +220,15 @@ type UpdateCredentialMetaParams struct {
 	ID               int64
 }
 
-func (q *Queries) UpdateCredentialMeta(ctx context.Context, arg UpdateCredentialMetaParams) error {
-	_, err := q.db.ExecContext(ctx, updateCredentialMeta,
+// Writes every field, and is guarded on liveness like the status update.
+//
+// MERGING is the caller's job, not this query's: which fields a driver is
+// entitled to overwrite is a business rule, and it lives in ProviderService
+// where the stored metadata is already in hand. Doing it in SQL would also have
+// meant COALESCE/NULLIF, which sqlc's SQLite parser cannot name parameters
+// inside.
+func (q *Queries) UpdateCredentialMeta(ctx context.Context, arg UpdateCredentialMetaParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateCredentialMeta,
 		arg.Hint,
 		arg.AccountEmail,
 		arg.IssuedAt,
@@ -230,15 +238,19 @@ func (q *Queries) UpdateCredentialMeta(ctx context.Context, arg UpdateCredential
 		arg.UpdatedAt,
 		arg.ID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
-const updateCredentialStatus = `-- name: UpdateCredentialStatus :exec
+const updateCredentialStatus = `-- name: UpdateCredentialStatus :execrows
 UPDATE provider_credentials
 SET status            = ?,
     last_verify_error = ?,
     updated_at        = ?
-WHERE id = ?
+WHERE id = ?4
+  AND status IN ('active', 'unverified')
 `
 
 type UpdateCredentialStatusParams struct {
@@ -248,12 +260,20 @@ type UpdateCredentialStatusParams struct {
 	ID              int64
 }
 
-func (q *Queries) UpdateCredentialStatus(ctx context.Context, arg UpdateCredentialStatusParams) error {
-	_, err := q.db.ExecContext(ctx, updateCredentialStatus,
+// Guarded on liveness, and reporting rows affected, because verification
+// deliberately runs outside a transaction: the row can be retired by a DELETE or
+// replaced by another submission while the provider is being called. Without the
+// guard, a late verdict writes 'active' back onto a revoked row and resurrects
+// it. Zero rows means "superseded", which is a normal outcome, not an error.
+func (q *Queries) UpdateCredentialStatus(ctx context.Context, arg UpdateCredentialStatusParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateCredentialStatus,
 		arg.Status,
 		arg.LastVerifyError,
 		arg.UpdatedAt,
 		arg.ID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

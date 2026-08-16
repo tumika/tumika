@@ -94,17 +94,21 @@ func (r *CredentialRepo) Insert(ctx context.Context, c domain.SealedCredential) 
 	return id, nil
 }
 
-func (r *CredentialRepo) UpdateStatus(ctx context.Context, id int64, status domain.CredentialStatus, verifyErr string) error {
-	return mapError(r.s.writeQ(ctx).UpdateCredentialStatus(ctx, UpdateCredentialStatusParams{
+func (r *CredentialRepo) UpdateStatus(ctx context.Context, id int64, status domain.CredentialStatus, verifyErr string) (bool, error) {
+	rows, err := r.s.writeQ(ctx).UpdateCredentialStatus(ctx, UpdateCredentialStatusParams{
 		Status:          string(status),
 		LastVerifyError: verifyErr,
 		UpdatedAt:       formatTime(time.Now()),
 		ID:              id,
-	}))
+	})
+	if err != nil {
+		return false, mapError(err)
+	}
+	return rows > 0, nil
 }
 
-func (r *CredentialRepo) UpdateMeta(ctx context.Context, id int64, meta domain.CredentialMeta) error {
-	return mapError(r.s.writeQ(ctx).UpdateCredentialMeta(ctx, UpdateCredentialMetaParams{
+func (r *CredentialRepo) UpdateMeta(ctx context.Context, id int64, meta domain.CredentialMeta) (bool, error) {
+	rows, err := r.s.writeQ(ctx).UpdateCredentialMeta(ctx, UpdateCredentialMetaParams{
 		Hint:             meta.Hint,
 		AccountEmail:     meta.AccountEmail,
 		IssuedAt:         nullTime(meta.IssuedAt),
@@ -113,7 +117,11 @@ func (r *CredentialRepo) UpdateMeta(ctx context.Context, id int64, meta domain.C
 		LastVerifiedAt:   nullTime(meta.LastVerifiedAt),
 		UpdatedAt:        formatTime(time.Now()),
 		ID:               id,
-	}))
+	})
+	if err != nil {
+		return false, mapError(err)
+	}
+	return rows > 0, nil
 }
 
 // Retire frees the slot the partial unique index guards, moving every live

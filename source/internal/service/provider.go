@@ -209,6 +209,10 @@ func (s *providerService) SubmitSecret(
 // credential that arrives during an outage is kept rather than discarded, and
 // the monitor re-checks it later.
 func (s *providerService) StoreCredential(ctx context.Context, cred domain.Credential) (domain.CredentialMeta, error) {
+	return s.store(ctx, cred)
+}
+
+func (s *providerService) store(ctx context.Context, cred domain.Credential) (domain.CredentialMeta, error) {
 	if cred.ProviderID == "" {
 		return domain.CredentialMeta{}, fmt.Errorf("%w: no provider", domain.ErrCredentialInvalid)
 	}
@@ -235,13 +239,51 @@ func (s *providerService) StoreCredential(ctx context.Context, cred domain.Crede
 	sealed.Ciphertext, sealed.Nonce = box.Ciphertext, box.Nonce
 	sealed.KeyRef, sealed.Cipher = box.KeyRef, box.Cipher
 
+	// Is there an incumbent? Replacing one is a different operation from
+	// establishing the first, and the difference matters.
+	incumbent, incumbentErr := s.creds.GetLive(ctx, cred.ProviderID, cred.Kind)
+	replacing := incumbentErr == nil
+	if incumbentErr != nil && !errors.Is(incumbentErr, domain.ErrNotFound) {
+		return domain.CredentialMeta{}, incumbentErr
+	}
+
+	// REPLACING: prove the candidate before retiring what works.
+	//
+	// Storing first would mean a well-shaped but wrong key retires the working
+	// credential and then fails verification, leaving the provider with nothing
+	// live and no way to get the old one back. Verifying first costs the
+	// "keep it during an outage" property for replacements only — and keeping a
+	// working credential beats keeping an unproven one.
+	if replacing {
+		meta, err := s.check(ctx, cred)
+		if err != nil {
+			return meta, fmt.Errorf("%w: the existing credential was left in place", err)
+		}
+		if meta.Status == string(domain.CredentialInvalid) {
+			return meta, fmt.Errorf("%w: %s; the existing credential was left in place",
+				domain.ErrCredentialInvalid, meta.LastVerifyError)
+		}
+		sealed.Meta = mergeMeta(cred.Meta, meta)
+
+		err = s.tx.InTx(ctx, func(ctx context.Context) error {
+			if err := s.creds.Retire(ctx, cred.ProviderID, cred.Kind, domain.CredentialRevoked); err != nil {
+				return err
+			}
+			_, err := s.creds.Insert(ctx, sealed)
+			return err
+		})
+		if err != nil {
+			return domain.CredentialMeta{}, err
+		}
+		_ = incumbent
+		return sealed.Meta, nil
+	}
+
+	// FIRST credential: store it, then verify. There is nothing to lose by
+	// keeping an unproven credential, and a provider outage should not stop an
+	// operator supplying one — the monitor re-checks it later.
 	var id int64
 	err = s.tx.InTx(ctx, func(ctx context.Context) error {
-		// The previous credential is retired, not deleted: what was tried is
-		// part of the record, and the partial unique index needs the slot freed.
-		if err := s.creds.Retire(ctx, cred.ProviderID, cred.Kind, domain.CredentialRevoked); err != nil {
-			return err
-		}
 		var err error
 		id, err = s.creds.Insert(ctx, sealed)
 		return err
@@ -252,12 +294,71 @@ func (s *providerService) StoreCredential(ctx context.Context, cred domain.Crede
 
 	meta, err := s.verify(ctx, cred.ProviderID, id, cred)
 	if err != nil {
-		// The credential is stored and unverified. That is a real state, not a
-		// failure to store — the monitor will try again — so report the metadata
-		// alongside the error rather than pretending nothing happened.
-		return sealed.Meta, err
+		// Stored but unverifiable: the provider could not be reached. That is a
+		// real, recorded state rather than a failure to store, so the metadata
+		// that comes back is the one that was written.
+		return meta, err
+	}
+	if meta.Status == string(domain.CredentialInvalid) {
+		return meta, fmt.Errorf("%w: %s", domain.ErrCredentialInvalid, meta.LastVerifyError)
 	}
 	return meta, nil
+}
+
+// check runs the driver's verification without touching the database.
+//
+// A failure here means the check could not be CARRIED OUT, which says nothing
+// about the credential — so it is wrapped in ErrProviderUnavailable and never
+// treated as a verdict. Both callers depend on that distinction: one would
+// otherwise revoke a working credential over an outage, the other would report
+// tumika as broken when the provider is.
+func (s *providerService) check(ctx context.Context, cred domain.Credential) (domain.CredentialMeta, error) {
+	checker, err := s.registry.HealthChecker(cred.ProviderID)
+	if err != nil {
+		return domain.CredentialMeta{}, err
+	}
+
+	meta, err := checker.Verify(ctx, cred)
+	if err != nil {
+		return meta, fmt.Errorf("%w: %w", domain.ErrProviderUnavailable, err)
+	}
+	return meta, nil
+}
+
+// mergeMeta layers what a driver reported over what is already stored.
+//
+// A driver reports only what it learned. anthropicapi.Verify, for instance,
+// returns a hint, a status and a timestamp — so replacing the stored metadata
+// wholesale would null the account and expiry an interactive login had
+// established, and expiry warnings would silently stop working after the first
+// re-verification.
+func mergeMeta(stored, fresh domain.CredentialMeta) domain.CredentialMeta {
+	merged := stored
+
+	if fresh.Status != "" {
+		merged.Status = fresh.Status
+	}
+	if fresh.Hint != "" {
+		merged.Hint = fresh.Hint
+	}
+	if fresh.AccountEmail != "" {
+		merged.AccountEmail = fresh.AccountEmail
+	}
+	if fresh.IssuedAt != nil {
+		merged.IssuedAt = fresh.IssuedAt
+		merged.ExpiryIsEstimate = fresh.ExpiryIsEstimate
+	}
+	if fresh.ExpiresAt != nil {
+		merged.ExpiresAt = fresh.ExpiresAt
+		merged.ExpiryIsEstimate = fresh.ExpiryIsEstimate
+	}
+	if fresh.LastVerifiedAt != nil {
+		merged.LastVerifiedAt = fresh.LastVerifiedAt
+	}
+	// Always taken from the fresh result, including when it clears.
+	merged.LastVerifyError = fresh.LastVerifyError
+
+	return merged
 }
 
 func (s *providerService) VerifyCredential(ctx context.Context, id string) (domain.CredentialMeta, error) {
@@ -269,6 +370,11 @@ func (s *providerService) VerifyCredential(ctx context.Context, id string) (doma
 	if err != nil {
 		return domain.CredentialMeta{}, err
 	}
+
+	// A rejection is a RESULT here, not an error: an explicit verification asked
+	// "does this still work", and "no" is an answer. The submission path turns
+	// the same verdict into an error, because there the caller was trying to
+	// establish a credential and did not succeed.
 	return s.verify(ctx, id, sealedID, cred)
 }
 
@@ -280,34 +386,42 @@ func (s *providerService) VerifyCredential(ctx context.Context, id string) (doma
 func (s *providerService) verify(
 	ctx context.Context, providerID string, sealedID int64, cred domain.Credential,
 ) (domain.CredentialMeta, error) {
-	checker, err := s.registry.HealthChecker(providerID)
-	if err != nil {
-		return domain.CredentialMeta{}, err
-	}
-
-	meta, verifyErr := checker.Verify(ctx, cred)
+	fresh, verifyErr := s.check(ctx, cred)
 	if verifyErr != nil {
-		return meta, verifyErr
+		// The check could not be carried out. Nothing is recorded — marking a
+		// credential invalid because the provider was unreachable would revoke a
+		// working key over someone else's outage.
+		return cred.Meta, verifyErr
 	}
 
-	if meta.Status == "" {
-		meta.Status = string(domain.CredentialUnverified)
+	merged := mergeMeta(cred.Meta, fresh)
+	if merged.Status == "" {
+		merged.Status = string(domain.CredentialUnverified)
 	}
 
-	err = s.tx.InTx(ctx, func(ctx context.Context) error {
-		if err := s.creds.UpdateMeta(ctx, sealedID, meta); err != nil {
+	var applied bool
+	err := s.tx.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		if applied, err = s.creds.UpdateMeta(ctx, sealedID, merged); err != nil {
 			return err
 		}
-		return s.creds.UpdateStatus(ctx, sealedID, domain.CredentialStatus(meta.Status), meta.LastVerifyError)
+		applied, err = s.creds.UpdateStatus(ctx, sealedID, domain.CredentialStatus(merged.Status), merged.LastVerifyError)
+		return err
 	})
 	if err != nil {
-		return meta, err
+		return merged, err
 	}
 
-	if meta.Status == string(domain.CredentialInvalid) {
-		return meta, fmt.Errorf("%w: %s", domain.ErrCredentialInvalid, meta.LastVerifyError)
+	// The row was retired or replaced while the provider was being called.
+	// Writing the verdict anyway would resurrect a revoked credential, so it is
+	// discarded — a normal outcome of verifying outside a transaction, not a
+	// failure.
+	if !applied {
+		return merged, fmt.Errorf("%w: the credential was replaced or removed while it was being verified",
+			domain.ErrSuperseded)
 	}
-	return meta, nil
+
+	return merged, nil
 }
 
 // openLive unseals the live credential for a provider.

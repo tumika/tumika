@@ -121,8 +121,12 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// actually implements, so a driver that lies about its capabilities stops
 	// the daemon here rather than producing a client that offers a flow the
 	// daemon will reject.
+	// nil means "use the real drivers"; an explicitly empty slice means "no
+	// drivers", which a test filtering its list down to nothing is entitled to
+	// ask for. Treating both alike would have quietly pointed such a test at
+	// api.anthropic.com.
 	drivers := opts.Providers
-	if len(drivers) == 0 {
+	if drivers == nil {
 		drivers = []provider.Provider{anthropicapi.New()}
 	}
 	registry, err := provider.NewRegistry(drivers...)

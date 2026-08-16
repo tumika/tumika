@@ -214,14 +214,59 @@ func TestCapabilityLookupsUseSentinels(t *testing.T) {
 	}
 }
 
-func TestManagedProvidersImplementInstaller(t *testing.T) {
-	d := descriptor(domain.AuthAPIKey)
-	d.Managed = true
+// Managed drives an install affordance in clients, so a descriptor claiming it
+// without an Installer produces a button that cannot work.
+func TestManagedMustAgreeWithInstaller(t *testing.T) {
+	managed := descriptor(domain.AuthAPIKey)
+	managed.Managed = true
 
-	p := withInstaller{fake: fake{d: d}}
-	// Managed with an Installer is fine; the conformance suite checks the pair
-	// stays in step. Here we only need the registry not to reject it.
-	if _, err := provider.NewRegistry(withStatic{fake: p.fake, accepted: []domain.AuthMethod{domain.AuthAPIKey}}); err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
+	t.Run("managed without an Installer is rejected", func(t *testing.T) {
+		p := withStatic{fake: fake{d: managed}, accepted: []domain.AuthMethod{domain.AuthAPIKey}}
+
+		_, err := provider.NewRegistry(p)
+		if err == nil {
+			t.Fatal("a Managed provider with no Installer was accepted")
+		}
+		if !strings.Contains(err.Error(), "Managed") {
+			t.Errorf("error = %q, want it to name Managed", err)
+		}
+	})
+
+	t.Run("an Installer without Managed is rejected", func(t *testing.T) {
+		p := staticInstaller{
+			withInstaller: withInstaller{fake: fake{d: descriptor(domain.AuthAPIKey)}},
+			accepted:      []domain.AuthMethod{domain.AuthAPIKey},
+		}
+
+		if _, err := provider.NewRegistry(p); err == nil {
+			t.Fatal("an Installer that does not declare Managed was accepted")
+		}
+	})
+
+	t.Run("the pair agreeing is accepted", func(t *testing.T) {
+		p := staticInstaller{
+			withInstaller: withInstaller{fake: fake{d: managed}},
+			accepted:      []domain.AuthMethod{domain.AuthAPIKey},
+		}
+
+		if _, err := provider.NewRegistry(p); err != nil {
+			t.Fatalf("NewRegistry: %v", err)
+		}
+	})
+}
+
+// staticInstaller has both static auth and an installer, like a vendored CLI
+// provider will.
+type staticInstaller struct {
+	withInstaller
+	accepted []domain.AuthMethod
+}
+
+func (s staticInstaller) AcceptedMethods() []domain.AuthMethod { return s.accepted }
+func (s staticInstaller) ValidateSecret(domain.AuthMethod, string) error {
+	return nil
+}
+
+func (s staticInstaller) Materialize(domain.AuthMethod, string) (domain.Credential, error) {
+	return domain.Credential{}, nil
 }

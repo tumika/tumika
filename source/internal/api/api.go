@@ -137,6 +137,13 @@ func writeServiceError(w http.ResponseWriter, logger *slog.Logger, err error) {
 		writeError(w, http.StatusBadRequest, "interactive_auth_unsupported", err.Error())
 	case errors.Is(err, domain.ErrInstallUnsupported):
 		writeError(w, http.StatusBadRequest, "install_unsupported", err.Error())
+	case errors.Is(err, domain.ErrProviderUnavailable):
+		// The provider could not be reached, which is not tumika failing. A 500
+		// would tell the operator to look at the wrong system, and would hide
+		// that the credential may well have been stored.
+		writeError(w, http.StatusBadGateway, "provider_unavailable", err.Error())
+	case errors.Is(err, domain.ErrSuperseded):
+		writeError(w, http.StatusConflict, "superseded", err.Error())
 	default:
 		// The message is deliberately generic: an internal failure's text can
 		// carry paths, SQL or driver detail, none of which belongs in a
