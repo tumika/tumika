@@ -1,0 +1,77 @@
+# Repository governance for gt. This file is the source of truth; run
+# 'gt repo sync' to render it, and 'gt repo check' to verify.
+#
+# Shared policy (Dependabot cooldown, commit-message prefixes, the weekly sync
+# schedule) lives in gt's templates, not here, so it stays consistent across
+# every governed repo.
+#
+# The pipeline stages below become jobs in ci-orchestration.yml, each calling a
+# ci-*/cd-* workflow that belongs to this repository: gt creates those once and
+# never touches them again. Branch protection needs exactly one check, ci-gate,
+# which waits on all of them.
+
+gt_version: 1.0.0
+dependabot:
+  - ecosystem: docker
+    directory: /deploy/testharness
+    note: |
+      The end-to-end test harness image. Only discovered because the file is
+      named Dockerfile — Dependabot's docker ecosystem does not find a file
+      named Containerfile.
+  - ecosystem: github-actions
+    directory: /
+  - ecosystem: gomod
+    directory: /
+dependabot_auto_merge:
+  enabled: true
+  schedule: 0 1 * * *
+  max_bump: minor
+  delete_branch: true
+bulwark:
+  enabled: true
+pipeline:
+  ci:
+    enabled: true
+    stages:
+      - preflight
+      - build
+      - test
+      - end2end
+    merge_queue: false
+  cd:
+    enabled: false
+    stages:
+      - preflight
+      - publish
+      - deploy
+      - verify
+    tags:
+      - v*.*.*
+conventional_commits:
+  enabled: true
+  scope: pr_title
+  types:
+    - feat
+    - fix
+    - docs
+    - style
+    - refactor
+    - perf
+    - test
+    - build
+    - ci
+    - chore
+    - revert
+settings:
+  merge:
+    squash: true
+    merge_commit: false
+    rebase: false
+    delete_branch_on_merge: true
+  branch_protection:
+    branch: main
+    required_approvals: 0
+    require_up_to_date: false
+files:
+  - sync
+  - dependabot-auto-merge

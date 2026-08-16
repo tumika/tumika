@@ -1,0 +1,89 @@
+# ci-test — this file is yours.
+#
+# gt created it once and will never modify or delete it again.
+#
+# The test suite, moved from ci.yml verbatim.
+#
+# One deliberate change: the coverage artifact is now named `gt-coverage`
+# rather than `coverage-out`, because that is the name gt's bulwark stage
+# downloads. Renaming it back would silently send bulwark to running the suite
+# itself — correct, but a second full matrix run, and measured differently.
+name: ci-test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    # Both supported platforms, because a meaningful amount of this codebase is
+    # platform-specific: the Keychain and systemd-creds sealing backends, the
+    # launchd and systemd service drivers, and the PTY login flow. Testing only
+    # on Linux would leave the macOS half of that unbuilt.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      # -coverpkg=./... credits coverage across package boundaries.
+      #
+      # Without it a profile only records the package under test, so code
+      # exercised by another package's tests reads as zero — the daemon's
+      # end-to-end tests drive the API handlers and the service layer, and none
+      # of it counted. That understated the real figure by about five points and
+      # made the coverage gates argue with reality rather than with the code.
+      - name: go test
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+
+      # Only the Linux profile feeds the coverage gate, so the baseline is
+      # measured the same way every time. Build-tagged files for the other
+      # platform are simply absent from a profile rather than counted as
+      # uncovered — the compiler never sees them — so this does not deflate the
+      # number. It does mean the darwin-only code (the Keychain sealer, the
+      # launchd driver) is tested on macOS but not coverage-gated; merging two
+      # platforms' profiles correctly needs `go tool covdata`, which is worth
+      # revisiting once those files exist.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: gt-coverage
+          path: coverage.out
+          retention-days: 1
+
+  # Builds the DEPLOYMENT TARGET, which nothing else does: `build & test`
+  # compiles for whatever the runner happens to be, and tumika is written for a
+  # Raspberry Pi. A break in linux/arm64 would otherwise ship green.
+  #
+  # It also enforces the no-cgo invariant, which `.golangci.yml`'s nocgo rule
+  # documents and cannot enforce — depguard never sees `import "C"` in either
+  # cgo mode.
+  #
+  # Two things about that enforcement, each of which was got wrong first:
+  #
+  #  1. It is `go list`, not the build. `CGO_ENABLED=0 go build ./...` looks like
+  #     it would catch a cgo package and does not — build constraints exclude
+  #     the file, the pattern match skips the package, and the build exits zero.
+  #  2. It runs on EVERY matrix leg, because `go list` applies build constraints
+  #     for the current GOOS/GOARCH exactly as the build does. A
+  #     `//go:build darwin` file importing "C" is invisible on the linux legs,
+  #     so restricting this to one leg reopened precisely the hole it closes.
+  #
+  # Both verified by adding such a package and watching the check pass.
+  #
+  # Scope: this covers THIS MODULE's source. A dependency that uses cgo is
+  # covered by the CGO_ENABLED=0 build above — if it has a pure-Go fallback the
+  # build succeeds and the invariant holds, and if it does not the build fails.

@@ -1,0 +1,53 @@
+# ci-end2end — this file is yours.
+#
+# gt created it once and will never modify or delete it again.
+#
+# The suites that exercise a built artefact rather than the source: the
+# shipped container image, and a real systemd install. Moved from ci.yml
+# verbatim.
+name: ci-end2end
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: build and exercise the shipped image
+        run: deploy/verify-image.sh
+
+  # THE integration gate, and the one job allowed to be slow. It is what makes
+  # the Pi deployment trustworthy without a Pi.
+  #
+  # Every assertion in verify.sh is there because it caught something that a
+  # fully green unit-test suite did not: the service account, the ownership
+  # handover, the unit systemd actually accepts, an upgrade that restarts onto
+  # the new binary, a system install that does not use a per-user home, and a
+  # crash loop that must not be reported as running.
+
+  linux-install:
+    name: linux-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: install under a real systemd
+        run: deploy/testharness/verify.sh
+
+  # `goreleaser build --snapshot` on every PR, so the release configuration is
+  # exercised continuously rather than first tried on a tag — the one moment
+  # when a broken build is most expensive and least expected.
+  #
+  # --snapshot builds without a tag and publishes nothing.

@@ -1,0 +1,28 @@
+# Managed by gt — edit .gt-repo.yaml, then run `gt repo sync`.
+#
+# Daily batch window for merging Dependabot's eligible bumps. The Dependabot
+# cooldown (set in .github/dependabot.yml) is the supply-chain guard; this is
+# the merge executor on top of it.
+#
+# Bumps above `minor` are left for human review.
+#
+# Known gap, not a bug: Dependabot PRs touching .github/workflows/** can never
+# be merged here. There is no permissions: key granting GITHUB_TOKEN the
+# `workflow` scope, so the github-actions ecosystem always needs a human or
+# `gt repo fleet merge-pending`, which runs with your own credentials.
+name: Dependabot auto-merge
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+# A called reusable workflow can only narrow the caller's token, never widen
+# it, so the writes the merge job needs have to be granted here.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    uses: pedromvgomes/gt/.github/workflows/reusable-dependabot-auto-merge.yml@v1

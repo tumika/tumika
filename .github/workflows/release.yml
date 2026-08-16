@@ -14,7 +14,8 @@ on:
 permissions:
   contents: read
 
-# Never cancelled, unlike ci.yml. A half-run release is worse than a slow one,
+# Never cancelled, unlike ci-orchestration.yml. A half-run release is worse than
+# a slow one,
 # and two tags pushed back to back would otherwise race on the ghcr :latest tag
 # and could leave it on the older of the two.
 concurrency:
@@ -66,7 +67,7 @@ jobs:
         run: go test -race ./...
 
       # The deployment target, and the no-cgo invariant. Same reasoning as
-      # ci.yml's cross-compile job: a release is exactly the wrong moment to
+      # ci-build.yml's cross-compile job: a release is exactly the wrong moment to
       # discover that linux/arm64 stopped building.
       - name: cross-compile
         run: |
