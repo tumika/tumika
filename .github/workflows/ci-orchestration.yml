@@ -148,11 +148,31 @@ jobs:
     if: needs.attest.outputs.validated != 'true'
     uses: pedromvgomes/gt/.github/workflows/reusable-governance.yml@v1
 
+  bulwark:
+    needs: [attest, test]
+    # `!cancelled()` because a job whose needs were skipped is skipped too, and
+    # ci-gate counts skipped as a pass. Without it a preflight that skips tests
+    # would silently disable the security gate while the required check stayed
+    # green. bulwark still runs *after* tests, to consume their coverage.
+    if: "!cancelled() && needs.attest.outputs.validated != 'true'"
+    uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
+    # `inherit` because bulwark reads CODECOV_TOKEN and SEMGREP_APP_TOKEN,
+    # neither of which gt can name per repository — some repos set one, some
+    # both, some neither, and an enumerated block naming a secret a repo does
+    # not have is not an error but is not honest either. The callee is gt's own
+    # reusable workflow, pinned to a tag in a repository we control, and it
+    # forwards exactly those two values to bulwark and nothing else.
+    # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write
+
   # The single required check. `if: always()` so it still reports when a stage
   # was skipped, and a skipped stage passes — that is the point of preflight.
   ci-gate:
     name: ci-gate
-    needs: [attest, preflight, build, test, end2end, conventional-commits, governance]
+    needs: [attest, preflight, build, test, end2end, conventional-commits, governance, bulwark]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

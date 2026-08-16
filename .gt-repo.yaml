@@ -10,7 +10,7 @@
 # never touches them again. Branch protection needs exactly one check, ci-gate,
 # which waits on all of them.
 
-gt_version: v1.0.0
+gt_version: 1.0.0
 dependabot:
   - ecosystem: docker
     directory: /deploy/testharness
@@ -28,10 +28,7 @@ dependabot_auto_merge:
   max_bump: minor
   delete_branch: true
 bulwark:
-  # Off. ci.yml already runs bulwark against build-test's coverage artifact, and
-  # gt's stage would be a second run competing for the same baselines on the
-  # bulwark-state branch. It goes on in the PR that moves that job into ci-test.
-  enabled: false
+  enabled: true
 pipeline:
   ci:
     enabled: true
@@ -41,9 +38,6 @@ pipeline:
       - test
       - end2end
     merge_queue: false
-  # Off. There is no release workflow here yet, so nothing collides — but
-  # cd-orchestration would claim `v*.*.*` with verify-attestation require: true,
-  # and the first tag ever pushed would go red on a pipeline that ships nothing.
   cd:
     enabled: false
     stages:
@@ -54,13 +48,6 @@ pipeline:
     tags:
       - v*.*.*
 conventional_commits:
-  # On, and for now this duplicates pr-title.yml. gt's check is derived from
-  # that workflow — same case-insensitive matching, same Revert "…" tolerance —
-  # so the two agree; gt's adds an optional scope allowlist.
-  #
-  # pr-title.yml is a required status check today, so removing it is a branch
-  # protection change rather than a file deletion, and it belongs in the PR that
-  # makes ci-gate the required check.
   enabled: true
   scope: pr_title
   types:

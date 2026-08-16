@@ -1,10 +1,13 @@
 # ci-build — this file is yours.
 #
-# gt created it once and will never modify or delete it again. Put this
-# repository's build steps here; the orchestration around it stays gt's.
+# gt created it once and will never modify or delete it again.
 #
-# It is called by ci-orchestration.yml and must keep `workflow_call`, or the
-# orchestrator loses the stage.
+# Everything that answers "does this tree build and is it internally
+# consistent" — moved here verbatim from ci.yml, comments included.
+#
+# release-build lives here rather than in a cd-* stage on purpose: it proves
+# goreleaser can still produce what the updater and installer expect, on every
+# PR, which is a build property. Actually shipping is a separate concern.
 name: ci-build
 
 on:
@@ -14,10 +17,128 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: build
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
-      # A no-op so the stage is green from the first run. Replace it.
-      - name: Nothing to do yet
-        run: echo "No build steps defined. Add them in .github/workflows/ci-build.yml"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # golangci-lint runs depguard, which is the mechanical enforcement of the
+      # layering rules in .agents/rules/ and ADR-0004. A forbidden import fails
+      # the build here rather than becoming a review argument.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  sqlc:
+    name: sqlc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      # Installed from source at a pinned version rather than via a third-party
+      # setup action: one fewer action to trust, and the version that generated
+      # the committed code is visible right here. Keep it in step with the
+      # version stamped in the generated files' header.
+      - name: install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+
+      # Fails when the committed generated code disagrees with the queries or
+      # the schema. That is what makes
+      # .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md
+      # mechanical rather than a habit — stale generated code otherwise fails at
+      # the exact query, at runtime, on the one path nobody exercised.
+      - name: sqlc diff
+        run: sqlc diff
+
+  cross-compile:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: go build ./...
+
+      # Every leg, with this leg's GOOS/GOARCH: see the note above. CGO_ENABLED=1
+      # so the cgo files are visible to `go list` at all.
+      - name: no cgo
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: |
+          cgo=$(go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
+          if [ -n "$cgo" ]; then
+            echo "these packages use cgo on ${GOOS}/${GOARCH}, which breaks the static build:" >&2
+            echo "$cgo" >&2
+            exit 1
+          fi
+
+  # The SHIPPED image (ADR: D9). The test-harness image is not built here: the
+  # linux-install job below builds it from the same context and then actually
+  # exercises it, so a second build could only fail in cases that one already
+  # covers.
+  #
+  # verify-image.sh does more than build: an image that compiles and cannot run
+  # the binary, write its volume as an unprivileged account, or answer the API
+  # is an image nobody can use.
+
+  release-build:
+    name: release-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      # release --snapshot, not build --snapshot: `build` produces no archives
+      # and no checksums, which is most of what the next step verifies.
+      # --skip=publish means nothing leaves the runner.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --snapshot --skip=publish --clean
+
+      # The names install.sh and `tumika update` depend on, and the ldflags that
+      # decide whether self-update works at all. None of it is checked by the
+      # compiler or by `goreleaser check`, and every failure would surface at the
+      # next release rather than here.
+      - name: the release ships what the updater and installer expect
+        run: scripts/verify-release-assets.sh
