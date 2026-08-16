@@ -156,14 +156,23 @@ jobs:
     # green. bulwark still runs *after* tests, to consume their coverage.
     if: "!cancelled() && needs.attest.outputs.validated != 'true'"
     uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
-    # `inherit` because bulwark reads CODECOV_TOKEN and SEMGREP_APP_TOKEN,
-    # neither of which gt can name per repository — some repos set one, some
-    # both, some neither, and an enumerated block naming a secret a repo does
-    # not have is not an error but is not honest either. The callee is gt's own
-    # reusable workflow, pinned to a tag in a repository we control, and it
-    # forwards exactly those two values to bulwark and nothing else.
-    # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit
-    secrets: inherit
+    # Named explicitly, NOT `inherit`. GitHub documents inherit as working for
+    # "reusable workflows in the same organization or enterprise", and gt lives
+    # under a different owner than most repositories that call it — so an
+    # organization secret never arrived, bulwark skipped its Codecov upload and
+    # quietly fell back to token-less semgrep. Nothing failed; coverage history
+    # just stopped being recorded.
+    #
+    # Naming them makes this workflow resolve each value in its own context and
+    # pass it in, which works across owners. An unset secret resolves to the
+    # empty string, which bulwark already treats as "not configured", so a
+    # repository using neither is unaffected.
+    #
+    # This also answers semgrep's secrets-inherit rule properly rather than
+    # suppressing it: nothing is inherited here now.
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
     permissions:
       contents: write
       pull-requests: write
