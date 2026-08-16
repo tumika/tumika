@@ -443,3 +443,154 @@ func TestPlatformKey(t *testing.T) {
 		})
 	}
 }
+
+func TestStableReportsTheBucketsCurrentVersion(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	got, err := inst.release.Stable(t.Context())
+	if err != nil {
+		t.Fatalf("Stable: %v", err)
+	}
+	// Informational only. The real bucket's stable was 2.1.224 while the pin was
+	// 2.1.233 — tumika installs the pin, not whatever is current.
+	if got != b.version {
+		t.Errorf("Stable = %q, want %q", got, b.version)
+	}
+}
+
+// A bucket that is unreachable, or that serves an error, must fail loudly rather
+// than installing something unverified.
+func TestFetchFailuresAreReported(t *testing.T) {
+	tests := map[string]http.HandlerFunc{
+		"manifest missing": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+		"bucket erroring": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+	}
+
+	for name, handler := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+
+			inst, err := NewInstaller(t.TempDir(), WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+			if err != nil {
+				t.Fatalf("NewInstaller: %v", err)
+			}
+
+			if _, err := inst.Install(t.Context(), "9.9.9"); err == nil {
+				t.Error("a failing bucket produced no error")
+			}
+			if _, err := inst.release.Stable(t.Context()); err == nil {
+				t.Error("Stable produced no error against a failing bucket")
+			}
+		})
+	}
+}
+
+// The binary is fetched separately from the manifest, so it has its own failure
+// path — and a 404 there must not leave a half-written install.
+func TestBinaryDownloadFailureLeavesNothingBehind(t *testing.T) {
+	b := newBucket(t)
+	server := b.serve(t)
+
+	// Re-serve everything except the binary.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+BinaryName) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	proxy := httptest.NewServer(mux)
+	t.Cleanup(proxy.Close)
+
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL(proxy.URL), WithHTTPClient(proxy.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	inst.release.keyring = openpgp.EntityList{b.entity}
+
+	if _, err := inst.Install(t.Context(), b.version); err == nil {
+		t.Fatal("a missing binary produced no error")
+	}
+
+	installed, err := inst.Installed(t.Context())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if len(installed) != 0 {
+		t.Errorf("a failed download left %v behind", installed)
+	}
+}
+
+// A manifest with no build for this machine is a clear refusal, not a confusing
+// download failure.
+func TestInstallRefusesAManifestWithoutThisPlatform(t *testing.T) {
+	b := newBucket(t)
+	b.platform = "solaris-sparc"
+	inst, _ := installerFor(t, b)
+
+	if _, err := inst.Install(t.Context(), b.version); !errors.Is(err, ErrPlatformUnsupported) {
+		t.Fatalf("= %v, want ErrPlatformUnsupported", err)
+	}
+}
+
+// A size that disagrees with the manifest means the manifest and the artifact
+// describe different things, which is worth refusing on its own.
+func TestInstallRefusesASizeMismatch(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	// Same bytes, so the checksum passes; the manifest lies about the length.
+	b.binary = append(b.binary, "extra"...)
+
+	if _, err := inst.Install(t.Context(), b.version); err == nil {
+		t.Error("a size mismatch was accepted")
+	}
+}
+
+func TestInstallRejectsAnEmptyVersion(t *testing.T) {
+	inst, err := NewInstaller(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	if _, err := inst.Install(t.Context(), ""); err == nil {
+		t.Error("an empty version was accepted")
+	}
+}
+
+// Unparseable directory names sort last rather than being dropped, so debris
+// stays visible to Prune instead of accumulating unnoticed.
+func TestVersionSortingHandlesDebris(t *testing.T) {
+	versions := []string{"2.1.9", "not-a-version", "2.2.0", "also-bad"}
+	sortVersionsNewestFirst(versions)
+
+	if versions[0] != "2.2.0" || versions[1] != "2.1.9" {
+		t.Errorf("valid versions did not sort first: %v", versions)
+	}
+	if len(versions) != 4 {
+		t.Errorf("sorting dropped entries: %v", versions)
+	}
+}
+
+// The fingerprint assertion is what stops a swapped key file silently changing
+// who tumika trusts.
+func TestFingerprintAssertionRejectsAForeignKey(t *testing.T) {
+	other, err := openpgp.NewEntity("Impostor", "", "impostor@example.com", nil)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+
+	err = assertFingerprint(openpgp.EntityList{other})
+	if !errors.Is(err, ErrUnsignedManifest) {
+		t.Fatalf("= %v, want ErrUnsignedManifest", err)
+	}
+	if !strings.Contains(err.Error(), SigningKeyFingerprint) {
+		t.Errorf("the error should name the expected fingerprint, got: %v", err)
+	}
+}
