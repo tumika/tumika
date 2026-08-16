@@ -594,3 +594,98 @@ func TestFingerprintAssertionRejectsAForeignKey(t *testing.T) {
 		t.Errorf("the error should name the expected fingerprint, got: %v", err)
 	}
 }
+
+// A providers root that is a file, not a directory, is what a botched volume
+// mount looks like. It must be an error, not a panic or a silent skip.
+func TestARootThatIsNotADirectory(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "providers")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	b := newBucket(t)
+	server := b.serve(t)
+	inst, err := NewInstaller(blocked, WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	inst.release.keyring = openpgp.EntityList{b.entity}
+
+	if _, err := inst.Installed(t.Context()); err == nil {
+		t.Error("Installed succeeded with a file where its root should be")
+	}
+	if _, err := inst.Install(t.Context(), b.version); err == nil {
+		t.Error("Install succeeded with a file where its root should be")
+	}
+}
+
+// The publish step renames a whole directory into place. If something is
+// already there — a previous interrupted install that left a directory without
+// a binary — the rename collides, and that must not be reported as success.
+func TestInstallHandlesACollisionAtPublishTime(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	// A directory with no binary: Install does not treat it as present (there is
+	// nothing to run), so it downloads and then meets it at the rename.
+	if err := os.MkdirAll(filepath.Join(inst.root, b.version, "debris"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	result, err := inst.Install(t.Context(), b.version)
+	if err == nil && !result.AlreadyPresent {
+		t.Error("a colliding publish reported a clean install")
+	}
+	if err != nil && !strings.Contains(err.Error(), b.version) {
+		t.Errorf("the error should name the version, got: %v", err)
+	}
+}
+
+// A download cut short mid-stream fails its checksum, which is the property that
+// matters: a truncated 307 MB binary must never be published.
+func TestATruncatedDownloadIsRejected(t *testing.T) {
+	b := newBucket(t)
+	server := b.serve(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+BinaryName) {
+			// Half the bytes, then stop.
+			_, _ = w.Write(b.binary[:len(b.binary)/2])
+			return
+		}
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	proxy := httptest.NewServer(mux)
+	t.Cleanup(proxy.Close)
+
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL(proxy.URL), WithHTTPClient(proxy.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	inst.release.keyring = openpgp.EntityList{b.entity}
+
+	if _, err := inst.Install(t.Context(), b.version); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("= %v, want ErrChecksumMismatch", err)
+	}
+
+	installed, _ := inst.Installed(t.Context())
+	if len(installed) != 0 {
+		t.Errorf("a truncated download was published: %v", installed)
+	}
+}
+
+// An unusable base URL is a configuration error and must surface as one.
+func TestAnUnusableBaseURL(t *testing.T) {
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL("://not a url"))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+
+	if _, err := inst.release.Stable(t.Context()); err == nil {
+		t.Error("an unusable base URL produced no error")
+	}
+	if _, err := inst.Install(t.Context(), "9.9.9"); err == nil {
+		t.Error("an unusable base URL produced no error from Install")
+	}
+}
