@@ -99,6 +99,22 @@ func NewSystemd(opts ...SystemdOption) (*Systemd, error) {
 
 func (s *Systemd) unitPath() string { return filepath.Join(s.unitDir, UnitName) }
 
+// Prepare creates the service account, so anything that runs AS it can.
+//
+// Called before Install, because key custody is probed by running a transient
+// unit as this account and systemd-run cannot resolve a user that does not
+// exist yet.
+func (s *Systemd) Prepare(ctx context.Context, cfg Config) error {
+	if cfg.User == "" {
+		cfg.User = DefaultUser
+	}
+	if s.euid != 0 {
+		return fmt.Errorf("%w: creating the %s account needs root; try sudo",
+			ErrPrivilegesRequired, cfg.User)
+	}
+	return s.ensureUser(ctx, cfg.User)
+}
+
 // Install writes the unit, creates the service account, and enables it.
 //
 // Idempotent by construction: every step is either a rewrite or is skipped when
@@ -106,6 +122,9 @@ func (s *Systemd) unitPath() string { return filepath.Join(s.unitDir, UnitName) 
 // rather than a mistake.
 func (s *Systemd) Install(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := validForUnitFile(cfg); err != nil {
 		return err
 	}
 	if cfg.User == "" {
@@ -141,12 +160,55 @@ func (s *Systemd) Install(ctx context.Context, cfg Config) error {
 	if out, err := s.run(ctx, "systemctl", "daemon-reload"); err != nil {
 		return commandError("systemctl daemon-reload", out, err)
 	}
-	// enable --now, so one command leaves the service both running and
-	// surviving a reboot. Enabling without starting is the failure an operator
-	// discovers by rebooting; starting without enabling is the one they
-	// discover months later.
-	if out, err := s.run(ctx, "systemctl", "enable", "--now", UnitName); err != nil {
-		return commandError("systemctl enable --now "+UnitName, out, err)
+	// enable, so it survives a reboot — the failure an operator discovers months
+	// later, by rebooting.
+	if out, err := s.run(ctx, "systemctl", "enable", UnitName); err != nil {
+		return commandError("systemctl enable "+UnitName, out, err)
+	}
+
+	// restart, NOT `enable --now`.
+	//
+	// `--now` runs `start`, which is a no-op on an already-active unit. A second
+	// install is the documented upgrade path: copyExecutable renames a new
+	// binary into place and the unit may have gained a LoadCredentialEncrypted=
+	// or changed its User=, and none of it would take effect until the next
+	// reboot — while the command printed "Installed and started." restart also
+	// starts a stopped unit, so it covers the first install too.
+	if out, err := s.run(ctx, "systemctl", "restart", UnitName); err != nil {
+		return commandError("systemctl restart "+UnitName, out, err)
+	}
+	return nil
+}
+
+// validForUnitFile refuses values a unit file cannot carry intact.
+//
+// systemd splits ExecStart= on whitespace, so `/srv/tumika data/bin/tumika`
+// becomes a command plus an argument and fails 203/EXEC. Environment= is parsed
+// as space-separated KEY=VALUE, so half a path becomes a second assignment and
+// the daemon builds its state tree somewhere else entirely. And `%` introduces a
+// specifier, so `%h` inside a path is rewritten to something unrelated.
+//
+// Every one of those produces an install that reports success and a service that
+// does not work — this package's characteristic failure.
+//
+// Refused rather than quoted. Quoting works, but it puts the escaping burden on
+// every future edit of the template, and nobody needs a service directory with a
+// space in it badly enough to pay that. macOS has no such constraint, which is
+// why this lives here rather than in Config.Validate.
+func validForUnitFile(cfg Config) error {
+	for _, field := range []struct{ name, value string }{
+		{"binary path", cfg.Binary},
+		{"home", cfg.Home},
+		{"sealed key path", cfg.SealedKey},
+	} {
+		if strings.ContainsAny(field.value, " \t") {
+			return fmt.Errorf("%s %q contains whitespace, which systemd reads as an argument boundary",
+				field.name, field.value)
+		}
+		if strings.Contains(field.value, "%") {
+			return fmt.Errorf("%s %q contains %%, which systemd reads as a specifier prefix",
+				field.name, field.value)
+		}
 	}
 	return nil
 }
@@ -187,6 +249,10 @@ func (s *Systemd) ensureUser(ctx context.Context, name string) error {
 // opens. Ownership changes; the 0700 modes do not, so the tree stays private to
 // the service rather than becoming world-readable.
 func (s *Systemd) giveHomeToService(cfg Config) error {
+	if err := safeToGiveAway(cfg.Home); err != nil {
+		return err
+	}
+
 	account, err := s.resolveUser(cfg.User)
 	if err != nil {
 		return err
@@ -211,6 +277,45 @@ func (s *Systemd) giveHomeToService(cfg Config) error {
 	})
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+// systemRoots are directories this must never hand to an unprivileged account.
+//
+// The chown is recursive and irreversible — the original owners are not recorded
+// anywhere — so `--home /` or a typo'd `--home /home` would quietly give away
+// the machine. Validate only checks that the path is absolute, which these all
+// are.
+var systemRoots = map[string]bool{
+	"/": true, "/bin": true, "/boot": true, "/dev": true, "/etc": true,
+	"/home": true, "/lib": true, "/media": true, "/mnt": true, "/opt": true,
+	"/proc": true, "/root": true, "/run": true, "/sbin": true, "/srv": true,
+	"/sys": true, "/tmp": true, "/usr": true, "/var": true, "/var/lib": true,
+	"/var/log": true, "/var/tmp": true,
+}
+
+// safeToGiveAway refuses a home that must not be handed to the service account.
+func safeToGiveAway(home string) error {
+	clean := filepath.Clean(home)
+	if systemRoots[clean] {
+		return fmt.Errorf(
+			"refusing to give %s to the service account: it is a system directory, and the "+
+				"handover is recursive and cannot be undone", clean)
+	}
+
+	// A symlinked home would have WalkDir following it and chowning whatever it
+	// points at, while Lchown protects only the links INSIDE the tree.
+	info, err := os.Lstat(clean)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // about to be created, owned correctly from the start
+		}
+		return fmt.Errorf("stat %s: %w", clean, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to give %s to the service account: it is a symlink, so the "+
+			"handover would follow it out of tumika's own tree", clean)
 	}
 	return nil
 }
@@ -252,11 +357,17 @@ func (s *Systemd) Uninstall(ctx context.Context) error {
 		return fmt.Errorf("%w: removing %s needs root; try sudo", ErrPrivilegesRequired, s.unitPath())
 	}
 
-	// Failures here are reported but not fatal: the unit is being deleted, and
-	// refusing to remove the file because the service was already stopped would
-	// leave the machine in the half state this is meant to clear.
+	// Not fatal: the unit is being deleted, and refusing to remove the file
+	// because the service was already stopped would leave the machine in the
+	// half state this is meant to clear.
+	//
+	// But NOT silent either. If the stop timed out on a wedged daemon, the unit
+	// is about to disappear while the process is still running and nothing is
+	// left to stop it — an operator needs to know that, even though the removal
+	// itself succeeded.
 	if out, err := s.run(ctx, "systemctl", "disable", "--now", UnitName); err != nil {
-		_ = out
+		Warnf("could not stop the service before removing it (%v)%s; "+
+			"check `ps` for a surviving tumika process", err, detail(out))
 	}
 
 	if err := os.Remove(s.unitPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -313,8 +424,20 @@ func (s *Systemd) Status(ctx context.Context) (Status, error) {
 	active, _ := s.run(ctx, "systemctl", "is-active", UnitName)
 	status.Detail = strings.TrimSpace(string(active))
 	switch status.Detail {
-	case "active", "activating", "reloading":
+	case "active", "reloading":
 		status.State = StateRunning
+	case "activating":
+		// NOT running. A unit in a Restart=always crash loop reports
+		// "activating" forever and never reaches "failed", because the
+		// supervisor keeps trying — so this is the state a dead install
+		// actually presents as, and calling it running is what let one report
+		// success. The restart counter tells the two apart: a genuine first
+		// start has not restarted yet.
+		status.State = StateStarting
+		if s.restarts(ctx) > 0 {
+			status.State = StateFailed
+			status.Detail = "restarting repeatedly; see `journalctl -u " + UnitName + "`"
+		}
 	case "inactive", "deactivating":
 		status.State = StateStopped
 	case "failed":
@@ -327,6 +450,22 @@ func (s *Systemd) Status(ctx context.Context) (Status, error) {
 	status.Enabled = strings.TrimSpace(string(enabled)) == "enabled"
 
 	return status, nil
+}
+
+// restarts is how many times systemd has had to restart the unit.
+//
+// Zero on a healthy first start, and climbing on a crash loop. Read rather than
+// inferred, because "activating" alone cannot tell the two apart.
+func (s *Systemd) restarts(ctx context.Context) int {
+	out, err := s.run(ctx, "systemctl", "show", "-p", "NRestarts", "--value", UnitName)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // renderUnit builds the unit file.

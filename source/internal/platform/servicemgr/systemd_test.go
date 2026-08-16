@@ -135,9 +135,15 @@ func TestInstallWritesTheUnitAndEnablesIt(t *testing.T) {
 	if rec.indexOf(t, "systemctl daemon-reload") > rec.indexOf(t, "systemctl enable") {
 		t.Errorf("enable ran before daemon-reload: %v", rec.joined())
 	}
-	// --now, so one command leaves it both running and surviving a reboot.
-	if !strings.Contains(strings.Join(rec.joined(), "\n"), "systemctl enable --now "+UnitName) {
-		t.Errorf("the service was enabled without being started: %v", rec.joined())
+	calls := strings.Join(rec.joined(), "\n")
+	if !strings.Contains(calls, "systemctl enable "+UnitName) {
+		t.Errorf("the service was not enabled, so it will not survive a reboot: %v", rec.joined())
+	}
+	// restart, not `enable --now`. `start` is a no-op on an active unit, so the
+	// documented upgrade path would leave the daemon on the old binary.
+	if !strings.Contains(calls, "systemctl restart "+UnitName) {
+		t.Errorf("the service was not restarted, so an upgrade would keep running the old binary: %v",
+			rec.joined())
 	}
 }
 
@@ -337,7 +343,10 @@ func TestStatusReadsTheOutputNotTheExitCode(t *testing.T) {
 		enabled   bool
 	}{
 		{"active", "enabled", StateRunning, true},
-		{"activating", "enabled", StateRunning, true},
+		// NOT running. This is what a Restart=always crash loop reports
+		// forever — it never reaches "failed" — so calling it running is the
+		// exact lie that let a dead install print "state running".
+		{"activating", "enabled", StateStarting, true},
 		{"inactive", "disabled", StateStopped, false},
 		{"failed", "enabled", StateFailed, true},
 		{"something-new", "enabled", StateUnknown, true},
@@ -597,5 +606,233 @@ func TestInstallDefaultsTheServiceAccount(t *testing.T) {
 	}
 	if !strings.Contains(string(unit), "User="+DefaultUser) {
 		t.Errorf("the unit does not name the default account:\n%s", unit)
+	}
+}
+
+// A crash loop reports "activating" forever. The restart counter is what tells
+// it apart from a genuine first start, and getting this wrong is what let a
+// service that had never executed report itself as running.
+func TestACrashLoopIsNotReportedAsStarting(t *testing.T) {
+	rec := newRecorder()
+	rec.output["systemctl is-active"] = "activating\n"
+	rec.output["systemctl is-enabled"] = "enabled\n"
+	rec.output["systemctl show -p NRestarts"] = "7\n"
+
+	mgr, unitDir := newTestSystemd(t, rec)
+	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	status, err := mgr.Status(t.Context())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.State != StateFailed {
+		t.Errorf("state = %q, want %q for a unit that has restarted 7 times", status.State, StateFailed)
+	}
+	if status.State == StateRunning {
+		t.Error("a service that has never executed is reported as running")
+	}
+}
+
+// A genuine first start has not restarted, and must not be called failed.
+func TestAFirstStartIsStartingNotFailed(t *testing.T) {
+	rec := newRecorder()
+	rec.output["systemctl is-active"] = "activating\n"
+	rec.output["systemctl is-enabled"] = "enabled\n"
+	rec.output["systemctl show -p NRestarts"] = "0\n"
+
+	mgr, unitDir := newTestSystemd(t, rec)
+	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	status, err := mgr.Status(t.Context())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.State != StateStarting {
+		t.Errorf("state = %q, want %q", status.State, StateStarting)
+	}
+}
+
+// The chown is recursive and cannot be undone, so a system directory must be
+// refused before anything is handed over.
+func TestInstallRefusesToGiveAwayASystemDirectory(t *testing.T) {
+	for _, home := range []string{"/", "/home", "/usr", "/var", "/var/lib", "/etc", "/root"} {
+		rec := newRecorder()
+		var chowned []string
+		mgr, unitDir := newTestSystemd(t, rec, withSystemdChown(func(path string, _, _ int) error {
+			chowned = append(chowned, path)
+			return nil
+		}))
+
+		cfg := testConfig(t)
+		cfg.Home = home
+
+		if err := mgr.Install(t.Context(), cfg); err == nil {
+			t.Errorf("%s was accepted as a home directory", home)
+		}
+		if len(chowned) != 0 {
+			t.Errorf("%s: ownership was changed before the refusal: %v", home, chowned)
+		}
+		if _, err := os.Stat(filepath.Join(unitDir, UnitName)); err == nil {
+			t.Errorf("%s: a unit was written", home)
+		}
+	}
+}
+
+// Lchown protects links INSIDE the tree; a symlinked root would have WalkDir
+// following it and chowning whatever it points at.
+func TestInstallRefusesASymlinkedHome(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "elsewhere")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(dir, "home")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	rec := newRecorder()
+	var chowned []string
+	mgr, _ := newTestSystemd(t, rec, withSystemdChown(func(path string, _, _ int) error {
+		chowned = append(chowned, path)
+		return nil
+	}))
+
+	cfg := testConfig(t)
+	cfg.Home = link
+
+	if err := mgr.Install(t.Context(), cfg); err == nil {
+		t.Fatal("a symlinked home was accepted")
+	}
+	if len(chowned) != 0 {
+		t.Errorf("ownership was changed outside tumika's tree: %v", chowned)
+	}
+}
+
+// Prepare creates the account and nothing else, so the handover probe has a
+// user to run as before any unit is written.
+func TestPrepareCreatesOnlyTheAccount(t *testing.T) {
+	rec := newRecorder()
+	mgr, unitDir := newTestSystemd(t, rec, withSystemdUserLookup(func(string) bool { return false }))
+
+	if err := mgr.Prepare(t.Context(), testConfig(t)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if _, err := rec.joined(), error(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0][0] != "useradd" {
+		t.Errorf("Prepare did more than create the account: %v", rec.joined())
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, UnitName)); err == nil {
+		t.Error("Prepare wrote a unit")
+	}
+}
+
+func TestPrepareNeedsRoot(t *testing.T) {
+	rec := newRecorder()
+	mgr, _ := newTestSystemd(t, rec, withSystemdEUID(1000))
+
+	if err := mgr.Prepare(t.Context(), testConfig(t)); !errors.Is(err, ErrPrivilegesRequired) {
+		t.Fatalf("= %v, want ErrPrivilegesRequired", err)
+	}
+}
+
+// A stop that fails during an uninstall is not fatal — the unit is going away —
+// but it must not be silent either: a daemon may survive with nothing left to
+// stop it.
+func TestAFailedStopDuringUninstallIsReported(t *testing.T) {
+	rec := newRecorder()
+	rec.fail["systemctl disable"] = errors.New("exit status 1")
+
+	var warnings []string
+	originalWarn := Warnf
+	Warnf = func(format string, args ...any) {
+		warnings = append(warnings, format)
+	}
+	t.Cleanup(func() { Warnf = originalWarn })
+
+	mgr, unitDir := newTestSystemd(t, rec)
+	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := mgr.Uninstall(t.Context()); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Error("a failed stop was swallowed silently")
+	}
+}
+
+// systemd splits ExecStart= on whitespace and parses Environment= as
+// space-separated KEY=VALUE, and `%` introduces a specifier. Each one produces
+// an install that reports success and a service that does not work.
+//
+// validForUnitFile is called DIRECTLY rather than through Install. Going through
+// Install passed for the wrong reason: an unwritable path like "/srv/tumika
+// data" fails at MkdirAll long before anything inspects it, so the test stayed
+// green with the validation removed entirely.
+func TestTheUnitRefusesValuesItCannotCarryIntact(t *testing.T) {
+	cases := map[string]Config{
+		"space in the binary path": {Binary: "/opt/tumika suite/bin/tumika", Home: "/var/lib/tumika"},
+		"space in the home":        {Binary: "/usr/local/bin/tumika", Home: "/srv/tumika data"},
+		"tab in the home":          {Binary: "/usr/local/bin/tumika", Home: "/srv/tumika\tdata"},
+		"specifier in the home":    {Binary: "/usr/local/bin/tumika", Home: "/srv/%h/tumika"},
+		"specifier in the binary":  {Binary: "/usr/local/bin/%i/tumika", Home: "/var/lib/tumika"},
+		"space in the sealed key":  {Binary: "/usr/local/bin/tumika", Home: "/var/lib/tumika", SealedKey: "/var/lib/my tumika/master.cred"},
+	}
+
+	for name, cfg := range cases {
+		if err := validForUnitFile(cfg); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+
+	ok := Config{Binary: "/usr/local/bin/tumika", Home: "/var/lib/tumika", SealedKey: "/var/lib/tumika/master.cred"}
+	if err := validForUnitFile(ok); err != nil {
+		t.Errorf("an ordinary config was refused: %v", err)
+	}
+}
+
+// And Install applies it, before writing anything.
+func TestInstallAppliesTheUnitFileRules(t *testing.T) {
+	rec := newRecorder()
+	mgr, unitDir := newTestSystemd(t, rec)
+
+	cfg := testConfig(t)
+	cfg.Binary = "/opt/tumika suite/bin/tumika"
+
+	if err := mgr.Install(t.Context(), cfg); err == nil {
+		t.Fatal("a binary path with a space was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, UnitName)); err == nil {
+		t.Error("a unit was written anyway")
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("the supervisor was called anyway: %v", rec.joined())
+	}
+}
+
+// And the constraint is systemd's alone. macOS's own default home is
+// ~/Library/Application Support/tumika — a path with a space that a plist
+// handles without complaint — so applying this rule to both would break every
+// Mac install to protect Linux.
+func TestAPathWithASpaceIsFineOnMacOS(t *testing.T) {
+	rec := newRecorder()
+	mgr, _ := newTestLaunchd(t, rec)
+
+	home := filepath.Join(t.TempDir(), "Application Support", "tumika")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	cfg := Config{Binary: "/usr/local/bin/tumika", Home: home}
+	if err := mgr.Install(t.Context(), cfg); err != nil {
+		t.Fatalf("a normal macOS path was refused: %v", err)
 	}
 }

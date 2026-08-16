@@ -118,10 +118,13 @@ func TestLaunchdEscapesPathsIntoThePlist(t *testing.T) {
 	}
 }
 
-// Stop kills the process without unloading the service. bootout would remove it
-// from the domain, so a later Start would fail with "service not found" and the
-// operator would have to reinstall to undo a stop.
-func TestLaunchdStopDoesNotUnloadTheService(t *testing.T) {
+// Stop has to actually stop it.
+//
+// `launchctl kill` looks gentler and stops nothing: the plist sets KeepAlive, so
+// launchd relaunches the process a moment later while `tumika stop` reports
+// success. KeepAlive is not negotiable — an update exits zero to be relaunched
+// on the new binary — so Stop unloads instead.
+func TestLaunchdStopUnloadsTheServiceRatherThanKillingIt(t *testing.T) {
 	rec := newRecorder()
 	mgr, agentDir := newTestLaunchd(t, rec)
 	if err := os.WriteFile(filepath.Join(agentDir, Label+".plist"), []byte("<plist/>"), 0o644); err != nil {
@@ -131,13 +134,39 @@ func TestLaunchdStopDoesNotUnloadTheService(t *testing.T) {
 	if err := mgr.Stop(t.Context()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	for _, call := range rec.joined() {
-		if strings.HasPrefix(call, "launchctl bootout") {
-			t.Errorf("Stop unloaded the service, so Start could not undo it: %s", call)
-		}
+
+	calls := strings.Join(rec.joined(), "\n")
+	if !strings.Contains(calls, "launchctl bootout") {
+		t.Errorf("Stop did not unload the service, so KeepAlive would relaunch it: %v", rec.joined())
 	}
+	// The plist stays, so a later Start needs no reinstall.
 	if _, err := os.Stat(filepath.Join(agentDir, Label+".plist")); err != nil {
-		t.Error("Stop removed the plist")
+		t.Error("Stop removed the plist, so starting again would need a reinstall")
+	}
+}
+
+// And Start has to load it back, since Stop unloaded it. A bare kickstart would
+// fail with "service not found" after a stop.
+func TestLaunchdStartReloadsAfterAStop(t *testing.T) {
+	rec := newRecorder()
+	mgr, agentDir := newTestLaunchd(t, rec)
+	if err := os.WriteFile(filepath.Join(agentDir, Label+".plist"), []byte("<plist/>"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := mgr.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := mgr.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	calls := strings.Join(rec.joined(), "\n")
+	if !strings.Contains(calls, "launchctl bootstrap") {
+		t.Errorf("Start did not load the service back into the domain: %v", rec.joined())
+	}
+	if !strings.Contains(calls, "launchctl kickstart") {
+		t.Errorf("Start did not start the service: %v", rec.joined())
 	}
 }
 
@@ -294,7 +323,7 @@ func TestLaunchdReportsSupervisorFailures(t *testing.T) {
 			return m.Install(context.Background(), Config{Binary: "/usr/local/bin/tumika", Home: "/tmp"})
 		}},
 		{"kickstart", "launchctl kickstart", func(m *Launchd) error { return m.Start(context.Background()) }},
-		{"kill", "launchctl kill", func(m *Launchd) error { return m.Stop(context.Background()) }},
+		{"bootout", "launchctl bootout", func(m *Launchd) error { return m.Stop(context.Background()) }},
 	} {
 		rec := newRecorder()
 		rec.fail[tc.fail] = errors.New("exit status 1")
@@ -358,5 +387,109 @@ func TestThePlistIsStableAcrossRenders(t *testing.T) {
 		if string(again) != string(first) {
 			t.Fatal("the plist is not stable across renders")
 		}
+	}
+}
+
+// Enabled means "will start at boot", and printStatus suppresses the "it will
+// not come back after a restart" warning on the strength of it. Assuming true
+// whenever a plist exists reported a disabled agent as enabled — suppressing
+// exactly the warning that exists to catch it.
+func TestLaunchdEnabledReflectsWhetherLaunchdWillStartIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"disabled", "{\n\t\"" + Label + "\" => true\n}\n", false},
+		{"explicitly enabled", "{\n\t\"" + Label + "\" => false\n}\n", true},
+		{"never disabled", "{\n\t\"com.example.other\" => true\n}\n", true},
+	} {
+		rec := newRecorder()
+		rec.output["launchctl print-disabled"] = tc.out
+		rec.output["launchctl print "] = "\tlast exit code = 0\n"
+
+		mgr, agentDir := newTestLaunchd(t, rec)
+		if err := os.WriteFile(filepath.Join(agentDir, Label+".plist"), []byte("<plist/>"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		status, err := mgr.Status(t.Context())
+		if err != nil {
+			t.Fatalf("%s: Status: %v", tc.name, err)
+		}
+		if status.Enabled != tc.want {
+			t.Errorf("%s: enabled = %v, want %v", tc.name, status.Enabled, tc.want)
+		}
+	}
+}
+
+// A LaunchAgent runs as the operator, who necessarily exists, so there is
+// nothing to prepare — and it must not fail for a platform that has no service
+// account to create.
+func TestLaunchdPrepareIsANoOp(t *testing.T) {
+	rec := newRecorder()
+	mgr, agentDir := newTestLaunchd(t, rec)
+
+	if err := mgr.Prepare(t.Context(), testConfig(t)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("Prepare called launchctl: %v", rec.joined())
+	}
+	entries, err := os.ReadDir(agentDir)
+	if err != nil {
+		t.Fatalf("read the agent directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Prepare wrote %d file(s)", len(entries))
+	}
+}
+
+// An install onto an unwritable agent directory must fail rather than report a
+// service that was never written.
+func TestLaunchdInstallReportsAnUnwritableAgentDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	rec := newRecorder()
+	parent := t.TempDir()
+	agentDir := filepath.Join(parent, "LaunchAgents")
+	if err := os.MkdirAll(agentDir, 0o500); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(agentDir, 0o700) })
+
+	mgr, _ := newTestLaunchd(t, rec, withLaunchdAgentDir(agentDir))
+
+	if err := mgr.Install(t.Context(), testConfig(t)); err == nil {
+		t.Fatal("an install onto an unwritable directory reported success")
+	}
+}
+
+// detail bounds what a runaway supervisor can print into a warning.
+func TestDetailIsBounded(t *testing.T) {
+	if got := detail(nil); got != "" {
+		t.Errorf("detail(nil) = %q, want empty", got)
+	}
+	if got := detail([]byte("   ")); got != "" {
+		t.Errorf("detail(whitespace) = %q, want empty", got)
+	}
+
+	long := detail([]byte(strings.Repeat("x", 5000)))
+	if len(long) > 260 {
+		t.Errorf("detail is %d chars; a runaway supervisor could fill a terminal", len(long))
+	}
+	if !strings.HasSuffix(long, "…") {
+		t.Error("a truncated detail does not say it was truncated")
+	}
+}
+
+// The plist renderer refuses a type it cannot express, rather than emitting
+// something launchd will silently misread.
+func TestWritePlistKeyRefusesAnUnknownType(t *testing.T) {
+	var b strings.Builder
+	if err := writePlistKey(&b, "Count", 42); err == nil {
+		t.Fatal("an unsupported type was rendered into the plist")
 	}
 }

@@ -253,10 +253,7 @@ func TestHandoverWorksReportsTheProbeResult(t *testing.T) {
 	}
 
 	if !HandoverWorks(t.Context(), "/var/lib/tumika/master.cred", "tumika", probe) {
-		if _, err := os.Stat("/usr/bin/systemd-run"); err == nil {
-			t.Error("a succeeding probe was reported as a failure")
-		}
-		t.Skip("systemd-run is not on this machine, so the probe short-circuits")
+		t.Fatal("a succeeding probe was reported as a failure")
 	}
 
 	joined := strings.Join(seen, " ")
@@ -292,10 +289,6 @@ func TestExecCredsRunnerReportsFailuresWithDetail(t *testing.T) {
 // SystemdCredsUsable must OBSERVE the capability. Asking `has-tpm2` would answer
 // the wrong question: a Pi has no TPM and works fine on the host key.
 func TestSystemdCredsUsableProbesByActuallySealing(t *testing.T) {
-	if _, err := exec.LookPath("systemd-creds"); err != nil {
-		t.Skip("systemd-creds is not on this machine, so the probe short-circuits")
-	}
-
 	var sawEncrypt bool
 	probe := func(_ context.Context, _ []byte, args ...string) ([]byte, error) {
 		if args[0] == "encrypt" {
@@ -313,10 +306,6 @@ func TestSystemdCredsUsableProbesByActuallySealing(t *testing.T) {
 }
 
 func TestSystemdCredsUsableReportsAFailureToSeal(t *testing.T) {
-	if _, err := exec.LookPath("systemd-creds"); err != nil {
-		t.Skip("systemd-creds is not on this machine")
-	}
-
 	probe := func(context.Context, []byte, ...string) ([]byte, error) {
 		return nil, errors.New("no host key")
 	}
@@ -389,5 +378,135 @@ func TestTheFileStoreIsStillTheFallback(t *testing.T) {
 	}
 	if store.Backend() != BackendFile {
 		t.Errorf("backend = %q, want %q", store.Backend(), BackendFile)
+	}
+}
+
+// The install-time custody path, exercised WITHOUT the env override — so it
+// actually reaches the sealed-blob logic rather than short-circuiting on
+// TUMIKA_MASTER_KEY, which is what every install test does.
+//
+// This is the case that locked the installer out of its own install: after
+// committing to systemd-creds, root still has to be able to open the database.
+func TestRootCanStillOpenTheDatabaseAfterCommittingToSystemdCreds(t *testing.T) {
+	t.Setenv(MasterKeyEnv, "")
+	t.Setenv(CredentialsDirEnv, "")
+
+	home := t.TempDir()
+	keyFile := filepath.Join(home, "master.key")
+	sealed := CredentialPathFor(keyFile)
+
+	fake := &fakeCreds{}
+	if err := SealMasterKey(t.Context(), sealed, fake.run); err != nil {
+		t.Fatalf("SealMasterKey: %v", err)
+	}
+
+	// systemd has handed nothing over — this is the installer, not the service.
+	store, err := openSealedDirectly(sealed, fake.run)
+	if err != nil {
+		t.Fatalf("root cannot open the key it just sealed: %v", err)
+	}
+	if store.Backend() != BackendSystemdCreds {
+		t.Errorf("backend = %q, want %q", store.Backend(), BackendSystemdCreds)
+	}
+
+	// And the key is the same one the service will receive, or the two halves
+	// would be sealing and opening different things.
+	handed := t.TempDir()
+	viaRoot, err := store.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(handed, CredentialName),
+		[]byte(encodeKey(viaRoot)), 0o400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv(CredentialsDirEnv, handed)
+
+	viaSystemd, err := chooseKeyStore("linux", keyFile)
+	if err != nil {
+		t.Fatalf("chooseKeyStore: %v", err)
+	}
+	serviceKey, err := viaSystemd.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+	if string(serviceKey) != string(viaRoot) {
+		t.Error("the installer and the service would use different keys")
+	}
+}
+
+// The real probe runs the command it is given. Exercised with `true`/`false`
+// rather than systemd-run, so the wiring is checked on any machine.
+func TestExecHandoverProbe(t *testing.T) {
+	if err := ExecHandoverProbe(t.Context(), "true"); err != nil {
+		t.Errorf("a succeeding command was reported as a failure: %v", err)
+	}
+	if err := ExecHandoverProbe(t.Context(), "false"); err == nil {
+		t.Error("a failing command was reported as a success")
+	}
+}
+
+// HandoverWorks builds the probe as a real transient unit: the credential
+// directive, and the account the unit will run as.
+func TestHandoverWorksBuildsACredentialProbe(t *testing.T) {
+	var args []string
+	probe := func(_ context.Context, name string, a ...string) error {
+		args = append([]string{name}, a...)
+		return nil
+	}
+
+	if !HandoverWorks(t.Context(), "/var/lib/tumika/master.cred", "", probe) {
+		t.Fatal("a succeeding probe was reported as a failure")
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "systemd-run") {
+		t.Errorf("the probe does not use a transient unit: %s", joined)
+	}
+	// No account given, so no User= — otherwise the probe would name an empty
+	// user and fail for a reason that says nothing about the handover.
+	if strings.Contains(joined, "User=") {
+		t.Errorf("the probe names a user that was not asked for: %s", joined)
+	}
+}
+
+// A blob that cannot be written is an error, not a silent fallback to no
+// custody at all.
+func TestSealMasterKeyReportsAnUnwritableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	fake := &fakeCreds{}
+	if err := SealMasterKey(t.Context(), filepath.Join(dir, CredentialFileName), fake.run); err == nil {
+		t.Fatal("sealing into an unwritable directory reported success")
+	}
+}
+
+// An empty blob from systemd-creds is refused rather than written out as a key
+// nothing will ever open.
+func TestSealMasterKeyRefusesAnEmptyBlob(t *testing.T) {
+	empty := func(context.Context, []byte, ...string) ([]byte, error) { return nil, nil }
+	path := filepath.Join(t.TempDir(), CredentialFileName)
+
+	if err := SealMasterKey(t.Context(), path, empty); err == nil {
+		t.Fatal("an empty blob was accepted")
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("an empty blob was written to disk")
+	}
+}
+
+// SystemdCredsUsable must report false when the tool produces nothing, not just
+// when it errors.
+func TestSystemdCredsUsableRefusesAnEmptyResult(t *testing.T) {
+	empty := func(context.Context, []byte, ...string) ([]byte, error) { return nil, nil }
+	if SystemdCredsUsable(t.Context(), empty) {
+		t.Error("a tool that sealed nothing was reported as usable")
 	}
 }

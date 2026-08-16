@@ -32,6 +32,17 @@ const ContainerEnv = "TUMIKA_CONTAINER"
 // owner-only throughout.
 const dirPerm os.FileMode = 0o700
 
+// SystemHome is where a SYSTEM-WIDE install keeps its state.
+//
+// Used by a container, and by `tumika install` on Linux — where the unit runs as
+// an unprivileged service account that cannot reach a per-user directory. The
+// XDG default below is right for a developer running the daemon in a terminal
+// and wrong for a supervised install, and nothing about the process itself
+// distinguishes the two: `sudo tumika install` has root's HOME either way. So
+// the choice is made by the INSTALLER, which knows which of the two it is
+// building, rather than by a euid heuristic here.
+const SystemHome = "/var/lib/tumika"
+
 // ErrUnsupportedPlatform is returned when the home directory cannot be resolved
 // because the OS is not one tumika supports (ADR: Linux and macOS only).
 var ErrUnsupportedPlatform = errors.New("unsupported platform")
@@ -155,7 +166,7 @@ func platformHome(goos string, inContainer bool) (string, error) {
 	}
 
 	if inContainer {
-		return "/var/lib/tumika", nil
+		return SystemHome, nil
 	}
 
 	switch goos {

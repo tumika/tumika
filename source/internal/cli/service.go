@@ -48,11 +48,15 @@ func newInstallCmd(g *globals) *cobra.Command {
 			"Linux, a LaunchAgent on macOS.\n\n" +
 			"The Linux install needs root — it writes /etc/systemd/system and creates the\n" +
 			"tumika service account. The macOS install does not.\n\n" +
-			"Running it again is how an upgrade is applied: the unit is rewritten and\n" +
-			"reloaded, and nothing under the home directory is touched.",
+			"On Linux the service keeps its state in " + paths.SystemHome + ", because the unit runs as\n" +
+			"an unprivileged account that cannot reach a per-user directory. Pass --home or\n" +
+			"set " + paths.HomeEnv + " to choose somewhere else.\n\n" +
+			"Running it again is how an upgrade is applied: the unit is rewritten, reloaded\n" +
+			"and restarted onto the new binary, and nothing under the home directory is\n" +
+			"touched.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			p, err := g.Paths()
+			p, err := servicePaths(g)
 			if err != nil {
 				return err
 			}
@@ -62,6 +66,9 @@ func newInstallCmd(g *globals) *cobra.Command {
 				Home:   p.Home,
 				User:   user,
 			}
+			if cfg.User == "" {
+				cfg.User = servicemgr.DefaultUser
+			}
 			if cfg.Binary == "" {
 				cfg.Binary, err = installedBinary(p)
 				if err != nil {
@@ -69,11 +76,26 @@ func newInstallCmd(g *globals) *cobra.Command {
 				}
 			}
 
+			mgr, err := managerFactory()
+			if err != nil {
+				return err
+			}
+
+			// The service ACCOUNT comes first, before anything that depends on
+			// it existing. The handover probe below runs a transient unit as
+			// that account, so probing first made systemd-run fail to resolve
+			// the user on every first install — the probe reported "no
+			// handover", the freshly sealed key was deleted, and the host
+			// dropped to the file key permanently.
+			if err := mgr.Prepare(cmd.Context(), cfg); err != nil {
+				return err
+			}
+
 			// Key custody is settled BEFORE the unit is written, because the
 			// unit has to name the sealed blob for systemd to hand it over —
 			// and sealing needs the root privileges this command already has
 			// and the daemon deliberately does not.
-			if cfg.SealedKey, err = sealKeyIfSupported(cmd, p); err != nil {
+			if cfg.SealedKey, err = sealKeyIfSupported(cmd, p, cfg.User); err != nil {
 				return err
 			}
 
@@ -86,11 +108,12 @@ func newInstallCmd(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Printed as soon as it exists, not at the end. Its hash is already
+			// stored, so an install that fails after this point would otherwise
+			// leave a daemon with a token nobody has ever seen — and a re-run
+			// finds one configured and prints nothing.
+			printToken(cmd, token)
 
-			mgr, err := managerFactory()
-			if err != nil {
-				return err
-			}
 			if err := mgr.Install(cmd.Context(), cfg); err != nil {
 				return err
 			}
@@ -101,17 +124,7 @@ func newInstallCmd(g *globals) *cobra.Command {
 			if cfg.SealedKey != "" {
 				printf(cmd, "  key     sealed to this host (%s)\n", cfg.SealedKey)
 			}
-			if err := reportStatus(cmd, mgr); err != nil {
-				return err
-			}
-
-			if token != "" {
-				// Printed LAST so it is the thing left on screen, and to stdout
-				// only — never through the logger, which would put a live
-				// credential in the journal.
-				printf(cmd, "\nYour API token (shown once, only its hash is stored):\n\n  %s\n", token)
-			}
-			return nil
+			return reportStatus(cmd, mgr)
 		},
 	}
 
@@ -123,6 +136,35 @@ func newInstallCmd(g *globals) *cobra.Command {
 	return cmd
 }
 
+// servicePaths resolves the layout a SUPERVISED install should use.
+//
+// On Linux that is the system-wide home, not the XDG per-user one. The default
+// is right for a developer running the daemon in a terminal and wrong here: the
+// unit runs as an unprivileged account, and `sudo tumika install` resolves
+// root's HOME, so the unit ends up naming /root/.local/state/tumika. The account
+// cannot traverse a 0700 /root, systemd answers 203/EXEC, and Restart=always
+// turns it into a loop the install reports as running.
+//
+// An explicit --home or TUMIKA_HOME still wins, because an operator who said
+// where meant it.
+func servicePaths(g *globals) (paths.Paths, error) {
+	if g.home == "" && os.Getenv(paths.HomeEnv) == "" && installGOOS == "linux" {
+		return paths.Resolve(paths.SystemHome)
+	}
+	return g.Paths()
+}
+
+// printToken writes a freshly minted token to stdout, and nowhere else.
+//
+// Never through the logger, which would put a live credential into the journal,
+// and never into a file — the only copy is the one the operator keeps.
+func printToken(cmd *cobra.Command, token string) {
+	if token == "" {
+		return
+	}
+	printf(cmd, "\nYour API token (shown once, only its hash is stored):\n\n  %s\n\n", token)
+}
+
 // sealKeyIfSupported seals a host-bound master key, when the host can.
 //
 // Returns the blob's path, or "" to leave the daemon on its file-based
@@ -131,7 +173,7 @@ func newInstallCmd(g *globals) *cobra.Command {
 //
 // Only ever ADDS custody. If a blob already exists it is reused untouched:
 // replacing it would orphan every credential sealed under the key inside.
-func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths) (string, error) {
+func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths, user string) (string, error) {
 	if installGOOS != "linux" {
 		return "", nil
 	}
@@ -162,7 +204,10 @@ func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths) (string, error) {
 	// this custody without checking leaves a daemon that can never start —
 	// which is precisely what happened the first time, in a container where
 	// systemd sets $CREDENTIALS_DIRECTORY to a directory it never creates.
-	if !handoverWorks(cmd.Context(), sealed, servicemgr.DefaultUser, nil) {
+	// Probed as the account the unit will ACTUALLY run as, which is not
+	// necessarily the default: --user assistant would otherwise verify delivery
+	// to an account that never runs the service.
+	if !handoverWorks(cmd.Context(), sealed, user, nil) {
 		// Nothing is sealed under this key yet — it was minted seconds ago — so
 		// removing it is safe, and leaving it behind would make every later
 		// start fail closed on a key nobody can use.
@@ -388,6 +433,12 @@ func printStatus(cmd *cobra.Command, status servicemgr.Status) {
 	printf(cmd, "  unit    %s\n", status.Path)
 	if status.Detail != "" {
 		printf(cmd, "  detail  %s\n", status.Detail)
+	}
+	if status.State == servicemgr.StateStarting {
+		printf(cmd, "\n  Starting. If it stays here it is restarting in a loop — check the logs.\n")
+	}
+	if status.State == servicemgr.StateFailed {
+		printf(cmd, "\n  The service is not running. Check the logs for why.\n")
 	}
 	if status.State == servicemgr.StateRunning && !status.Enabled {
 		// Worth saying out loud: it works now and disappears at the next
