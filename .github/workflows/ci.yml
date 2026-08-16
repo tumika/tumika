@@ -149,8 +149,10 @@ jobs:
       # nosemgrep: yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag
       - uses: wardnet/bulwark@v1
         with:
-          tests-mode: skip
-          go-report: coverage.out
+          # No coverage inputs: bulwark v1.7.0 removed tests-mode/go-report in
+          # favour of `coverage.source` in .bulwark.yml at the scan root. The
+          # artifact above lands coverage.out at that root, which is the first
+          # path bulwark's own candidate search checks, so no override is needed.
           # With a Semgrep token bulwark runs `semgrep ci` — Semgrep's own
           # diff-aware mode — instead of `semgrep scan`, and reports to the
           # AppSec Platform dashboard. GitHub withholds secrets from Dependabot

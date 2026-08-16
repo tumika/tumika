@@ -1,0 +1,16 @@
+# bulwark configuration for tumika.
+
+coverage:
+  # ci.yml's build-test job already runs `go test -race -coverprofile=coverage.out
+  # ./...`, and the bulwark job downloads that artifact rather than re-running the
+  # suite. bulwark's default is `run`, which would execute every test a second
+  # time — slower, and a flake there fails a job that is meant to be reading a
+  # report rather than producing one.
+  #
+  # This lives here rather than at the call site because it describes how the
+  # repo's pipeline is built — one answer, true for every workflow — which is
+  # why bulwark v1.7.0 removed the `tests-mode` input that used to carry it.
+  #
+  # No report path is set: the artifact lands coverage.out at the scan root,
+  # which is already the first candidate bulwark checks.
+  source: report
