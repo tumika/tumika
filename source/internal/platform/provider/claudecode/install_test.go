@@ -34,6 +34,9 @@ type bucket struct {
 	tamperManifest bool
 	// wrongChecksum publishes a checksum that does not match the binary.
 	wrongChecksum bool
+	// wrongSize publishes a size that does not match the binary, with a correct
+	// checksum — the only way to reach the size check.
+	wrongSize bool
 	// omitSignature serves a 404 for the .sig.
 	omitSignature bool
 	// claimVersion overrides the version inside the manifest, simulating a
@@ -76,11 +79,16 @@ func (b *bucket) manifest() Manifest {
 		version = b.claimVersion
 	}
 
+	size := int64(len(b.binary))
+	if b.wrongSize {
+		size += 1024
+	}
+
 	return Manifest{
 		Version: version,
 		Commit:  "0123456789abcdef",
 		Platforms: map[string]Platform{
-			b.platform: {Binary: BinaryName, Checksum: checksum, Size: int64(len(b.binary))},
+			b.platform: {Binary: BinaryName, Checksum: checksum, Size: size},
 		},
 	}
 }
@@ -139,8 +147,16 @@ func installerFor(t *testing.T, b *bucket) (*Installer, string) {
 	if err != nil {
 		t.Fatalf("NewInstaller: %v", err)
 	}
-	inst.release.keyring = openpgp.EntityList{b.entity}
+	trust(inst, b.entity)
 	return inst, root
+}
+
+// trust substitutes a whole trust anchor: the keyring AND the fingerprint
+// Manifest will accept. Swapping only the keyring would leave the two disagreeing,
+// which is not a state production can reach.
+func trust(inst *Installer, entity *openpgp.Entity) {
+	inst.release.keyring = openpgp.EntityList{entity}
+	inst.release.expectFingerprint = strings.ToUpper(hex.EncodeToString(entity.PrimaryKey.Fingerprint))
 }
 
 func runtimeGOOS() string   { return runtime.GOOS }
@@ -221,7 +237,7 @@ func TestInstallRefusesAnUntrustedManifest(t *testing.T) {
 				t.Fatalf("NewInstaller: %v", err)
 			}
 			// Trust the ORIGINAL key, whatever the bucket did.
-			inst.release.keyring = openpgp.EntityList{trusted}
+			trust(inst, trusted)
 
 			if _, err := inst.Install(t.Context(), b.version); err == nil {
 				t.Fatal("an untrusted manifest was accepted")
@@ -513,7 +529,7 @@ func TestBinaryDownloadFailureLeavesNothingBehind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInstaller: %v", err)
 	}
-	inst.release.keyring = openpgp.EntityList{b.entity}
+	trust(inst, b.entity)
 
 	if _, err := inst.Install(t.Context(), b.version); err == nil {
 		t.Fatal("a missing binary produced no error")
@@ -542,15 +558,22 @@ func TestInstallRefusesAManifestWithoutThisPlatform(t *testing.T) {
 
 // A size that disagrees with the manifest means the manifest and the artifact
 // describe different things, which is worth refusing on its own.
+//
+// The earlier version of this test appended bytes to the binary AFTER the
+// manifest was signed, so the CHECKSUM failed first and the size branch never
+// ran — it passed for the wrong reason. Lying about the size with the bytes
+// unchanged is the only way to reach it.
 func TestInstallRefusesASizeMismatch(t *testing.T) {
 	b := newBucket(t)
+	b.wrongSize = true
 	inst, _ := installerFor(t, b)
 
-	// Same bytes, so the checksum passes; the manifest lies about the length.
-	b.binary = append(b.binary, "extra"...)
-
-	if _, err := inst.Install(t.Context(), b.version); err == nil {
-		t.Error("a size mismatch was accepted")
+	_, err := inst.Install(t.Context(), b.version)
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("= %v, want ErrChecksumMismatch", err)
+	}
+	if !strings.Contains(err.Error(), "the manifest says") {
+		t.Errorf("the error should be the SIZE check, not the checksum: %v", err)
 	}
 }
 
@@ -609,7 +632,7 @@ func TestARootThatIsNotADirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInstaller: %v", err)
 	}
-	inst.release.keyring = openpgp.EntityList{b.entity}
+	trust(inst, b.entity)
 
 	if _, err := inst.Installed(t.Context()); err == nil {
 		t.Error("Installed succeeded with a file where its root should be")
@@ -619,25 +642,53 @@ func TestARootThatIsNotADirectory(t *testing.T) {
 	}
 }
 
-// The publish step renames a whole directory into place. If something is
-// already there — a previous interrupted install that left a directory without
-// a binary — the rename collides, and that must not be reported as success.
-func TestInstallHandlesACollisionAtPublishTime(t *testing.T) {
+// A collision with debris must be an ERROR, never a phantom success.
+//
+// The earlier version of this test accepted AlreadyPresent here, which enshrined
+// the bug: the verified download is discarded by the deferred cleanup, Path()
+// points at a file that does not exist, and every later attempt repeats it — so
+// the daemon is permanently stuck with a "present" version it cannot execute.
+func TestACollisionWithDebrisIsAnErrorNotAPhantomInstall(t *testing.T) {
 	b := newBucket(t)
 	inst, _ := installerFor(t, b)
 
-	// A directory with no binary: Install does not treat it as present (there is
-	// nothing to run), so it downloads and then meets it at the rename.
+	// An interrupted install left the directory but no runnable binary.
 	if err := os.MkdirAll(filepath.Join(inst.root, b.version, "debris"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
 	result, err := inst.Install(t.Context(), b.version)
-	if err == nil && !result.AlreadyPresent {
-		t.Error("a colliding publish reported a clean install")
+	if err == nil {
+		t.Fatalf("a collision with debris reported success: %+v", result)
 	}
-	if err != nil && !strings.Contains(err.Error(), b.version) {
-		t.Errorf("the error should name the version, got: %v", err)
+	if usable(result.Path) {
+		t.Error("the reported path is usable, so this should not have been an error")
+	}
+	if !strings.Contains(err.Error(), "remove it and retry") {
+		t.Errorf("the error should tell the operator what to do, got: %v", err)
+	}
+}
+
+// A collision with a COMPLETE install is the real race, and is fine: whoever won
+// it verified their copy the same way.
+func TestACollisionWithACompleteInstallIsAccepted(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	dir := filepath.Join(inst.root, b.version)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, BinaryName), b.binary, 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := inst.Install(t.Context(), b.version)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !result.AlreadyPresent {
+		t.Error("a complete install was not recognised")
 	}
 }
 
@@ -663,7 +714,7 @@ func TestATruncatedDownloadIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInstaller: %v", err)
 	}
-	inst.release.keyring = openpgp.EntityList{b.entity}
+	trust(inst, b.entity)
 
 	if _, err := inst.Install(t.Context(), b.version); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("= %v, want ErrChecksumMismatch", err)
@@ -687,5 +738,200 @@ func TestAnUnusableBaseURL(t *testing.T) {
 	}
 	if _, err := inst.Install(t.Context(), "9.9.9"); err == nil {
 		t.Error("an unusable base URL produced no error from Install")
+	}
+}
+
+// Path() joins the version into a filesystem path and the release client
+// interpolates it into a URL, so an unchecked value escapes both. A traversing
+// version used to reach the fast path, find an existing `claude` outside the
+// providers root, and report an unverified binary as installed — precisely the
+// hijack this package exists to prevent.
+func TestVersionMustBeABareVersionToken(t *testing.T) {
+	root := t.TempDir()
+
+	// Something runnable outside the root, standing in for /usr/local/bin.
+	outside := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, BinaryName), []byte("not ours"), 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	inst, err := NewInstaller(filepath.Join(root, "providers"))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+
+	for _, version := range []string{
+		"../../elsewhere",
+		"../elsewhere",
+		"/etc",
+		"2.1.233/../../elsewhere",
+		"",
+		"not-a-version",
+		"2.1.233 ",
+	} {
+		t.Run(version, func(t *testing.T) {
+			result, err := inst.Install(t.Context(), version)
+			if !errors.Is(err, ErrInvalidVersion) {
+				t.Fatalf("Install(%q) = %+v, %v; want ErrInvalidVersion", version, result, err)
+			}
+			if result.AlreadyPresent {
+				t.Errorf("reported an unverified binary as installed at %s", result.Path)
+			}
+		})
+	}
+}
+
+// Mere existence is not enough for the fast path: none of these can be executed,
+// and accepting them makes Install a permanent no-op that reports success.
+func TestTheFastPathRequiresARunnableBinary(t *testing.T) {
+	b := newBucket(t)
+
+	tests := map[string]func(dir string){
+		"a directory named claude": func(dir string) {
+			_ = os.MkdirAll(filepath.Join(dir, BinaryName), 0o700)
+		},
+		"an empty file": func(dir string) {
+			_ = os.WriteFile(filepath.Join(dir, BinaryName), nil, 0o700)
+		},
+		"not executable": func(dir string) {
+			_ = os.WriteFile(filepath.Join(dir, BinaryName), []byte("x"), 0o600)
+		},
+	}
+
+	for name, seed := range tests {
+		t.Run(name, func(t *testing.T) {
+			inst, _ := installerFor(t, b)
+			dir := filepath.Join(inst.root, b.version)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			seed(dir)
+
+			// Not reported as installed...
+			installed, err := inst.Installed(t.Context())
+			if err != nil {
+				t.Fatalf("Installed: %v", err)
+			}
+			if len(installed) != 0 {
+				t.Errorf("an unrunnable binary was reported as installed: %v", installed)
+			}
+
+			// ...and not accepted by the fast path either.
+			if result, err := inst.Install(t.Context(), b.version); err == nil && result.AlreadyPresent {
+				t.Error("the fast path accepted a binary that cannot be executed")
+			}
+		})
+	}
+}
+
+// Staging must live outside the directory Installed() enumerates. Inside it, a
+// `claude` file created before a single byte is downloaded would be listed as a
+// version, and Prune would delete the staging directory of an install in flight.
+func TestStagingIsNotVisibleAsAnInstalledVersion(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	if _, err := inst.Install(t.Context(), b.version); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	if strings.HasPrefix(inst.staging, inst.root) {
+		t.Errorf("staging %q is inside the enumerated root %q", inst.staging, inst.root)
+	}
+
+	// Simulate an interrupted download: staging debris containing a binary.
+	debris := filepath.Join(inst.root, ".staging-9.9.9-leftover")
+	if err := os.MkdirAll(debris, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(debris, BinaryName), []byte("unverified"), 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	installed, err := inst.Installed(t.Context())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	for _, v := range installed {
+		if strings.HasPrefix(v, ".") {
+			t.Errorf("staging debris was reported as an installed version: %q", v)
+		}
+	}
+	if len(installed) != 1 || installed[0] != b.version {
+		t.Errorf("Installed() = %v, want just the real version", installed)
+	}
+}
+
+// The budget must count only protected versions that are actually installed, or
+// retention silently keeps one more than asked — 307 MB more, on the SD card the
+// policy exists to protect.
+func TestPruneBudgetCountsOnlyInstalledProtectedVersions(t *testing.T) {
+	root := t.TempDir()
+	inst, err := NewInstaller(root)
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+
+	for _, v := range []string{"3.0.0", "2.0.0", "1.0.0"} {
+		dir := filepath.Join(inst.root, v)
+		_ = os.MkdirAll(dir, 0o700)
+		_ = os.WriteFile(filepath.Join(dir, BinaryName), []byte("x"), 0o700)
+	}
+
+	// 3.0.0 is protected AND is already among the newest, so it must not buy an
+	// extra slot.
+	if err := inst.Prune(t.Context(), 2, "3.0.0", "3.0.0"); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	remaining, err := inst.Installed(t.Context())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Errorf("kept %v, want exactly 2 — a protected version already among the newest must not inflate the budget", remaining)
+	}
+}
+
+// A keyring holding the right key PLUS another would have satisfied a
+// contains-check while making the other key a trusted manifest signer.
+func TestTheEmbeddedKeyringMustHoldExactlyOneKey(t *testing.T) {
+	real, err := openpgp.ReadArmoredKeyRing(strings.NewReader(string(signingKey)))
+	if err != nil {
+		t.Fatalf("read the embedded key: %v", err)
+	}
+
+	impostor, err := openpgp.NewEntity("Impostor", "", "impostor@example.com", nil)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+
+	if err := assertFingerprint(append(real, impostor)); !errors.Is(err, ErrUnsignedManifest) {
+		t.Errorf("a keyring with an extra key was accepted: %v", err)
+	}
+	if err := assertFingerprint(openpgp.EntityList{}); !errors.Is(err, ErrUnsignedManifest) {
+		t.Errorf("an empty keyring was accepted: %v", err)
+	}
+}
+
+// Verification must check WHO signed, not merely that the keyring contains the
+// pinned key: CheckArmoredDetachedSignature accepts a signature from any entity
+// in the ring.
+func TestASignatureFromAnExtraKeyInTheRingIsRefused(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	// The ring contains the bucket's signer, but we expect a different one.
+	inst.release.expectFingerprint = SigningKeyFingerprint
+
+	_, err := inst.Install(t.Context(), b.version)
+	if !errors.Is(err, ErrUnsignedManifest) {
+		t.Fatalf("= %v, want ErrUnsignedManifest", err)
+	}
+	if !strings.Contains(err.Error(), "signed by") {
+		t.Errorf("the error should name the actual signer, got: %v", err)
 	}
 }

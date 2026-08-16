@@ -105,10 +105,16 @@ func PlatformKey(goos, goarch string) (string, error) {
 
 // releaseClient fetches and verifies release artifacts.
 type releaseClient struct {
-	baseURL  string
-	client   *http.Client
-	keyring  openpgp.EntityList
-	platform string
+	baseURL string
+	client  *http.Client
+	keyring openpgp.EntityList
+	// expectFingerprint is the signer Manifest will accept. A field rather than
+	// the constant directly so a test can substitute a whole trust anchor —
+	// keyring AND expected signer together. Substituting only the keyring would
+	// leave the two halves disagreeing, which is not a configuration that can
+	// exist in production.
+	expectFingerprint string
+	platform          string
 }
 
 func newReleaseClient(baseURL string, httpClient *http.Client) (*releaseClient, error) {
@@ -132,27 +138,38 @@ func newReleaseClient(baseURL string, httpClient *http.Client) (*releaseClient, 
 	}
 
 	return &releaseClient{
-		baseURL:  strings.TrimSuffix(baseURL, "/"),
-		client:   httpClient,
-		keyring:  keyring,
-		platform: platform,
+		baseURL:           strings.TrimSuffix(baseURL, "/"),
+		client:            httpClient,
+		keyring:           keyring,
+		expectFingerprint: SigningKeyFingerprint,
+		platform:          platform,
 	}, nil
 }
 
-// assertFingerprint checks the embedded key is the one we mean.
+// assertFingerprint checks the embedded keyring holds exactly the key we mean.
 //
 // The fingerprint is the constant an operator can check against Anthropic's
 // published value; the key file is bytes nobody reads. Checking one against the
-// other at startup means swapping the file alone cannot silently change who
-// tumika trusts.
+// other at startup is what stops swapping the file silently changing who tumika
+// trusts.
+//
+// EXACTLY ONE entity, not "at least one that matches". A keyring with the right
+// key plus an attacker's would have satisfied a contains-check while making the
+// attacker a trusted signer — and the manifest verification would have accepted
+// their signature. Manifest() also checks the signer's own fingerprint, so this
+// is belt and braces on the property that matters most in the package.
 func assertFingerprint(keyring openpgp.EntityList) error {
-	for _, entity := range keyring {
-		got := strings.ToUpper(hex.EncodeToString(entity.PrimaryKey.Fingerprint))
-		if got == SigningKeyFingerprint {
-			return nil
-		}
+	if len(keyring) != 1 {
+		return fmt.Errorf("%w: the embedded keyring holds %d keys, expected exactly 1",
+			ErrUnsignedManifest, len(keyring))
 	}
-	return fmt.Errorf("%w: the embedded key is not %s", ErrUnsignedManifest, SigningKeyFingerprint)
+
+	got := strings.ToUpper(hex.EncodeToString(keyring[0].PrimaryKey.Fingerprint))
+	if got != SigningKeyFingerprint {
+		return fmt.Errorf("%w: the embedded key is %s, expected %s",
+			ErrUnsignedManifest, got, SigningKeyFingerprint)
+	}
+	return nil
 }
 
 // Stable reports the version the bucket currently calls stable.
@@ -184,9 +201,28 @@ func (c *releaseClient) Manifest(ctx context.Context, version string) (Manifest,
 		return Manifest{}, fmt.Errorf("fetch the manifest signature: %w", err)
 	}
 
-	_, err = openpgp.CheckArmoredDetachedSignature(c.keyring, strings.NewReader(string(raw)), strings.NewReader(string(sig)), nil)
+	signer, err := openpgp.CheckArmoredDetachedSignature(
+		c.keyring, strings.NewReader(string(raw)), strings.NewReader(string(sig)), nil)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("%w: %w", ErrUnsignedManifest, err)
+	}
+
+	// Check WHO signed it, not merely that the keyring contains the right key.
+	//
+	// CheckArmoredDetachedSignature accepts a signature from ANY entity in the
+	// keyring and returns which one; discarding that meant the guarantee rested
+	// entirely on the keyring having exactly one member. Appending a second
+	// armored key to the embedded file would have made it a fully trusted
+	// signer while every existing check still passed — which is exactly the
+	// "swapping the file cannot change who tumika trusts" property the embedded
+	// key is supposed to provide.
+	if signer == nil {
+		return Manifest{}, fmt.Errorf("%w: the signature names no key", ErrUnsignedManifest)
+	}
+	got := strings.ToUpper(hex.EncodeToString(signer.PrimaryKey.Fingerprint))
+	if got != c.expectFingerprint {
+		return Manifest{}, fmt.Errorf("%w: signed by %s, expected %s",
+			ErrUnsignedManifest, got, c.expectFingerprint)
 	}
 
 	var manifest Manifest

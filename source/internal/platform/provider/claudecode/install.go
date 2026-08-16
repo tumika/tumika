@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"syscall"
 
 	"golang.org/x/mod/semver"
 
@@ -34,7 +36,11 @@ const DefaultRetention = 2
 // A version is either completely present or absent — never half-written — which
 // is what lets Installed() simply list directories.
 type Installer struct {
-	root    string
+	root string
+	// staging is a sibling of root, deliberately outside the directory
+	// Installed() enumerates, and on the same filesystem so the publishing
+	// rename cannot cross a boundary.
+	staging string
 	release *releaseClient
 }
 
@@ -70,8 +76,46 @@ func NewInstaller(providersRoot string, opts ...InstallerOption) (*Installer, er
 
 	return &Installer{
 		root:    filepath.Join(providersRoot, "claude-code"),
+		staging: filepath.Join(providersRoot, ".claude-code-staging"),
 		release: release,
 	}, nil
+}
+
+// ErrInvalidVersion means a version string is not a bare version token.
+var ErrInvalidVersion = errors.New("invalid version")
+
+// validateVersion refuses anything that is not a bare version token.
+//
+// Path() joins this into a filesystem path and the release client interpolates
+// it into a URL, so an unchecked value escapes both. "../../../../usr/local/bin"
+// cleans to a path outside the providers root, where Install's fast path would
+// find an existing `claude`, never download anything, and report it as an
+// installed version — handing the daemon an unverified binary to execute. That
+// is precisely the hijack this package exists to prevent.
+func validateVersion(version string) error {
+	if version == "" {
+		return fmt.Errorf("%w: no version specified", ErrInvalidVersion)
+	}
+	if !semver.IsValid("v" + version) {
+		return fmt.Errorf("%w: %q is not a version", ErrInvalidVersion, version)
+	}
+	// semver.IsValid already excludes separators, but the intent is worth
+	// stating where a reader is looking for it.
+	if strings.ContainsAny(version, `/\`) || version != filepath.Base(version) {
+		return fmt.Errorf("%w: %q contains a path separator", ErrInvalidVersion, version)
+	}
+	return nil
+}
+
+// usable reports whether path is a binary the daemon could actually execute.
+//
+// Mere existence is not enough: a directory named `claude`, a zero-byte file, or
+// one with the execute bit stripped all satisfy os.Stat and none can be run. An
+// Install that accepted any of them would be a permanent no-op reporting
+// success.
+func usable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Mode().Perm()&0o100 != 0
 }
 
 // Path is where a version's binary lives once installed.
@@ -99,9 +143,19 @@ func (i *Installer) Installed(context.Context) ([]string, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		// A directory without the binary is debris from an interrupted install
-		// and is not a version anyone can run.
-		if _, err := os.Stat(filepath.Join(i.root, entry.Name(), BinaryName)); err != nil {
+		// Dot-prefixed directories are never versions. Staging lives elsewhere
+		// now, but a leftover from an older build must not be reported as an
+		// installed version — its binary is created before a single byte is
+		// downloaded, let alone verified.
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if validateVersion(entry.Name()) != nil {
+			continue
+		}
+		// A directory without a runnable binary is debris from an interrupted
+		// install, not a version anyone can use.
+		if !usable(filepath.Join(i.root, entry.Name(), BinaryName)) {
 			continue
 		}
 		versions = append(versions, entry.Name())
@@ -118,12 +172,12 @@ func (i *Installer) Installed(context.Context) ([]string, error) {
 // the binary. Verifying a download against a checksum from an unsigned document
 // proves the bytes arrived intact, not that they are the right bytes.
 func (i *Installer) Install(ctx context.Context, version string) (domain.InstallResult, error) {
-	if version == "" {
-		return domain.InstallResult{}, errors.New("no version specified")
+	if err := validateVersion(version); err != nil {
+		return domain.InstallResult{}, err
 	}
 
 	target := i.Path(version)
-	if _, err := os.Stat(target); err == nil {
+	if usable(target) {
 		return domain.InstallResult{Version: version, Path: target, AlreadyPresent: true}, nil
 	}
 
@@ -132,12 +186,21 @@ func (i *Installer) Install(ctx context.Context, version string) (domain.Install
 		return domain.InstallResult{}, err
 	}
 
-	// Staged in a sibling of the final directory, so the rename that publishes
-	// it cannot cross a filesystem boundary.
+	// Staged OUTSIDE the directory Installed() enumerates, and beside it so the
+	// publishing rename stays on one filesystem.
+	//
+	// Staging inside that directory put a `claude` file — created before a
+	// single byte was downloaded — where Installed() would list it as a version
+	// and Path() would hand out a runnable path to unverified bytes. Worse,
+	// Prune walked the same list and would delete the staging directory of an
+	// install still in flight.
 	if err := os.MkdirAll(i.root, 0o700); err != nil {
 		return domain.InstallResult{}, fmt.Errorf("create %s: %w", i.root, err)
 	}
-	staging, err := os.MkdirTemp(i.root, ".staging-"+version+"-")
+	if err := os.MkdirAll(i.staging, 0o700); err != nil {
+		return domain.InstallResult{}, fmt.Errorf("create %s: %w", i.staging, err)
+	}
+	staging, err := os.MkdirTemp(i.staging, version+"-")
 	if err != nil {
 		return domain.InstallResult{}, fmt.Errorf("create a staging directory: %w", err)
 	}
@@ -164,22 +227,65 @@ func (i *Installer) Install(ctx context.Context, version string) (domain.Install
 		// unverified is ever left where Installed() would find it.
 		return domain.InstallResult{}, err
 	}
+	// Flushed to the device before the rename publishes it. On the Pi + SD card
+	// deployment this package is written for, a power cut can otherwise make the
+	// rename durable while the contents are not — leaving a zero-length or
+	// truncated `claude` that the fast path above will treat as installed
+	// forever.
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return domain.InstallResult{}, fmt.Errorf("flush %s: %w", staged, err)
+	}
 	if err := file.Close(); err != nil {
 		return domain.InstallResult{}, fmt.Errorf("close %s: %w", staged, err)
+	}
+	if err := syncDir(staging); err != nil {
+		return domain.InstallResult{}, err
 	}
 
 	// Published by renaming the whole directory: a reader either sees no version
 	// or sees a complete, verified one.
 	if err := os.Rename(staging, filepath.Join(i.root, version)); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			// Another process installed it while we were downloading. Theirs is
-			// verified too; nothing to do.
+		if !errors.Is(err, os.ErrExist) && !errors.Is(err, syscall.ENOTEMPTY) {
+			return domain.InstallResult{}, fmt.Errorf("install %s: %w", version, err)
+		}
+
+		// Something already occupies the destination. If it is a usable binary,
+		// another process won the race and its copy is verified too.
+		//
+		// If it is NOT — an empty directory left by an interrupted install, say
+		// — then reporting success would be a lie: the verified download is
+		// about to be discarded by the deferred cleanup, and Path() would point
+		// at a file that does not exist. Every later attempt would repeat it, so
+		// the daemon would be permanently stuck with a "present" version it
+		// cannot execute.
+		if usable(target) {
 			return domain.InstallResult{Version: version, Path: target, AlreadyPresent: true}, nil
 		}
-		return domain.InstallResult{}, fmt.Errorf("install %s: %w", version, err)
+		return domain.InstallResult{}, fmt.Errorf(
+			"install %s: %s already exists but holds no usable binary; remove it and retry: %w",
+			version, filepath.Join(i.root, version), err)
+	}
+
+	if err := syncDir(i.root); err != nil {
+		return domain.InstallResult{}, err
 	}
 
 	return domain.InstallResult{Version: version, Path: target}, nil
+}
+
+// syncDir flushes a directory entry, so a rename survives a power cut.
+func syncDir(path string) error {
+	dir, err := os.Open(path) // #nosec G304 -- a directory this package created
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() { _ = dir.Close() }()
+
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("flush %s: %w", path, err)
+	}
+	return nil
 }
 
 // Prune removes all but the newest keep versions, never removing protected ones.
@@ -198,15 +304,31 @@ func (i *Installer) Prune(ctx context.Context, keep int, protected ...string) er
 		return err
 	}
 
+	// Keep the newest `keep`, PLUS any protected version not already among them.
+	//
+	// Expressed in that order deliberately. A combined budget of
+	// keep+len(protected) let a protected version that was already among the
+	// newest buy an extra slot it never used, so keep=2 retained three — roughly
+	// 920 MB on the SD card the policy exists to protect — and duplicates in
+	// protected made it worse.
 	keepSet := make(map[string]struct{}, keep+len(protected))
-	for _, v := range protected {
-		keepSet[v] = struct{}{}
-	}
 	for _, v := range installed {
-		if len(keepSet) >= keep+len(protected) {
+		if len(keepSet) >= keep {
 			break
 		}
 		keepSet[v] = struct{}{}
+	}
+
+	// Protected versions survive whether or not they are recent. Only ones that
+	// are actually installed matter; the rest are not ours to keep.
+	installedSet := make(map[string]struct{}, len(installed))
+	for _, v := range installed {
+		installedSet[v] = struct{}{}
+	}
+	for _, v := range protected {
+		if _, ok := installedSet[v]; ok {
+			keepSet[v] = struct{}{}
+		}
 	}
 
 	for _, v := range installed {
