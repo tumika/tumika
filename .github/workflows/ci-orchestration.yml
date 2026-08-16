@@ -19,6 +19,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Superseded pushes to the same PR are cancelled; runs on the default branch and
+# in a merge queue are not. Cancelling a PR run costs nothing — a newer commit
+# is about to be validated anyway — whereas cancelling a default-branch run
+# discards the attestation it was about to record, and cancelling a queued
+# merge would drop it from the queue.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
