@@ -253,10 +253,7 @@ func TestHandoverWorksReportsTheProbeResult(t *testing.T) {
 	}
 
 	if !HandoverWorks(t.Context(), "/var/lib/tumika/master.cred", "tumika", probe) {
-		if _, err := os.Stat("/usr/bin/systemd-run"); err == nil {
-			t.Error("a succeeding probe was reported as a failure")
-		}
-		t.Skip("systemd-run is not on this machine, so the probe short-circuits")
+		t.Fatal("a succeeding probe was reported as a failure")
 	}
 
 	joined := strings.Join(seen, " ")
@@ -292,10 +289,6 @@ func TestExecCredsRunnerReportsFailuresWithDetail(t *testing.T) {
 // SystemdCredsUsable must OBSERVE the capability. Asking `has-tpm2` would answer
 // the wrong question: a Pi has no TPM and works fine on the host key.
 func TestSystemdCredsUsableProbesByActuallySealing(t *testing.T) {
-	if _, err := exec.LookPath("systemd-creds"); err != nil {
-		t.Skip("systemd-creds is not on this machine, so the probe short-circuits")
-	}
-
 	var sawEncrypt bool
 	probe := func(_ context.Context, _ []byte, args ...string) ([]byte, error) {
 		if args[0] == "encrypt" {
@@ -313,10 +306,6 @@ func TestSystemdCredsUsableProbesByActuallySealing(t *testing.T) {
 }
 
 func TestSystemdCredsUsableReportsAFailureToSeal(t *testing.T) {
-	if _, err := exec.LookPath("systemd-creds"); err != nil {
-		t.Skip("systemd-creds is not on this machine")
-	}
-
 	probe := func(context.Context, []byte, ...string) ([]byte, error) {
 		return nil, errors.New("no host key")
 	}
@@ -389,5 +378,59 @@ func TestTheFileStoreIsStillTheFallback(t *testing.T) {
 	}
 	if store.Backend() != BackendFile {
 		t.Errorf("backend = %q, want %q", store.Backend(), BackendFile)
+	}
+}
+
+// The install-time custody path, exercised WITHOUT the env override — so it
+// actually reaches the sealed-blob logic rather than short-circuiting on
+// TUMIKA_MASTER_KEY, which is what every install test does.
+//
+// This is the case that locked the installer out of its own install: after
+// committing to systemd-creds, root still has to be able to open the database.
+func TestRootCanStillOpenTheDatabaseAfterCommittingToSystemdCreds(t *testing.T) {
+	t.Setenv(MasterKeyEnv, "")
+	t.Setenv(CredentialsDirEnv, "")
+
+	home := t.TempDir()
+	keyFile := filepath.Join(home, "master.key")
+	sealed := CredentialPathFor(keyFile)
+
+	fake := &fakeCreds{}
+	if err := SealMasterKey(t.Context(), sealed, fake.run); err != nil {
+		t.Fatalf("SealMasterKey: %v", err)
+	}
+
+	// systemd has handed nothing over — this is the installer, not the service.
+	store, err := openSealedDirectly(sealed, fake.run)
+	if err != nil {
+		t.Fatalf("root cannot open the key it just sealed: %v", err)
+	}
+	if store.Backend() != BackendSystemdCreds {
+		t.Errorf("backend = %q, want %q", store.Backend(), BackendSystemdCreds)
+	}
+
+	// And the key is the same one the service will receive, or the two halves
+	// would be sealing and opening different things.
+	handed := t.TempDir()
+	viaRoot, err := store.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(handed, CredentialName),
+		[]byte(encodeKey(viaRoot)), 0o400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv(CredentialsDirEnv, handed)
+
+	viaSystemd, err := chooseKeyStore("linux", keyFile)
+	if err != nil {
+		t.Fatalf("chooseKeyStore: %v", err)
+	}
+	serviceKey, err := viaSystemd.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+	if string(serviceKey) != string(viaRoot) {
+		t.Error("the installer and the service would use different keys")
 	}
 }

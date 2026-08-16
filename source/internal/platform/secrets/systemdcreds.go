@@ -173,11 +173,15 @@ func ExecCredsRunner(ctx context.Context, stdin []byte, args ...string) ([]byte,
 // a Pi has no TPM and works fine on the host key, so the TPM question answers
 // something else. Only the installer calls this, and only as root.
 func SystemdCredsUsable(ctx context.Context, run CredsRunner) bool {
+	// LookPath only when the real tool is what will run. Checking it first
+	// short-circuited every injected stub, so the tests written to exercise this
+	// on a machine without systemd — which is the entire reason the indirection
+	// exists — skipped instead.
 	if run == nil {
+		if _, err := exec.LookPath("systemd-creds"); err != nil {
+			return false
+		}
 		run = ExecCredsRunner
-	}
-	if _, err := exec.LookPath("systemd-creds"); err != nil {
-		return false
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, credsTimeout)
@@ -219,10 +223,10 @@ func ExecHandoverProbe(ctx context.Context, name string, args ...string) error {
 // the capability rather than observing it.
 func HandoverWorks(ctx context.Context, sealedPath, user string, probe HandoverProbe) bool {
 	if probe == nil {
+		if _, err := exec.LookPath("systemd-run"); err != nil {
+			return false
+		}
 		probe = ExecHandoverProbe
-	}
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return false
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, credsTimeout)

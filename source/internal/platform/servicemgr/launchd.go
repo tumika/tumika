@@ -68,6 +68,10 @@ func (l *Launchd) target() string {
 
 func (l *Launchd) domain() string { return "gui/" + strconv.Itoa(l.uid) }
 
+// Prepare has nothing to do on macOS: a LaunchAgent runs as the operator, who
+// necessarily exists.
+func (l *Launchd) Prepare(context.Context, Config) error { return nil }
+
 // Install writes the plist and bootstraps it.
 //
 // bootstrap/bootout, not the load/unload pair. The older commands are
@@ -119,8 +123,12 @@ func (l *Launchd) Uninstall(ctx context.Context) error {
 		return fmt.Errorf("%w: no LaunchAgent at %s", ErrNotInstalled, l.plistPath())
 	}
 
+	// Not fatal — the plist is going away regardless — but not silent: if the
+	// service could not be unloaded, a process may survive the uninstall with
+	// nothing left to stop it.
 	if out, err := l.run(ctx, "launchctl", "bootout", l.target()); err != nil {
-		_ = out
+		Warnf("could not unload the service before removing it (%v)%s; "+
+			"check `ps` for a surviving tumika process", err, detail(out))
 	}
 	if err := os.Remove(l.plistPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove %s: %w", l.plistPath(), err)
@@ -128,9 +136,18 @@ func (l *Launchd) Uninstall(ctx context.Context) error {
 	return nil
 }
 
+// Start loads the service back into the domain and kicks it off.
+//
+// bootstrap first, because Stop unloads: a kickstart alone would fail with
+// "service not found" after a stop. Its failure is ignored — "already
+// bootstrapped" is the normal answer when the service was merely idle — and
+// kickstart is what actually reports whether the service could be started.
 func (l *Launchd) Start(ctx context.Context) error {
 	if err := l.requireInstalled(); err != nil {
 		return err
+	}
+	if out, err := l.run(ctx, "launchctl", "bootstrap", l.domain(), l.plistPath()); err != nil {
+		_ = out
 	}
 	if out, err := l.run(ctx, "launchctl", "kickstart", l.target()); err != nil {
 		return commandError("launchctl kickstart "+l.target(), out, err)
@@ -138,17 +155,21 @@ func (l *Launchd) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop kills the running process without unloading the service.
+// Stop boots the service out of the domain.
 //
-// `launchctl kill` rather than bootout: booting out would also remove it from
-// the domain, so a later Start would fail with "service not found" and the
-// operator would have to reinstall to undo a stop.
+// `launchctl kill` looks gentler and does not stop anything: the plist sets
+// KeepAlive, so launchd relaunches the process a moment later and `tumika stop`
+// returned success while the daemon was still running. KeepAlive is not
+// negotiable either — an update exits zero to be relaunched on the new binary.
+//
+// So Stop unloads, and Start bootstraps again. The plist stays on disk, so this
+// is still reversible without a reinstall, which is what the kill was for.
 func (l *Launchd) Stop(ctx context.Context) error {
 	if err := l.requireInstalled(); err != nil {
 		return err
 	}
-	if out, err := l.run(ctx, "launchctl", "kill", "SIGTERM", l.target()); err != nil {
-		return commandError("launchctl kill "+l.target(), out, err)
+	if out, err := l.run(ctx, "launchctl", "bootout", l.target()); err != nil {
+		return commandError("launchctl bootout "+l.target(), out, err)
 	}
 	return nil
 }
@@ -172,8 +193,12 @@ func (l *Launchd) Status(ctx context.Context) (Status, error) {
 		return status, fmt.Errorf("stat %s: %w", l.plistPath(), err)
 	}
 
-	// The plist exists, so it is installed even if launchd has never loaded it.
-	status.Enabled = true
+	// Installed. Whether it will START is a different question, and one launchd
+	// answers: a service that was explicitly disabled, or whose plist was
+	// written but never bootstrapped, has a plist and will not come back.
+	// Assuming true here suppressed exactly the "it will not survive a reboot"
+	// warning that exists to catch it.
+	status.Enabled = l.enabled(ctx)
 
 	out, err := l.run(ctx, "launchctl", "print", l.target())
 	if err != nil {
@@ -198,6 +223,28 @@ func (l *Launchd) Status(ctx context.Context) (Status, error) {
 		status.State = StateStopped
 	}
 	return status, nil
+}
+
+// enabled reports whether launchd will start this service.
+//
+// print-disabled is the authoritative answer; anything else is a guess. A
+// service absent from the list has never been disabled, which is the default and
+// means enabled.
+func (l *Launchd) enabled(ctx context.Context) bool {
+	out, err := l.run(ctx, "launchctl", "print-disabled", l.domain())
+	if err != nil {
+		// The domain could not be read. Not knowing is not the same as knowing
+		// it is disabled, and the plist is there — so report the optimistic
+		// answer rather than warning about something that may be fine.
+		return true
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if !strings.Contains(line, `"`+Label+`"`) {
+			continue
+		}
+		return !strings.Contains(line, "true")
+	}
+	return true
 }
 
 // pidLine extracts the running pid, if launchd reports one.
