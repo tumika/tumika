@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Read-only at the top, elevated per JOB to the minimum each one needs:
+# `contents: write` for goreleaser to publish the release, `packages: write` for
+# the ghcr push. The gate job gets neither.
+#
+# A release workflow holds the most powerful token in the repository, and it runs
+# on a tag — which is exactly the trigger somebody would reach for.
+permissions:
+  contents: read
+
+jobs:
+  # Nothing releases from a red tree.
+  #
+  # This is a full re-run rather than a reference to the CI run for the same
+  # commit: a tag can be pushed to any commit, including one whose PR checks
+  # never ran, and "the tests passed on main last week" is not the same claim as
+  # "the tests pass on the commit being released".
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      # The deployment target, and the no-cgo invariant. Same reasoning as
+      # ci.yml's cross-compile job: a release is exactly the wrong moment to
+      # discover that linux/arm64 stopped building.
+      - name: cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%%/*}"; goarch="${target##*/}"
+            echo "building $target"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build ./...
+            cgo=$(CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch" \
+              go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
+            if [ -n "$cgo" ]; then
+              echo "cgo on $target: $cgo" >&2
+              exit 1
+            fi
+          done
+
+      - name: install under a real systemd
+        run: deploy/testharness/verify.sh
+
+  goreleaser:
+    name: goreleaser
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # goreleaser builds the changelog from the commit range since the
+          # previous tag, so a shallow clone silently produces an empty one.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Checked on the REAL release too, not only on snapshots: this is the
+      # build people actually download, and a missing raw asset or an untaken
+      # ldflag is invisible until someone's self-update fails.
+      - name: the release ships what the updater and installer expect
+        run: scripts/verify-release-assets.sh
+
+  # Published AFTER goreleaser, so a release never exists with an image tag that
+  # points at nothing — the release notes tell people to pull it.
+  image:
+    name: image
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # QEMU, because the image builds the binary INSIDE the build stage: an
+      # arm64 image needs an arm64 toolchain run, not just an arm64 base. Slow,
+      # and it only runs on a tag.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: ghcr.io/tumika/tumika
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}

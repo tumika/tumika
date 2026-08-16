@@ -371,6 +371,36 @@ exclude the file, the pattern match skips the package, and the build exits zero.
 Both were verified by adding a cgo package. `go list` reporting a non-empty
 `CgoFiles` is what actually fires.
 
+## Releasing
+
+Tag `vX.Y.Z` and push it. `release.yml` then: re-runs the full gate (including
+the systemd install harness) on that exact commit, runs `goreleaser release`,
+and publishes a multi-arch image to `ghcr.io/tumika/tumika`.
+
+The gate is a full re-run rather than a reference to the commit's CI result,
+because a tag can be pushed to any commit — including one whose PR checks never
+ran.
+
+**Two archives, and both are load-bearing.** The `.tar.gz` is what a person
+downloads; the RAW binary is what `tumika update` fetches and what
+`scripts/install.sh` downloads (ADR-0003), because the updater replaces the
+running binary with an atomic rename and needs one uncompressed file at a
+predictable URL. `scripts/verify-release-assets.sh` checks that contract on both
+the snapshot build in CI and the real release — dropping the raw archive,
+renaming a template, or losing a target are all one-line edits that leave the
+build perfectly green.
+
+It also runs the built binary and asserts it reports the release version.
+Reading `metadata.json` is NOT the same question: goreleaser fills that in from
+the tag whether or not the ldflags reached the compiler. Verified by dropping
+`-X main.version` — the metadata stayed correct and the binary reported `dev`,
+which `buildinfo.IsDev()` treats as "disable self-update entirely".
+
+**Before any public release:** sign `checksums.txt` with an ECDSA key from
+Actions secrets and verify it in the updater. A checksum fetched from the same
+host as the binary proves the download was not corrupted; it does not prove who
+produced it.
+
 **Reviewing a branch:** `cd` to that branch's worktree first. This session's
 working directory is often an older one, and a review run there silently reviews
 long-merged code — it has produced three rounds of stale findings.

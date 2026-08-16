@@ -214,6 +214,39 @@ jobs:
       - name: install under a real systemd
         run: deploy/testharness/verify.sh
 
+  # `goreleaser build --snapshot` on every PR, so the release configuration is
+  # exercised continuously rather than first tried on a tag — the one moment
+  # when a broken build is most expensive and least expected.
+  #
+  # --snapshot builds without a tag and publishes nothing.
+  release-build:
+    name: release-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      # release --snapshot, not build --snapshot: `build` produces no archives
+      # and no checksums, which is most of what the next step verifies.
+      # --skip=publish means nothing leaves the runner.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --snapshot --skip=publish --clean
+
+      # The names install.sh and `tumika update` depend on, and the ldflags that
+      # decide whether self-update works at all. None of it is checked by the
+      # compiler or by `goreleaser check`, and every failure would surface at the
+      # next release rather than here.
+      - name: the release ships what the updater and installer expect
+        run: scripts/verify-release-assets.sh
+
   bulwark:
     name: bulwark
     # Fail fast: bulwark's coverage step parses the profile build-test produced,
@@ -274,12 +307,10 @@ jobs:
   # silently without blocking a merge. Add a job to `needs:` below and the
   # gate covers it automatically; the ruleset itself never needs to change.
   #
-  # Jobs still to join this list as the capabilities they test arrive:
-  #   build — `goreleaser build --snapshot --clean`, with .goreleaser.yml
   pr-gate:
     name: PR Gate
     if: always()
-    needs: [lint, sqlc, build-test, cross-compile, images, linux-install, bulwark]
+    needs: [lint, sqlc, build-test, cross-compile, release-build, images, linux-install, bulwark]
     runs-on: ubuntu-latest
     steps:
       - name: Require all upstream jobs to have succeeded
