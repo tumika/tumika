@@ -56,9 +56,22 @@ echo "==> the first run mints a token against the volume"
 # The daemon refuses to serve without one, so this is the documented first step
 # and it has to work against a fresh volume — an unprivileged account writing a
 # directory the image created at build time.
-token=$($ENGINE run --rm -v "$VOLUME:/var/lib/tumika" "$IMAGE" token rotate \
-  | grep -oE 'tmk_[A-Za-z0-9_-]+' | tail -1)
-[[ -n "$token" ]] || fail "could not mint a token against the volume"
+#
+# The output is captured FIRST and parsed after. Piping straight into grep put
+# the assignment outside any &&/|| list, so under `set -o pipefail` a
+# non-matching grep failed the pipeline and errexit killed the script before the
+# guard below could run: CI would show a bare non-zero exit with no message and
+# no container output. --quiet prints the token alone, so there is nothing to
+# scrape in the normal case.
+rotate_out=$($ENGINE run --rm -v "$VOLUME:/var/lib/tumika" "$IMAGE" token rotate --quiet 2>&1) || {
+  echo "$rotate_out" >&2
+  fail "token rotate failed against a fresh volume"
+}
+token=$(grep -oE 'tmk_[A-Za-z0-9_-]+' <<<"$rotate_out" | tail -1 || true)
+[[ -n "$token" ]] || {
+  echo "$rotate_out" >&2
+  fail "token rotate printed no token"
+}
 ok "minted a token"
 
 echo "==> serving"
@@ -94,18 +107,27 @@ if grep -q "$token" <<<"$logs"; then
 fi
 ok "the token stays out of the logs"
 
-echo "==> state survives a restart"
-# The volume is the whole install. A token that stopped working after a restart
-# would mean the database was inside the container layer.
-$ENGINE restart "$NAME" >/dev/null
+echo "==> state lives on the volume, not in the container"
+# The container is REMOVED and a new one started from the image against the same
+# volume. A restart would prove nothing: it keeps the writable layer, so a
+# database written inside the image layer would survive one and the check would
+# pass unconditionally — the one assertion that exists to show the mount matters.
+$ENGINE rm -f "$NAME" >/dev/null
+$ENGINE run -d --name "$NAME" -v "$VOLUME:/var/lib/tumika" \
+  -p "127.0.0.1:$PORT:8737" "$IMAGE" serve --listen 0.0.0.0:8737 >/dev/null
+
+health=""
 for _ in $(seq 1 30); do
   health=$(curl -fsS -H "Authorization: Bearer $token" \
     "http://127.0.0.1:$PORT/v1/health" 2>/dev/null) && break
   sleep 1
 done
-echo "${health:-}" | grep -q '"status":"ok"' \
-  || fail "the same token stopped working after a restart; state is not on the volume"
-ok "the same token still works after a restart"
+grep -q '"status":"ok"' <<<"${health:-}" || {
+  # The more interesting failure of the two: it means the state did not survive.
+  $ENGINE logs "$NAME" >&2
+  fail "the same token stopped working in a fresh container; state is not on the volume"
+}
+ok "a fresh container from the image accepts the same token"
 
 echo
 echo "PASS"

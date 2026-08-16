@@ -69,7 +69,6 @@ source/internal/platform/paths/         # filesystem layout resolution
 source/internal/platform/logging/       # slog setup + secret redaction handler
 source/internal/platform/buildinfo/     # version/commit/date, injected at build time
 deploy/Dockerfile                       # shipped image (tumika as PID 1)
-deploy/Dockerfile                       # shipped image (plain, tumika as PID 1)
 deploy/verify-image.sh                  # exercises the shipped image, not just its build
 deploy/testharness/Dockerfile           # CI-only: debian + systemd, exercises `tumika install`
 deploy/testharness/verify.sh            # the linux-install gate

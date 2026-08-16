@@ -119,11 +119,21 @@ jobs:
   # documents and cannot enforce — depguard never sees `import "C"` in either
   # cgo mode.
   #
-  # The enforcement is `go list`, NOT the build. `CGO_ENABLED=0 go build ./...`
-  # looks like it would catch a cgo package and does not: build constraints
-  # exclude the file, the pattern match skips the package, and the build exits
-  # zero. Verified by adding one. `go list` reporting a non-empty CgoFiles is
-  # the check that actually fires.
+  # Two things about that enforcement, each of which was got wrong first:
+  #
+  #  1. It is `go list`, not the build. `CGO_ENABLED=0 go build ./...` looks like
+  #     it would catch a cgo package and does not — build constraints exclude
+  #     the file, the pattern match skips the package, and the build exits zero.
+  #  2. It runs on EVERY matrix leg, because `go list` applies build constraints
+  #     for the current GOOS/GOARCH exactly as the build does. A
+  #     `//go:build darwin` file importing "C" is invisible on the linux legs,
+  #     so restricting this to one leg reopened precisely the hole it closes.
+  #
+  # Both verified by adding such a package and watching the check pass.
+  #
+  # Scope: this covers THIS MODULE's source. A dependency that uses cgo is
+  # covered by the CGO_ENABLED=0 build above — if it has a pure-Go fallback the
+  # build succeeds and the invariant holds, and if it does not the build fails.
   cross-compile:
     name: cross-compile
     runs-on: ubuntu-latest
@@ -150,26 +160,29 @@ jobs:
           GOARCH: ${{ matrix.target.goarch }}
         run: go build ./...
 
+      # Every leg, with this leg's GOOS/GOARCH: see the note above. CGO_ENABLED=1
+      # so the cgo files are visible to `go list` at all.
       - name: no cgo
-        # Only once, on the native target: CgoFiles is a property of the source,
-        # and asking four times would report the same package four times.
-        if: matrix.target.goos == 'linux' && matrix.target.goarch == 'amd64'
         env:
           CGO_ENABLED: "1"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
         run: |
           cgo=$(go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
           if [ -n "$cgo" ]; then
-            echo "these packages use cgo, which breaks the static cross-compile:" >&2
+            echo "these packages use cgo on ${GOOS}/${GOARCH}, which breaks the static build:" >&2
             echo "$cgo" >&2
             exit 1
           fi
 
-  # Both container artifacts (ADR: D9). The shipped image is what a user runs;
-  # the harness is CI-only and exists to exercise `tumika install`.
+  # The SHIPPED image (ADR: D9). The test-harness image is not built here: the
+  # linux-install job below builds it from the same context and then actually
+  # exercises it, so a second build could only fail in cases that one already
+  # covers.
   #
-  # verify-image.sh does more than build it: an image that compiles and cannot
-  # run the binary, write its volume as an unprivileged account, or answer the
-  # API is an image nobody can use.
+  # verify-image.sh does more than build: an image that compiles and cannot run
+  # the binary, write its volume as an unprivileged account, or answer the API
+  # is an image nobody can use.
   images:
     name: images
     runs-on: ubuntu-latest
@@ -178,9 +191,6 @@ jobs:
 
       - name: build and exercise the shipped image
         run: deploy/verify-image.sh
-
-      - name: build the test-harness image
-        run: podman build -t tumika-harness -f deploy/testharness/Dockerfile deploy/testharness
 
   # THE integration gate, and the one job allowed to be slow. It is what makes
   # the Pi deployment trustworthy without a Pi.
@@ -263,10 +273,7 @@ jobs:
   # gate covers it automatically; the ruleset itself never needs to change.
   #
   # Jobs still to join this list as the capabilities they test arrive:
-  #   build         — `goreleaser build --snapshot --clean`, with .goreleaser.yml
-  #   images        — shipped image + systemd test-harness image
-  #   linux-install — the integration gate that makes the Pi deployment
-  #                   trustworthy without a Pi
+  #   build — `goreleaser build --snapshot --clean`, with .goreleaser.yml
   pr-gate:
     name: PR Gate
     if: always()
