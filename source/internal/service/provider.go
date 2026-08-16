@@ -219,6 +219,14 @@ func (s *providerService) store(ctx context.Context, cred domain.Credential) (do
 	if cred.Secret == "" {
 		return domain.CredentialMeta{}, fmt.Errorf("%w: no secret", domain.ErrCredentialInvalid)
 	}
+	// Checked here rather than left to the database's CHECK constraint: the kind
+	// is bound into the sealing AAD and assumed by openLive and DeleteCredential,
+	// so an unknown one would seal successfully and then surface as an opaque
+	// 500 from a constraint violation.
+	if cred.Kind != domain.CredentialOAuthToken && cred.Kind != domain.CredentialAPIKey {
+		return domain.CredentialMeta{}, fmt.Errorf("%w: unknown credential kind %q",
+			domain.ErrCredentialInvalid, cred.Kind)
+	}
 	if _, err := s.registry.Get(cred.ProviderID); err != nil {
 		return domain.CredentialMeta{}, err
 	}
@@ -241,10 +249,21 @@ func (s *providerService) store(ctx context.Context, cred domain.Credential) (do
 
 	// Is there an incumbent? Replacing one is a different operation from
 	// establishing the first, and the difference matters.
-	incumbent, incumbentErr := s.creds.GetLive(ctx, cred.ProviderID, cred.Kind)
-	replacing := incumbentErr == nil
-	if incumbentErr != nil && !errors.Is(incumbentErr, domain.ErrNotFound) {
-		return domain.CredentialMeta{}, incumbentErr
+	//
+	// Asked per PROVIDER, not per kind. The partial unique index is per kind, so
+	// submitting an api_key while an oauth_token was live used to find no
+	// incumbent, take the first-credential path, and leave two live rows — after
+	// which openLive picked one of them and List reported whichever came last.
+	// A provider has one credential in use; which kind it is is the provider's
+	// business, not a second slot.
+	replacing := false
+	for _, kind := range credentialKinds {
+		if _, err := s.creds.GetLive(ctx, cred.ProviderID, kind); err == nil {
+			replacing = true
+			break
+		} else if !errors.Is(err, domain.ErrNotFound) {
+			return domain.CredentialMeta{}, err
+		}
 	}
 
 	// REPLACING: prove the candidate before retiring what works.
@@ -259,15 +278,34 @@ func (s *providerService) store(ctx context.Context, cred domain.Credential) (do
 		if err != nil {
 			return meta, fmt.Errorf("%w: the existing credential was left in place", err)
 		}
-		if meta.Status == string(domain.CredentialInvalid) {
-			return meta, fmt.Errorf("%w: %s; the existing credential was left in place",
-				domain.ErrCredentialInvalid, meta.LastVerifyError)
+
+		// Anything short of ACTIVE leaves the incumbent alone.
+		//
+		// Testing only for `invalid` was not enough: a driver reporting
+		// `expired` — or reporting nothing at all, which its contract permits —
+		// would have retired a working credential and inserted a row that is not
+		// live, leaving the provider with none and no way back. That is exactly
+		// the outcome verifying-before-retiring exists to prevent, so the
+		// condition is a positive test for the one status that justifies the
+		// swap.
+		if meta.Status != string(domain.CredentialActive) {
+			status := meta.Status
+			if status == "" {
+				status = "unverified"
+			}
+			return meta, fmt.Errorf("%w: the replacement verified as %s (%s); "+
+				"the existing credential was left in place",
+				domain.ErrCredentialInvalid, status, meta.LastVerifyError)
 		}
 		sealed.Meta = mergeMeta(cred.Meta, meta)
 
 		err = s.tx.InTx(ctx, func(ctx context.Context) error {
-			if err := s.creds.Retire(ctx, cred.ProviderID, cred.Kind, domain.CredentialRevoked); err != nil {
-				return err
+			// Every kind, so the provider is left with exactly one live
+			// credential.
+			for _, kind := range credentialKinds {
+				if err := s.creds.Retire(ctx, cred.ProviderID, kind, domain.CredentialRevoked); err != nil {
+					return err
+				}
 			}
 			_, err := s.creds.Insert(ctx, sealed)
 			return err
@@ -275,7 +313,6 @@ func (s *providerService) store(ctx context.Context, cred domain.Credential) (do
 		if err != nil {
 			return domain.CredentialMeta{}, err
 		}
-		_ = incumbent
 		return sealed.Meta, nil
 	}
 
@@ -295,9 +332,10 @@ func (s *providerService) store(ctx context.Context, cred domain.Credential) (do
 	meta, err := s.verify(ctx, cred.ProviderID, id, cred)
 	if err != nil {
 		// Stored but unverifiable: the provider could not be reached. That is a
-		// real, recorded state rather than a failure to store, so the metadata
-		// that comes back is the one that was written.
-		return meta, err
+		// real, recorded state rather than a failure to store — so what comes
+		// back is the metadata that was WRITTEN, which has Status forced to
+		// unverified, not the caller's, which may claim otherwise.
+		return sealed.Meta, err
 	}
 	if meta.Status == string(domain.CredentialInvalid) {
 		return meta, fmt.Errorf("%w: %s", domain.ErrCredentialInvalid, meta.LastVerifyError)
@@ -425,14 +463,25 @@ func (s *providerService) verify(
 }
 
 // openLive unseals the live credential for a provider.
+// openLive unseals the credential to verify for a provider.
+//
+// It prefers a live one, and falls back to the most recent credential the
+// operator has not revoked. Without the fallback, a credential rejected once —
+// including by a provider-side hiccup — could never be re-checked: GetLive
+// excludes 'invalid', so an explicit verification would answer 404 and the
+// monitor would never look at it again. Being unusable and being unrecoverable
+// are different things.
 func (s *providerService) openLive(ctx context.Context, providerID string) (domain.Credential, int64, error) {
-	for _, kind := range []string{domain.CredentialOAuthToken, domain.CredentialAPIKey} {
-		sealed, err := s.creds.GetLive(ctx, providerID, kind)
-		if errors.Is(err, domain.ErrNotFound) {
-			continue
-		}
+	for _, lookup := range []func(context.Context, string, string) (domain.SealedCredential, error){
+		s.creds.GetLive,
+		s.creds.GetLatest,
+	} {
+		sealed, found, err := firstOf(ctx, lookup, providerID)
 		if err != nil {
 			return domain.Credential{}, 0, err
+		}
+		if !found {
+			continue
 		}
 
 		plaintext, err := s.sealer.Open(secrets.Sealed{
@@ -457,6 +506,29 @@ func (s *providerService) openLive(ctx context.Context, providerID string) (doma
 	return domain.Credential{}, 0, fmt.Errorf("%w: no credential stored for %q", domain.ErrNotFound, providerID)
 }
 
+// credentialKinds is every kind a provider may hold. Iterated wherever "this
+// provider's credential" is meant regardless of how it was obtained.
+var credentialKinds = []string{domain.CredentialOAuthToken, domain.CredentialAPIKey}
+
+// firstOf runs a lookup across every credential kind and returns the first hit.
+func firstOf(
+	ctx context.Context,
+	lookup func(context.Context, string, string) (domain.SealedCredential, error),
+	providerID string,
+) (domain.SealedCredential, bool, error) {
+	for _, kind := range credentialKinds {
+		sealed, err := lookup(ctx, providerID, kind)
+		if errors.Is(err, domain.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return domain.SealedCredential{}, false, err
+		}
+		return sealed, true, nil
+	}
+	return domain.SealedCredential{}, false, nil
+}
+
 // DeleteCredential retires every live credential for a provider.
 //
 // Retire rather than delete: the row is the record that a credential was once in
@@ -467,7 +539,7 @@ func (s *providerService) DeleteCredential(ctx context.Context, id string) error
 	}
 
 	return s.tx.InTx(ctx, func(ctx context.Context) error {
-		for _, kind := range []string{domain.CredentialOAuthToken, domain.CredentialAPIKey} {
+		for _, kind := range credentialKinds {
 			if err := s.creds.Retire(ctx, id, kind, domain.CredentialRevoked); err != nil {
 				return err
 			}

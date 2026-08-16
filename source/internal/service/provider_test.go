@@ -29,9 +29,12 @@ type fakeDriver struct {
 	// verdict maps a secret to the status Verify reports.
 	verdict map[string]domain.CredentialStatus
 	// err, when set, means the check could not be carried out at all.
-	err   error
-	calls int
-	meta  domain.CredentialMeta
+	err error
+	// blankStatus makes Verify report no status at all, which its contract
+	// permits and which the service must not treat as success.
+	blankStatus bool
+	calls       int
+	meta        domain.CredentialMeta
 }
 
 func (f *fakeDriver) Descriptor() domain.Descriptor {
@@ -80,6 +83,9 @@ func (f *fakeDriver) Verify(_ context.Context, c domain.Credential) (domain.Cred
 
 	meta := f.meta
 	meta.Status = string(status)
+	if f.blankStatus {
+		meta.Status = ""
+	}
 	now := time.Now().UTC()
 	meta.LastVerifiedAt = &now
 	if status == domain.CredentialInvalid {
@@ -112,6 +118,27 @@ func (f *fakeCredRepo) GetLive(_ context.Context, providerID, kind string) (doma
 	return domain.SealedCredential{}, domain.ErrNotFound
 }
 
+// GetLatest returns the most recent non-revoked credential, whatever its
+// status — which is what lets a rejected one be re-verified.
+func (f *fakeCredRepo) GetLatest(_ context.Context, providerID, kind string) (domain.SealedCredential, error) {
+	var best *domain.SealedCredential
+	for _, row := range f.rows {
+		if row.ProviderID != providerID || row.Kind != kind {
+			continue
+		}
+		if row.Meta.Status == string(domain.CredentialRevoked) {
+			continue
+		}
+		if best == nil || row.ID > best.ID {
+			best = row
+		}
+	}
+	if best == nil {
+		return domain.SealedCredential{}, domain.ErrNotFound
+	}
+	return *best, nil
+}
+
 func (f *fakeCredRepo) ListLive(context.Context) ([]domain.SealedCredential, error) {
 	var out []domain.SealedCredential
 	for _, row := range f.rows {
@@ -137,7 +164,9 @@ func (f *fakeCredRepo) Insert(_ context.Context, c domain.SealedCredential) (int
 
 func (f *fakeCredRepo) UpdateStatus(_ context.Context, id int64, status domain.CredentialStatus, verifyErr string) (bool, error) {
 	row, ok := f.rows[id]
-	if !ok || !live(row.Meta.Status) {
+	// Guarded on "not revoked" rather than on liveness, matching the SQL: an
+	// invalid credential must still be able to verify back to active.
+	if !ok || row.Meta.Status == string(domain.CredentialRevoked) {
 		return false, nil
 	}
 	row.Meta.Status = string(status)
@@ -147,7 +176,7 @@ func (f *fakeCredRepo) UpdateStatus(_ context.Context, id int64, status domain.C
 
 func (f *fakeCredRepo) UpdateMeta(_ context.Context, id int64, meta domain.CredentialMeta) (bool, error) {
 	row, ok := f.rows[id]
-	if !ok || !live(row.Meta.Status) {
+	if !ok || row.Meta.Status == string(domain.CredentialRevoked) {
 		return false, nil
 	}
 	status := row.Meta.Status
@@ -546,6 +575,10 @@ func (f *failingCredRepo) Insert(ctx context.Context, c domain.SealedCredential)
 	return f.fakeCredRepo.Insert(ctx, c)
 }
 
+func (f *failingCredRepo) GetLatest(ctx context.Context, providerID, kind string) (domain.SealedCredential, error) {
+	return f.fakeCredRepo.GetLatest(ctx, providerID, kind)
+}
+
 func (f *failingCredRepo) ListLive(ctx context.Context) ([]domain.SealedCredential, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -639,5 +672,141 @@ func TestVerifyWithNoStoredCredential(t *testing.T) {
 
 	if _, err := svc.VerifyCredential(t.Context(), fakeProviderID); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("= %v, want ErrNotFound", err)
+	}
+}
+
+// Only an ACTIVE replacement justifies retiring a working credential.
+//
+// Testing only for `invalid` was not enough: a driver reporting `expired` — or
+// reporting nothing, which its contract permits — would have retired the
+// incumbent and inserted a row that is not live, leaving the provider with none.
+func TestOnlyAnActiveReplacementRetiresTheIncumbent(t *testing.T) {
+	for name, verdict := range map[string]domain.CredentialStatus{
+		"expired":      domain.CredentialExpired,
+		"unverified":   domain.CredentialUnverified,
+		"empty status": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			driver := &fakeDriver{verdict: map[string]domain.CredentialStatus{goodSecret: domain.CredentialActive}}
+			blank := verdict == ""
+			svc, creds := newProviderService(t, driver)
+			ctx := t.Context()
+
+			if _, err := svc.SubmitSecret(ctx, fakeProviderID, domain.AuthAPIKey, goodSecret); err != nil {
+				t.Fatalf("first submit: %v", err)
+			}
+			incumbent, err := creds.GetLive(ctx, fakeProviderID, domain.CredentialAPIKey)
+			if err != nil {
+				t.Fatalf("GetLive: %v", err)
+			}
+
+			driver.verdict = map[string]domain.CredentialStatus{badSecret: verdict}
+			driver.blankStatus = blank
+			if _, err := svc.SubmitSecret(ctx, fakeProviderID, domain.AuthAPIKey, badSecret); err == nil {
+				t.Fatal("a replacement that did not verify active was accepted")
+			}
+
+			after, err := creds.GetLive(ctx, fakeProviderID, domain.CredentialAPIKey)
+			if err != nil {
+				t.Fatalf("the provider was left with no live credential: %v", err)
+			}
+			if after.ID != incumbent.ID {
+				t.Error("the incumbent was replaced by a credential that did not verify active")
+			}
+		})
+	}
+}
+
+// A provider holds ONE credential in use. Submitting a different kind used to
+// take the first-credential path and leave two live rows, after which one was
+// silently never used or shown.
+func TestSubmittingADifferentKindReplacesRatherThanCoexists(t *testing.T) {
+	driver := &fakeDriver{}
+	svc, creds := newProviderService(t, driver)
+	ctx := t.Context()
+
+	if _, err := svc.StoreCredential(ctx, domain.Credential{
+		ProviderID: fakeProviderID, Kind: domain.CredentialOAuthToken, Secret: goodSecret,
+	}); err != nil {
+		t.Fatalf("store an oauth token: %v", err)
+	}
+	if _, err := svc.StoreCredential(ctx, domain.Credential{
+		ProviderID: fakeProviderID, Kind: domain.CredentialAPIKey, Secret: badSecret,
+	}); err != nil {
+		t.Fatalf("store an api key: %v", err)
+	}
+
+	live, err := creds.ListLive(ctx)
+	if err != nil {
+		t.Fatalf("ListLive: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("the provider holds %d live credentials, want exactly 1", len(live))
+	}
+	if live[0].Kind != domain.CredentialAPIKey {
+		t.Errorf("the live credential is %q, want the one most recently stored", live[0].Kind)
+	}
+}
+
+// Being unusable and being unrecoverable are different things: a credential
+// rejected once — possibly by a provider-side hiccup — must still be
+// re-checkable, or the only cure is re-submitting the secret.
+func TestARejectedCredentialCanBeVerifiedAgain(t *testing.T) {
+	driver := &fakeDriver{verdict: map[string]domain.CredentialStatus{goodSecret: domain.CredentialInvalid}}
+	svc, creds := newProviderService(t, driver)
+	ctx := t.Context()
+
+	// Stored, then rejected on its first check.
+	if _, err := svc.StoreCredential(ctx, domain.Credential{
+		ProviderID: fakeProviderID, Kind: domain.CredentialAPIKey, Secret: goodSecret,
+	}); err == nil {
+		t.Fatal("a rejected first credential should report the rejection")
+	}
+	if _, err := creds.GetLive(ctx, fakeProviderID, domain.CredentialAPIKey); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("a rejected credential must not be live")
+	}
+
+	// The provider starts accepting it again.
+	driver.verdict = map[string]domain.CredentialStatus{goodSecret: domain.CredentialActive}
+
+	meta, err := svc.VerifyCredential(ctx, fakeProviderID)
+	if err != nil {
+		t.Fatalf("a rejected credential could not be re-verified: %v", err)
+	}
+	if meta.Status != string(domain.CredentialActive) {
+		t.Errorf("Status = %q, want active", meta.Status)
+	}
+	if _, err := creds.GetLive(ctx, fakeProviderID, domain.CredentialAPIKey); err != nil {
+		t.Errorf("the recovered credential is not live again: %v", err)
+	}
+}
+
+// A revoked credential is the one terminal state, because it is the one the
+// operator chose.
+func TestARevokedCredentialStaysRevoked(t *testing.T) {
+	driver := &fakeDriver{}
+	svc, _ := newProviderService(t, driver)
+	ctx := t.Context()
+
+	if _, err := svc.SubmitSecret(ctx, fakeProviderID, domain.AuthAPIKey, goodSecret); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := svc.DeleteCredential(ctx, fakeProviderID); err != nil {
+		t.Fatalf("DeleteCredential: %v", err)
+	}
+
+	if _, err := svc.VerifyCredential(ctx, fakeProviderID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("a revoked credential was resurrected by a verification: %v", err)
+	}
+}
+
+func TestStoreCredentialRejectsAnUnknownKind(t *testing.T) {
+	svc, _ := newProviderService(t, &fakeDriver{})
+
+	_, err := svc.StoreCredential(t.Context(), domain.Credential{
+		ProviderID: fakeProviderID, Kind: "telepathy", Secret: goodSecret,
+	})
+	if !errors.Is(err, domain.ErrCredentialInvalid) {
+		t.Errorf("= %v, want ErrCredentialInvalid rather than a constraint violation", err)
 	}
 }

@@ -31,6 +31,17 @@ func (r *CredentialRepo) GetLive(ctx context.Context, providerID, kind string) (
 	return credentialFrom(row)
 }
 
+func (r *CredentialRepo) GetLatest(ctx context.Context, providerID, kind string) (domain.SealedCredential, error) {
+	row, err := r.s.readQ(ctx).GetLatestCredential(ctx, GetLatestCredentialParams{
+		ProviderID: providerID,
+		Kind:       kind,
+	})
+	if err != nil {
+		return domain.SealedCredential{}, mapError(err)
+	}
+	return credentialFrom(ProviderCredential(row))
+}
+
 func (r *CredentialRepo) ListLive(ctx context.Context) ([]domain.SealedCredential, error) {
 	rows, err := r.s.readQ(ctx).ListLiveCredentials(ctx)
 	if err != nil {

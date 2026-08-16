@@ -144,6 +144,10 @@ func writeServiceError(w http.ResponseWriter, logger *slog.Logger, err error) {
 		writeError(w, http.StatusBadGateway, "provider_unavailable", err.Error())
 	case errors.Is(err, domain.ErrSuperseded):
 		writeError(w, http.StatusConflict, "superseded", err.Error())
+	case errors.Is(err, domain.ErrConflict):
+		// Two submissions raced and the partial unique index refused the loser.
+		// Actionable — retry — rather than an internal failure.
+		writeError(w, http.StatusConflict, "conflict", err.Error())
 	default:
 		// The message is deliberately generic: an internal failure's text can
 		// carry paths, SQL or driver detail, none of which belongs in a

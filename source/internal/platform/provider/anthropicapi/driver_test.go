@@ -131,23 +131,56 @@ func TestVerifyAcceptsAWorkingKey(t *testing.T) {
 	}
 }
 
-// A rejected key is a RESULT, not an error: the provider answered the question.
-func TestVerifyReportsARejectedKeyAsAVerdict(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		meta, err := verifyAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`))
-		})
+// A 401 is a RESULT, not an error: the provider answered the question.
+func TestVerifyReportsA401AsAVerdict(t *testing.T) {
+	meta, err := verifyAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`))
+	})
 
-		if err != nil {
-			t.Fatalf("a %d must be a verdict, not an error: %v", status, err)
-		}
-		if meta.Status != string(domain.CredentialInvalid) {
-			t.Errorf("Status = %q, want invalid", meta.Status)
-		}
-		if !strings.Contains(meta.LastVerifyError, "invalid x-api-key") {
-			t.Errorf("LastVerifyError = %q, want the provider's own message", meta.LastVerifyError)
-		}
+	if err != nil {
+		t.Fatalf("a 401 must be a verdict, not an error: %v", err)
+	}
+	if meta.Status != string(domain.CredentialInvalid) {
+		t.Errorf("Status = %q, want invalid", meta.Status)
+	}
+	if !strings.Contains(meta.LastVerifyError, "invalid x-api-key") {
+		t.Errorf("LastVerifyError = %q, want the provider's own message", meta.LastVerifyError)
+	}
+}
+
+// A 403 is NOT a verdict on the key. It can mean the key is perfectly valid but
+// lacks access to this endpoint or workspace, and condemning it would take a
+// working credential out of service over a permissions detail — permanently, if
+// nothing can re-verify a credential once marked invalid.
+func TestVerifyDoesNotCondemnAKeyOnA403(t *testing.T) {
+	meta, err := verifyAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"permission denied for this endpoint"}}`))
+	})
+
+	if err == nil {
+		t.Fatal("a 403 should be reported as an error the caller can retry")
+	}
+	if meta.Status == string(domain.CredentialInvalid) {
+		t.Error("a 403 marked the credential invalid")
+	}
+	if !strings.Contains(err.Error(), "lack access") {
+		t.Errorf("the error should explain the ambiguity, got: %v", err)
+	}
+}
+
+// Truncating a long non-ASCII error body must not store invalid UTF-8, which
+// would come back through JSON as replacement characters.
+func TestVerifyTruncatesOnARuneBoundary(t *testing.T) {
+	long := strings.Repeat("é", 400)
+	meta, _ := verifyAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"` + long + `"}}`))
+	})
+
+	if !utf8.ValidString(meta.LastVerifyError) {
+		t.Errorf("stored metadata is not valid UTF-8: %q", meta.LastVerifyError)
 	}
 }
 

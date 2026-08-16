@@ -74,6 +74,13 @@ type CredentialRepository interface {
 	// GetLive returns the one live credential for a provider and kind — the
 	// row the partial unique index permits — or domain.ErrNotFound.
 	GetLive(ctx context.Context, providerID, kind string) (domain.SealedCredential, error)
+	// GetLatest returns the most recent credential for a provider and kind that
+	// the operator has not revoked, whatever its status.
+	//
+	// GetLive excludes 'invalid' and 'expired' because they must not be USED;
+	// this exists because they must still be re-CHECKABLE. A key rejected by a
+	// provider-side hiccup would otherwise be condemned permanently.
+	GetLatest(ctx context.Context, providerID, kind string) (domain.SealedCredential, error)
 	// ListLive returns every live credential, for the credential monitor and
 	// for /v1/health.
 	ListLive(ctx context.Context) ([]domain.SealedCredential, error)

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tumika/tumika/source/internal/domain"
 	"github.com/tumika/tumika/source/internal/platform/logging"
@@ -177,11 +178,18 @@ func (d *Driver) Verify(ctx context.Context, c domain.Credential) (domain.Creden
 		meta.Status = string(domain.CredentialActive)
 		return meta, nil
 
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case resp.StatusCode == http.StatusUnauthorized:
 		// A verdict, not a failure: the provider has told us the key is no good.
 		meta.Status = string(domain.CredentialInvalid)
 		meta.LastVerifyError = describe(resp)
 		return meta, nil
+
+	case resp.StatusCode == http.StatusForbidden:
+		// NOT a verdict. A 403 on /v1/models can mean the key is fine but lacks
+		// access to this endpoint or workspace, and condemning it would take a
+		// working credential out of service over a permissions detail.
+		return meta, fmt.Errorf("%s returned %s (the key may be valid but lack access to this endpoint): %s",
+			d.baseURL, resp.Status, describe(resp))
 
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		// Says nothing about the key. Leave the status alone and report an
@@ -229,7 +237,15 @@ func truncate(s string) string {
 	if len(s) <= maxDescription {
 		return s
 	}
-	return s[:maxDescription] + "…"
+
+	// Cut on a rune boundary. A localised error page from an upstream proxy is
+	// the realistic non-ASCII case, and slicing bytes would store invalid UTF-8
+	// that comes back through JSON as replacement characters.
+	cut := maxDescription
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // hint is the only part of a key that may be shown or stored in the clear.

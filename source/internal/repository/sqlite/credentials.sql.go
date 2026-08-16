@@ -20,6 +20,55 @@ func (q *Queries) DeleteCredential(ctx context.Context, id int64) error {
 	return err
 }
 
+const getLatestCredential = `-- name: GetLatestCredential :one
+SELECT id, provider_id, kind, ciphertext, nonce, key_ref, cipher,
+       hint, account_email, status, issued_at, expires_at, expiry_is_estimate,
+       last_verified_at, last_verify_error, created_at, updated_at
+FROM provider_credentials
+WHERE provider_id = ?
+  AND kind = ?
+  AND status != 'revoked'
+ORDER BY id DESC
+LIMIT 1
+`
+
+type GetLatestCredentialParams struct {
+	ProviderID string
+	Kind       string
+}
+
+// The most recent credential that has not been revoked, whatever its status.
+//
+// GetLiveCredential deliberately excludes 'invalid' and 'expired', because those
+// must not be USED. But they must still be re-checkable: a key rejected because
+// of a provider-side hiccup would otherwise be condemned forever, recoverable
+// only by re-submitting the secret. Revoked is the one terminal state  -  that one
+// the operator chose.
+func (q *Queries) GetLatestCredential(ctx context.Context, arg GetLatestCredentialParams) (ProviderCredential, error) {
+	row := q.db.QueryRowContext(ctx, getLatestCredential, arg.ProviderID, arg.Kind)
+	var i ProviderCredential
+	err := row.Scan(
+		&i.ID,
+		&i.ProviderID,
+		&i.Kind,
+		&i.Ciphertext,
+		&i.Nonce,
+		&i.KeyRef,
+		&i.Cipher,
+		&i.Hint,
+		&i.AccountEmail,
+		&i.Status,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ExpiryIsEstimate,
+		&i.LastVerifiedAt,
+		&i.LastVerifyError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getLiveCredential = `-- name: GetLiveCredential :one
 
 SELECT id, provider_id, kind, ciphertext, nonce, key_ref, cipher,
@@ -206,7 +255,7 @@ SET hint               = ?,
     last_verified_at   = ?,
     updated_at         = ?
 WHERE id = ?
-  AND status IN ('active', 'unverified')
+  AND status != 'revoked'
 `
 
 type UpdateCredentialMetaParams struct {
@@ -220,7 +269,7 @@ type UpdateCredentialMetaParams struct {
 	ID               int64
 }
 
-// Writes every field, and is guarded on liveness like the status update.
+// Writes every field, and carries the same guard as the status update.
 //
 // MERGING is the caller's job, not this query's: which fields a driver is
 // entitled to overwrite is a business rule, and it lives in ProviderService
@@ -249,8 +298,8 @@ UPDATE provider_credentials
 SET status            = ?,
     last_verify_error = ?,
     updated_at        = ?
-WHERE id = ?4
-  AND status IN ('active', 'unverified')
+WHERE id = ?
+  AND status != 'revoked'
 `
 
 type UpdateCredentialStatusParams struct {
@@ -260,11 +309,15 @@ type UpdateCredentialStatusParams struct {
 	ID              int64
 }
 
-// Guarded on liveness, and reporting rows affected, because verification
-// deliberately runs outside a transaction: the row can be retired by a DELETE or
-// replaced by another submission while the provider is being called. Without the
-// guard, a late verdict writes 'active' back onto a revoked row and resurrects
-// it. Zero rows means "superseded", which is a normal outcome, not an error.
+// Guarded, and reporting rows affected, because verification deliberately runs
+// outside a transaction: the row can be revoked by a DELETE or superseded while
+// the provider is being called, and a late verdict writing 'active' back would
+// resurrect it. Zero rows means "superseded", a normal outcome rather than an
+// error.
+//
+// The guard is `!= 'revoked'` rather than a liveness test, so an 'invalid'
+// credential can still be re-verified back to 'active'. Revoked is the only
+// terminal state, because it is the only one the operator chose.
 func (q *Queries) UpdateCredentialStatus(ctx context.Context, arg UpdateCredentialStatusParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, updateCredentialStatus,
 		arg.Status,
