@@ -236,8 +236,28 @@ The cipher is fixed; only key custody varies, chosen at startup and reported by
 | Precedence | Backend | Notes |
 |---|---|---|
 | 1 | `TUMIKA_MASTER_KEY` | explicit beats implicit, or the override would not be trustworthy |
-| 2 | macOS Keychain | why the Mac install is a LaunchAgent, not a daemon — Keychain needs a session |
-| 3 | `0600` file | the honest fallback; a container has no keystore. `systemd-creds` joins at the service-manager step |
+| 2 | systemd handover | `$CREDENTIALS_DIRECTORY` — as deliberate as the override; systemd only sets it because the unit asked |
+| 3 | macOS Keychain | why the Mac install is a LaunchAgent, not a daemon — Keychain needs a session |
+| 4 | `0600` file | the honest fallback; a container has no keystore |
+
+**`systemd-creds` is split across two processes, and neither half makes sense
+alone.** `tumika install` runs as root and *seals* the key, because
+`systemd-creds encrypt` reads the root-only host key. The daemon runs
+unprivileged and never invokes `systemd-creds` at all: the unit declares
+`LoadCredentialEncrypted=`, so systemd decrypts during startup — while still
+privileged — and drops the plaintext into a tmpfs the service account can read.
+
+Decrypting at runtime is the obvious design and it does not work; the daemon
+cannot read the host key and silently fell back to reporting backend `file`.
+Install therefore also *proves* the handover with a transient probe unit before
+committing to it: a host can be able to seal a key and unable to receive one, and
+committing without checking leaves a daemon that can never start. Both were found
+by running the install under a real systemd (`deploy/testharness/verify.sh`), not
+by reasoning about it.
+
+**A sealed blob that cannot be opened is fatal**, exactly like the Keychain: a
+host with `master.cred` has credentials sealed under that key, and minting a
+fresh one in a file would start cleanly and read none of them.
 
 Two things that are easy to get wrong and are pinned by tests:
 
@@ -258,6 +278,30 @@ keychain or a denied prompt fails the daemon closed. Falling back to a file woul
 find no key, mint a fresh one, start cleanly — and be unable to open a single
 existing credential, while anything re-submitted during that run got sealed under
 the new key and orphaned on the next successful start.
+
+## Service management
+
+`tumika install` sets the daemon up under the platform's supervisor — a systemd
+system unit on Linux, a LaunchAgent on macOS — and `uninstall / start / stop /
+status` drive it from there. Neither driver is behind a build tag: both compile
+everywhere and only `servicemgr.New` consults `runtime.GOOS`, so the Linux unit
+rendering and command sequencing are testable on a Mac.
+
+Three things the Linux install must do, each of which was a silent failure first:
+
+- **Hand `TUMIKA_HOME` to the service account.** The layout is created `0700` by
+  root and the unit runs as `tumika`, so without this systemd cannot traverse into
+  the directory holding the binary — `203/EXEC`, which `Restart=always` turns into
+  a loop that `is-active` reports as `activating` forever rather than `failed`.
+- **Mint an API token before starting.** The daemon refuses to serve without one,
+  and `Restart=always` turns that refusal into the same loop.
+- **Prove the credential handover** before writing `LoadCredentialEncrypted=`.
+
+`deploy/testharness/verify.sh` runs the whole thing under a real systemd in a
+podman container: install, ownership, the unit systemd actually accepts,
+`/v1/health` through the supervised daemon, `Restart=always` recovery from
+`SIGKILL`, a second install, and an uninstall that leaves the database. Unit tests
+check what is rendered and sequenced; only this checks whether systemd agrees.
 
 ## Conventions
 
