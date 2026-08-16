@@ -16,6 +16,7 @@ type Health struct {
 
 	Database DatabaseHealth `json:"database"`
 	Auth     AuthHealth     `json:"auth"`
+	Secrets  SecretsHealth  `json:"secrets"`
 
 	// Warnings names everything that made Status "degraded", so the reason
 	// travels with the verdict rather than having to be inferred.
@@ -27,6 +28,13 @@ type DatabaseHealth struct {
 	SchemaVersion int64  `json:"schema_version"`
 	Reachable     bool   `json:"reachable"`
 	Error         string `json:"error,omitempty"`
+}
+
+// SecretsHealth describes credential key custody. It names the backend and
+// nothing else — never the key, never its reference beyond the backend name,
+// since a key reference includes a filesystem path.
+type SecretsHealth struct {
+	Backend string `json:"backend"`
 }
 
 // AuthHealth describes API authentication. It reports only whether a token

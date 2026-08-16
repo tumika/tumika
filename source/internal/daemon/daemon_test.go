@@ -15,6 +15,7 @@ import (
 	"github.com/tumika/tumika/source/internal/daemon"
 	"github.com/tumika/tumika/source/internal/domain"
 	"github.com/tumika/tumika/source/internal/platform/paths"
+	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/service"
 )
 
@@ -24,8 +25,22 @@ import (
 // The layer tests use fakes; this one deliberately does not. It is the only
 // thing that proves the wiring between them is right, which is the whole point
 // of building this slice before anything complicated arrives.
+// testKey pins key custody for the whole daemon test suite.
+//
+// Without it, daemon.New goes through secrets.OpenKeyStore, which on macOS
+// reaches for the REAL login Keychain and writes an entry into it — so
+// `go test ./...` would mutate the Keychain of whoever ran it. The override also
+// makes the tests deterministic across platforms.
+const testKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+func useTestKeyCustody(t *testing.T) {
+	t.Helper()
+	t.Setenv(secrets.MasterKeyEnv, testKey)
+}
+
 func start(t *testing.T) (string, string) {
 	t.Helper()
+	useTestKeyCustody(t)
 
 	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
@@ -214,6 +229,8 @@ func TestUnknownSettingIsNotFound(t *testing.T) {
 
 // State must survive a restart: that is the point of persisting it.
 func TestSettingsSurviveARestart(t *testing.T) {
+	useTestKeyCustody(t)
+
 	home := filepath.Join(t.TempDir(), "home")
 	p, err := paths.Resolve(home)
 	if err != nil {
@@ -282,6 +299,8 @@ func TestSettingsSurviveARestart(t *testing.T) {
 // unauthenticated. Minting one automatically would have to put a full-access
 // credential somewhere readable — a log line or a file — that nobody asked for.
 func TestServeRefusesWithoutAToken(t *testing.T) {
+	useTestKeyCustody(t)
+
 	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)

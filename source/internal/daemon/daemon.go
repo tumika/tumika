@@ -19,6 +19,7 @@ import (
 	"github.com/tumika/tumika/source/internal/api"
 	"github.com/tumika/tumika/source/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/internal/platform/paths"
+	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/internal/service"
 )
@@ -42,6 +43,7 @@ type Daemon struct {
 	store   *sqlite.Store
 	config  service.ConfigService
 	auth    service.AuthService
+	sealer  secrets.Sealer
 	health  service.HealthService
 	log     *slog.Logger
 	started time.Time
@@ -91,16 +93,33 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// that live with it.
 	auth := service.NewAuthService(config)
 
+	// Key custody is resolved at startup, not lazily: a daemon that cannot seal
+	// is a daemon that cannot store a credential, and finding that out on the
+	// first login attempt is finding out too late.
+	keyStore, err := secrets.OpenKeyStore(opts.Paths.MasterKey)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("open key custody: %w", err)
+	}
+	sealer, err := secrets.New(keyStore)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("initialise sealing: %w", err)
+	}
+	opts.Logger.InfoContext(ctx, "credential key custody ready", "backend", sealer.Backend())
+
 	schemaVersion := func(ctx context.Context) (int64, error) {
 		return sqlite.SchemaVersion(ctx, store)
 	}
 
 	return &Daemon{
-		opts:    opts,
-		store:   store,
-		config:  config,
-		auth:    auth,
-		health:  service.NewHealthService(buildinfo.Version(), time.Now(), schemaVersion, auth),
+		opts:   opts,
+		store:  store,
+		config: config,
+		auth:   auth,
+		sealer: sealer,
+		health: service.NewHealthService(
+			buildinfo.Version(), time.Now(), schemaVersion, auth, sealer.Backend()),
 		log:     opts.Logger,
 		started: time.Now(),
 	}, nil
@@ -116,6 +135,10 @@ func (d *Daemon) ConfigService() service.ConfigService { return d.config }
 // before a daemon is running — on a fresh install there is no token, so there is
 // nothing to authenticate an HTTP call with.
 func (d *Daemon) AuthService() service.AuthService { return d.auth }
+
+// Sealer exposes credential sealing. ProviderService takes it at the next step;
+// it is held here because key custody is a process-wide resource, resolved once.
+func (d *Daemon) Sealer() secrets.Sealer { return d.sealer }
 
 // Serve runs the HTTP API until ctx is cancelled, then drains.
 func (d *Daemon) Serve(ctx context.Context) error {

@@ -21,22 +21,30 @@ type HealthService interface {
 }
 
 type healthService struct {
-	version string
-	started time.Time
-	schema  SchemaVersionFunc
-	auth    AuthService
-	now     func() time.Time
+	version        string
+	started        time.Time
+	schema         SchemaVersionFunc
+	auth           AuthService
+	secretsBackend string
+	now            func() time.Time
 }
 
 // NewHealthService builds the service. started is the process start time, so
 // uptime survives however long the first request takes to arrive.
-func NewHealthService(version string, started time.Time, schema SchemaVersionFunc, auth AuthService) HealthService {
+func NewHealthService(
+	version string,
+	started time.Time,
+	schema SchemaVersionFunc,
+	auth AuthService,
+	secretsBackend string,
+) HealthService {
 	return &healthService{
-		version: version,
-		started: started,
-		schema:  schema,
-		auth:    auth,
-		now:     time.Now,
+		version:        version,
+		started:        started,
+		schema:         schema,
+		auth:           auth,
+		secretsBackend: secretsBackend,
+		now:            time.Now,
 	}
 }
 
@@ -60,6 +68,12 @@ func (s *healthService) Snapshot(ctx context.Context) domain.Health {
 	} else {
 		h.Database.Reachable = true
 		h.Database.SchemaVersion = version
+	}
+
+	h.Secrets.Backend = s.secretsBackend
+	if s.secretsBackend == "" {
+		h.Warnings = append(h.Warnings, "no credential key custody is configured")
+		h.Status = "degraded"
 	}
 
 	configured, err := s.auth.Configured(ctx)
