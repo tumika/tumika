@@ -19,6 +19,18 @@ import (
 // command tree can be exercised without touching launchctl or systemctl.
 var managerFactory = servicemgr.New
 
+// Indirections for the two systemd capabilities install probes. Variables for
+// the same reason as managerFactory: the interesting behaviour is what install
+// DOES with the answers — seal, or clean up and fall back — and neither answer
+// can be produced on a machine without systemd.
+var (
+	credsUsable   = secrets.SystemdCredsUsable
+	handoverWorks = secrets.HandoverWorks
+	sealMasterKey = secrets.SealMasterKey
+	// installGOOS is the platform install believes it is on.
+	installGOOS = runtime.GOOS
+)
+
 // newInstallCmd installs tumika as a supervised service.
 //
 // One of the few commands that does NOT go through the API (ADR-0004): there is
@@ -120,7 +132,7 @@ func newInstallCmd(g *globals) *cobra.Command {
 // Only ever ADDS custody. If a blob already exists it is reused untouched:
 // replacing it would orphan every credential sealed under the key inside.
 func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths) (string, error) {
-	if runtime.GOOS != "linux" {
+	if installGOOS != "linux" {
 		return "", nil
 	}
 
@@ -137,10 +149,10 @@ func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths) (string, error) {
 		return "", nil
 	}
 
-	if !secrets.SystemdCredsUsable(cmd.Context(), nil) {
+	if !credsUsable(cmd.Context(), nil) {
 		return "", nil
 	}
-	if err := secrets.SealMasterKey(cmd.Context(), sealed, nil); err != nil {
+	if err := sealMasterKey(cmd.Context(), sealed, nil); err != nil {
 		return "", err
 	}
 
@@ -150,7 +162,7 @@ func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths) (string, error) {
 	// this custody without checking leaves a daemon that can never start —
 	// which is precisely what happened the first time, in a container where
 	// systemd sets $CREDENTIALS_DIRECTORY to a directory it never creates.
-	if !secrets.HandoverWorks(cmd.Context(), sealed, servicemgr.DefaultUser, nil) {
+	if !handoverWorks(cmd.Context(), sealed, servicemgr.DefaultUser, nil) {
 		// Nothing is sealed under this key yet — it was minted seconds ago — so
 		// removing it is safe, and leaving it behind would make every later
 		// start fail closed on a key nobody can use.

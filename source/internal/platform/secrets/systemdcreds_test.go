@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -271,5 +272,122 @@ func TestHandoverWorksReportsAFailingProbe(t *testing.T) {
 	probe := func(context.Context, string, ...string) error { return errors.New("no credential delivered") }
 	if HandoverWorks(t.Context(), "/var/lib/tumika/master.cred", "tumika", probe) {
 		t.Error("a failing probe was reported as working")
+	}
+}
+
+// The real runner is what production uses, so its two behaviours are worth
+// pinning: output comes back, and a failure carries the tool's own words.
+func TestExecCredsRunnerReportsFailuresWithDetail(t *testing.T) {
+	if _, err := exec.LookPath("systemd-creds"); err != nil {
+		t.Skip("systemd-creds is not on this machine")
+	}
+
+	// A name nothing was sealed under, so decrypt must fail.
+	_, err := ExecCredsRunner(t.Context(), []byte("not a blob"), "decrypt", "--name=nope", "-", "-")
+	if err == nil {
+		t.Fatal("decrypting rubbish reported success")
+	}
+}
+
+// SystemdCredsUsable must OBSERVE the capability. Asking `has-tpm2` would answer
+// the wrong question: a Pi has no TPM and works fine on the host key.
+func TestSystemdCredsUsableProbesByActuallySealing(t *testing.T) {
+	if _, err := exec.LookPath("systemd-creds"); err != nil {
+		t.Skip("systemd-creds is not on this machine, so the probe short-circuits")
+	}
+
+	var sawEncrypt bool
+	probe := func(_ context.Context, _ []byte, args ...string) ([]byte, error) {
+		if args[0] == "encrypt" {
+			sawEncrypt = true
+		}
+		return []byte("sealed"), nil
+	}
+
+	if !SystemdCredsUsable(t.Context(), probe) {
+		t.Error("a succeeding seal was reported as unusable")
+	}
+	if !sawEncrypt {
+		t.Error("the probe did not actually try to seal anything")
+	}
+}
+
+func TestSystemdCredsUsableReportsAFailureToSeal(t *testing.T) {
+	if _, err := exec.LookPath("systemd-creds"); err != nil {
+		t.Skip("systemd-creds is not on this machine")
+	}
+
+	probe := func(context.Context, []byte, ...string) ([]byte, error) {
+		return nil, errors.New("no host key")
+	}
+	if SystemdCredsUsable(t.Context(), probe) {
+		t.Error("a host that cannot seal was reported as usable")
+	}
+}
+
+// Root opens the blob directly, which is what keeps the installer from being
+// locked out of its own install.
+func TestOpenSealedDirectly(t *testing.T) {
+	fake := &fakeCreds{}
+	path := filepath.Join(t.TempDir(), CredentialFileName)
+
+	if err := SealMasterKey(t.Context(), path, fake.run); err != nil {
+		t.Fatalf("SealMasterKey: %v", err)
+	}
+
+	store, err := openSealedDirectly(path, fake.run)
+	if err != nil {
+		t.Fatalf("openSealedDirectly: %v", err)
+	}
+	if store.Backend() != BackendSystemdCreds {
+		t.Errorf("backend = %q, want %q", store.Backend(), BackendSystemdCreds)
+	}
+	if !strings.Contains(store.KeyRef(), CredentialName) {
+		t.Errorf("KeyRef does not name the credential: %q", store.KeyRef())
+	}
+
+	key, err := store.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+	if len(key) != KeySize {
+		t.Errorf("key is %d bytes, want %d", len(key), KeySize)
+	}
+}
+
+// A blob sealed on another host cannot be opened here, and that must surface as
+// an error rather than a zero key.
+func TestOpenSealedDirectlyRefusesABlobItCannotDecrypt(t *testing.T) {
+	fake := &fakeCreds{decErr: errors.New("host key mismatch")}
+	path := filepath.Join(t.TempDir(), CredentialFileName)
+	if err := os.WriteFile(path, []byte("sealed elsewhere"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if _, err := openSealedDirectly(path, fake.run); err == nil {
+		t.Fatal("a blob from another host was opened")
+	}
+}
+
+// A missing blob is a plain error, not a panic on a nil store.
+func TestOpenSealedDirectlyWithNoBlob(t *testing.T) {
+	fake := &fakeCreds{}
+	if _, err := openSealedDirectly(filepath.Join(t.TempDir(), "absent"), fake.run); err == nil {
+		t.Fatal("a missing blob was opened")
+	}
+}
+
+// The file store remains the fallback where there is no systemd and no
+// handover — which is what a container gets.
+func TestTheFileStoreIsStillTheFallback(t *testing.T) {
+	t.Setenv(MasterKeyEnv, "")
+	t.Setenv(CredentialsDirEnv, "")
+
+	store, err := chooseKeyStore("linux", filepath.Join(t.TempDir(), "master.key"))
+	if err != nil {
+		t.Fatalf("chooseKeyStore: %v", err)
+	}
+	if store.Backend() != BackendFile {
+		t.Errorf("backend = %q, want %q", store.Backend(), BackendFile)
 	}
 }

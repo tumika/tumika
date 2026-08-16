@@ -463,3 +463,139 @@ func TestASupervisorFailureCarriesItsOwnOutput(t *testing.T) {
 		t.Errorf("the error lost systemd's own output: %v", err)
 	}
 }
+
+// The happy paths. Start and Stop on an installed service must reach the
+// supervisor and report success.
+func TestStartAndStopOnAnInstalledService(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		call    func(*Systemd) error
+	}{
+		{"start", func(m *Systemd) error { return m.Start(context.Background()) }},
+		{"stop", func(m *Systemd) error { return m.Stop(context.Background()) }},
+	} {
+		rec := newRecorder()
+		mgr, unitDir := newTestSystemd(t, rec)
+		if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		if err := tc.call(mgr); err != nil {
+			t.Fatalf("%s: %v", tc.command, err)
+		}
+		if !strings.Contains(strings.Join(rec.joined(), "\n"), "systemctl "+tc.command+" "+UnitName) {
+			t.Errorf("%s did not reach systemctl: %v", tc.command, rec.joined())
+		}
+	}
+}
+
+// A supervisor that refuses to start or stop must be reported, with its own
+// explanation.
+func TestStartAndStopReportASupervisorFailure(t *testing.T) {
+	for _, command := range []string{"start", "stop"} {
+		rec := newRecorder()
+		rec.fail["systemctl "+command] = errors.New("exit status 1")
+
+		mgr, unitDir := newTestSystemd(t, rec)
+		if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		var err error
+		if command == "start" {
+			err = mgr.Start(t.Context())
+		} else {
+			err = mgr.Stop(t.Context())
+		}
+		if err == nil {
+			t.Fatalf("a failed %s reported success", command)
+		}
+		if !strings.Contains(err.Error(), "simulated failure") {
+			t.Errorf("%s lost systemd's own output: %v", command, err)
+		}
+	}
+}
+
+// Uninstalling something that is not installed is an error worth naming, not a
+// silent success that leaves an operator wondering what happened.
+func TestUninstallWithNothingInstalled(t *testing.T) {
+	rec := newRecorder()
+	mgr, _ := newTestSystemd(t, rec)
+
+	if err := mgr.Uninstall(t.Context()); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("= %v, want ErrNotInstalled", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("systemctl was called for a service that does not exist: %v", rec.joined())
+	}
+}
+
+// Removing a unit needs root just as writing one does.
+func TestUninstallWithoutRoot(t *testing.T) {
+	rec := newRecorder()
+	mgr, unitDir := newTestSystemd(t, rec, withSystemdEUID(1000))
+	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	err := mgr.Uninstall(t.Context())
+	if !errors.Is(err, ErrPrivilegesRequired) {
+		t.Fatalf("= %v, want ErrPrivilegesRequired", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(unitDir, UnitName)); statErr != nil {
+		t.Error("a refused uninstall removed the unit anyway")
+	}
+}
+
+// A failure to create the account stops the install, rather than leaving a unit
+// naming a user that does not exist.
+func TestInstallStopsWhenTheAccountCannotBeCreated(t *testing.T) {
+	rec := newRecorder()
+	rec.fail["useradd"] = errors.New("exit status 1")
+
+	mgr, unitDir := newTestSystemd(t, rec, withSystemdUserLookup(func(string) bool { return false }))
+
+	if err := mgr.Install(t.Context(), testConfig(t)); err == nil {
+		t.Fatal("install reported success despite failing to create the account")
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, UnitName)); err == nil {
+		t.Error("a unit was written naming an account that does not exist")
+	}
+}
+
+// The account lookup failing is likewise fatal: chowning to a zero uid would
+// hand the data to root and leave the service unable to read it.
+func TestInstallStopsWhenTheAccountCannotBeResolved(t *testing.T) {
+	rec := newRecorder()
+	mgr, unitDir := newTestSystemd(t, rec, withSystemdIDLookup(func(string) (account, error) {
+		return account{}, errors.New("no such user")
+	}))
+
+	if err := mgr.Install(t.Context(), testConfig(t)); err == nil {
+		t.Fatal("install reported success despite an unresolvable account")
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, UnitName)); err == nil {
+		t.Error("a unit was written for an account that could not be resolved")
+	}
+}
+
+// The default account is used when none is asked for, so the unit and the
+// account it names cannot disagree.
+func TestInstallDefaultsTheServiceAccount(t *testing.T) {
+	rec := newRecorder()
+	mgr, unitDir := newTestSystemd(t, rec)
+
+	cfg := testConfig(t)
+	cfg.User = ""
+	if err := mgr.Install(t.Context(), cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	unit, err := os.ReadFile(filepath.Join(unitDir, UnitName))
+	if err != nil {
+		t.Fatalf("read the unit: %v", err)
+	}
+	if !strings.Contains(string(unit), "User="+DefaultUser) {
+		t.Errorf("the unit does not name the default account:\n%s", unit)
+	}
+}

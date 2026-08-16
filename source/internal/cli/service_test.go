@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tumika/tumika/source/internal/platform/paths"
+	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/platform/servicemgr"
 )
 
@@ -255,4 +257,278 @@ func TestCopyingOverARunningBinaryIsAtomic(t *testing.T) {
 			t.Errorf("a staging file was left behind: %s", entry.Name())
 		}
 	}
+}
+
+// useTestKeyCustody pins the master key, so nothing here reaches the real
+// Keychain on the machine running the tests.
+func useTestKeyCustody(t *testing.T) {
+	t.Helper()
+	t.Setenv("TUMIKA_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+}
+
+// A fresh install has to leave the operator with a token, or the daemon refuses
+// to serve and Restart=always turns that refusal into a crash loop — an install
+// that reports success and a service that never runs.
+func TestInstallMintsAndPrintsATokenOnAFreshHost(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	mgr := &fakeManager{status: servicemgr.Status{
+		Manager: "systemd", State: servicemgr.StateRunning, Enabled: true,
+	}}
+	useFakeManager(t, mgr)
+
+	out, _, err := run(t, "--home", home, "install")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !strings.Contains(out, "tmk_") {
+		t.Errorf("no token was printed:\n%s", out)
+	}
+	if len(mgr.calls) == 0 || mgr.calls[0] != "install" {
+		t.Errorf("the manager was not asked to install: %v", mgr.calls)
+	}
+	if mgr.lastConfig.Home != home {
+		t.Errorf("home = %q, want %q", mgr.lastConfig.Home, home)
+	}
+	if !filepath.IsAbs(mgr.lastConfig.Binary) {
+		t.Errorf("binary = %q, want an absolute path", mgr.lastConfig.Binary)
+	}
+}
+
+// A second install must not rotate the token: that would break every client the
+// operator had already configured, on what is meant to be an upgrade.
+func TestASecondInstallKeepsTheExistingToken(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	first, _, err := run(t, "--home", home, "install")
+	if err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+	second, _, err := run(t, "--home", home, "install")
+	if err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+
+	if !strings.Contains(first, "tmk_") {
+		t.Fatalf("the first install printed no token:\n%s", first)
+	}
+	if strings.Contains(second, "tmk_") {
+		t.Errorf("the second install rotated the token, breaking every configured client:\n%s", second)
+	}
+}
+
+// Being able to SEAL a key and being able to RECEIVE one are different
+// capabilities. Committing to systemd-creds without checking leaves a daemon
+// that can never start — which is exactly what a container does.
+func TestInstallFallsBackWhenTheHandoverDoesNotWork(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	sealed := filepath.Join(home, "master.cred")
+	credsUsableStub(t, true)
+	sealStub(t, func(_ context.Context, path string, _ secretsRunner) error {
+		return os.WriteFile(path, []byte("sealed"), 0o600)
+	})
+	handoverStub(t, false)
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	out, _, err := run(t, "--home", home, "install")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	if mgr.lastConfig.SealedKey != "" {
+		t.Errorf("the unit was told to load a credential systemd will not deliver: %q",
+			mgr.lastConfig.SealedKey)
+	}
+	// Nothing is sealed under it yet, so leaving it behind would make every
+	// later start fail closed on a key nobody can use.
+	if _, statErr := os.Stat(sealed); statErr == nil {
+		t.Error("the unusable sealed key was left behind")
+	}
+	if !strings.Contains(out, "file-based key") {
+		t.Errorf("the operator was not told which custody they ended up with:\n%s", out)
+	}
+}
+
+// When the handover does work, the unit gets the directive — that indirection is
+// the only reason the backend works at all.
+func TestInstallCommitsToSystemdCredsWhenTheHandoverWorks(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	credsUsableStub(t, true)
+	sealStub(t, func(_ context.Context, path string, _ secretsRunner) error {
+		return os.WriteFile(path, []byte("sealed"), 0o600)
+	})
+	handoverStub(t, true)
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if mgr.lastConfig.SealedKey != filepath.Join(home, "master.cred") {
+		t.Errorf("the unit does not hand the sealed key over: %q", mgr.lastConfig.SealedKey)
+	}
+}
+
+// A daemon already running on a file key must not be moved onto systemd-creds:
+// the keys are unrelated, and switching would make every stored credential
+// unreadable while reporting a healthy start.
+func TestInstallLeavesAnExistingFileKeyAlone(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "linux"
+	t.Cleanup(func() { installGOOS = restore })
+
+	if err := os.WriteFile(filepath.Join(home, "master.key"), []byte("existing"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sealed := false
+	credsUsableStub(t, true)
+	sealStub(t, func(context.Context, string, secretsRunner) error {
+		sealed = true
+		return nil
+	})
+	handoverStub(t, true)
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if sealed {
+		t.Error("custody was switched under a daemon that already has credentials sealed under a file key")
+	}
+	if mgr.lastConfig.SealedKey != "" {
+		t.Errorf("the unit was pointed at a sealed key that does not exist: %q", mgr.lastConfig.SealedKey)
+	}
+}
+
+// macOS seals nothing: custody there is the Keychain.
+func TestInstallSealsNothingOffLinux(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	restore := installGOOS
+	installGOOS = "darwin"
+	t.Cleanup(func() { installGOOS = restore })
+
+	credsUsableStub(t, true)
+	sealStub(t, func(context.Context, string, secretsRunner) error {
+		t.Error("a key was sealed with systemd-creds on macOS")
+		return nil
+	})
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "launchd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if mgr.lastConfig.SealedKey != "" {
+		t.Errorf("SealedKey = %q on macOS", mgr.lastConfig.SealedKey)
+	}
+}
+
+// The service runs a copy under the home directory, not the path the installer
+// happened to be invoked from — which might be a download directory that is gone
+// next week (ADR-0003).
+func TestInstallResolvesTheBinaryIntoTheHome(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	p, err := paths.Resolve(home)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	got, err := installedBinary(p)
+	if err != nil {
+		t.Fatalf("installedBinary: %v", err)
+	}
+	if got != filepath.Join(p.Bin, "tumika") {
+		t.Errorf("binary = %q, want it under the home directory", got)
+	}
+	if _, err := os.Stat(got); err != nil {
+		t.Errorf("the binary was not put in place: %v", err)
+	}
+}
+
+// An explicit --binary is honoured, so an operator can point the unit at a
+// packaged path they manage themselves.
+func TestInstallHonoursAnExplicitBinary(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install", "--binary", "/opt/tumika/bin/tumika"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if mgr.lastConfig.Binary != "/opt/tumika/bin/tumika" {
+		t.Errorf("binary = %q, want the explicit one", mgr.lastConfig.Binary)
+	}
+}
+
+func TestInstallPassesTheUserThrough(t *testing.T) {
+	useTestKeyCustody(t)
+	home := t.TempDir()
+
+	mgr := &fakeManager{status: servicemgr.Status{Manager: "systemd", State: servicemgr.StateRunning}}
+	useFakeManager(t, mgr)
+
+	if _, _, err := run(t, "--home", home, "install", "--user", "assistant"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if mgr.lastConfig.User != "assistant" {
+		t.Errorf("user = %q, want the one asked for", mgr.lastConfig.User)
+	}
+}
+
+// secretsRunner mirrors secrets.CredsRunner, so the stubs below match the real
+// signatures without the test importing it for a type alone.
+type secretsRunner = secrets.CredsRunner
+
+func credsUsableStub(t *testing.T, usable bool) {
+	t.Helper()
+	original := credsUsable
+	credsUsable = func(context.Context, secrets.CredsRunner) bool { return usable }
+	t.Cleanup(func() { credsUsable = original })
+}
+
+func handoverStub(t *testing.T, works bool) {
+	t.Helper()
+	original := handoverWorks
+	handoverWorks = func(context.Context, string, string, secrets.HandoverProbe) bool { return works }
+	t.Cleanup(func() { handoverWorks = original })
+}
+
+func sealStub(t *testing.T, fn func(context.Context, string, secrets.CredsRunner) error) {
+	t.Helper()
+	original := sealMasterKey
+	sealMasterKey = fn
+	t.Cleanup(func() { sealMasterKey = original })
 }

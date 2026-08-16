@@ -1,6 +1,7 @@
 package servicemgr
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"os"
@@ -265,5 +266,97 @@ func TestAnInvalidConfigWritesNothing(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("a refused install called launchctl: %v", rec.joined())
+	}
+}
+
+func TestLaunchdStartOnAnInstalledService(t *testing.T) {
+	rec := newRecorder()
+	mgr, agentDir := newTestLaunchd(t, rec)
+	if err := os.WriteFile(filepath.Join(agentDir, Label+".plist"), []byte("<plist/>"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := mgr.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !strings.Contains(strings.Join(rec.joined(), "\n"), "launchctl kickstart") {
+		t.Errorf("Start did not kickstart the service: %v", rec.joined())
+	}
+}
+
+func TestLaunchdReportsSupervisorFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail string
+		call func(*Launchd) error
+	}{
+		{"bootstrap", "launchctl bootstrap", func(m *Launchd) error {
+			return m.Install(context.Background(), Config{Binary: "/usr/local/bin/tumika", Home: "/tmp"})
+		}},
+		{"kickstart", "launchctl kickstart", func(m *Launchd) error { return m.Start(context.Background()) }},
+		{"kill", "launchctl kill", func(m *Launchd) error { return m.Stop(context.Background()) }},
+	} {
+		rec := newRecorder()
+		rec.fail[tc.fail] = errors.New("exit status 1")
+
+		mgr, agentDir := newTestLaunchd(t, rec)
+		if err := os.WriteFile(filepath.Join(agentDir, Label+".plist"), []byte("<plist/>"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		err := tc.call(mgr)
+		if err == nil {
+			t.Errorf("%s: a failure reported success", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "simulated failure") {
+			t.Errorf("%s: launchctl's own output was lost: %v", tc.name, err)
+		}
+	}
+}
+
+func TestLaunchdUninstallWithNothingInstalled(t *testing.T) {
+	rec := newRecorder()
+	mgr, _ := newTestLaunchd(t, rec)
+
+	if err := mgr.Uninstall(t.Context()); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("= %v, want ErrNotInstalled", err)
+	}
+}
+
+func TestLaunchdStatusWithNothingInstalled(t *testing.T) {
+	rec := newRecorder()
+	mgr, _ := newTestLaunchd(t, rec)
+
+	status, err := mgr.Status(t.Context())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.State != StateNotInstalled {
+		t.Errorf("state = %q, want %q", status.State, StateNotInstalled)
+	}
+	if status.Enabled {
+		t.Error("a service that does not exist is reported as enabled")
+	}
+}
+
+// The plist is byte-identical run to run: an install that rewrote it with the
+// same content in a different order would look like a change to anything
+// watching the file.
+func TestThePlistIsStableAcrossRenders(t *testing.T) {
+	cfg := Config{Binary: "/usr/local/bin/tumika", Home: "/var/lib/tumika", User: "tumika"}
+
+	first, err := renderPlist(cfg)
+	if err != nil {
+		t.Fatalf("renderPlist: %v", err)
+	}
+	for range 5 {
+		again, err := renderPlist(cfg)
+		if err != nil {
+			t.Fatalf("renderPlist: %v", err)
+		}
+		if string(again) != string(first) {
+			t.Fatal("the plist is not stable across renders")
+		}
 	}
 }
