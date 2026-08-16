@@ -146,6 +146,18 @@ linters:
         # No cgo, anywhere. Every build is CGO_ENABLED=0 so cross-compiling for
         # linux/arm64 is free — which is also why the SQLite driver is the pure
         # Go modernc.org/sqlite.
+        #
+        # This rule does NOT enforce that, and cannot: depguard never sees
+        # `import "C"`. Under CGO_ENABLED=1 the analysis runs on the
+        # cgo-rewritten file, and under CGO_ENABLED=0 build constraints exclude
+        # the file entirely, so the linter reports 0 issues either way. It is
+        # kept as documentation of intent.
+        #
+        # The actual enforcement is the `no cgo` step of the `cross-compile` job
+        # in ci.yml, which fails when `go list` reports a non-empty CgoFiles.
+        # Note that `CGO_ENABLED=0 go build ./...` does NOT catch it either:
+        # build constraints exclude the file, the pattern match skips the
+        # package, and the build exits zero.
         nocgo:
           files:
             - "$all"

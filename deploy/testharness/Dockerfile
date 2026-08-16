@@ -7,8 +7,14 @@
 # does not know, a sandbox setting that blocks the daemon's own data directory:
 # every one of those passes a rendering test and fails on the Pi.
 #
-# Debian trixie, because that is what Raspberry Pi OS tracks.
-FROM debian:trixie-slim
+# Debian trixie (trixie-slim), because that is what Raspberry Pi OS tracks.
+# Digest-pinned like the shipped image, and for a second reason here: this
+# builds from whatever `debian:trixie-slim` means in the LOCAL image store, so a
+# stray `podman pull --platform linux/amd64` on a developer's machine silently
+# rebuilds the harness on the wrong architecture. The install then fails in ways
+# that look like bugs in tumika. The multi-arch index digest resolves correctly
+# on every host.
+FROM debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=podman

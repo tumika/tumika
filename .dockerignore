@@ -1,0 +1,23 @@
+# The build context is the repository root, and COPY source/ takes whatever is
+# there — including untracked local files. In CI the checkout is clean, but on a
+# developer's machine a scratch database, a .env, or an editor backup under
+# source/ would be copied straight into the build stage. This is the only path by
+# which anything private could reach a layer.
+#
+# It also keeps the layer cache from being busted by unrelated local changes.
+
+*
+!go.mod
+!go.sum
+!source/
+
+source/**/*_test.go
+source/**/testdata/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/.env
+**/*.log
+**/.DS_Store
+**/*~
+**/*.swp
