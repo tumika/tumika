@@ -13,7 +13,15 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR runs — pushing a fix to a branch should not leave the
+  # previous run burning minutes. But NOT on main.
+  #
+  # bulwark records its coverage baseline from main runs, and PR coverage is
+  # diffed against that baseline. Cancelling a main run because another commit
+  # landed behind it drops the baseline for the cancelled commit, so the next PR
+  # is measured against an older tree than it was branched from — quietly, with
+  # a number that looks perfectly plausible.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -225,6 +233,22 @@ jobs:
     permissions:
       contents: write       # bulwark coverage caches baselines on the bulwark-state branch
       pull-requests: write  # for the PR summary comment
+    # These two are ignored on a Dependabot PR: GitHub issues a READ-ONLY
+    # GITHUB_TOKEN for `pull_request` runs it triggers, whatever the workflow
+    # asks for. That is separate from the secret-withholding noted further down.
+    #
+    # Caching the baseline is best-effort in bulwark and fails harmlessly. The
+    # PR summary comment is the exposure: bulwark's "Post PR summary" step has
+    # no continue-on-error, so a 403 from the comment API would fail the job —
+    # and pr-gate treats any non-success as a hard failure, which would make
+    # every weekly Dependabot PR red.
+    #
+    # Deliberately NOT worked around by skipping bulwark for Dependabot: a
+    # dependency bump is precisely when gosec and govulncheck earn their keep,
+    # and a security scan that skips the security-relevant PRs is worse than no
+    # scan, because it still reports green. The fix belongs upstream in bulwark
+    # (tolerate a failed comment), not in a condition here that trades scanning
+    # for a green tick.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
