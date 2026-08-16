@@ -1,0 +1,20 @@
+# .bulwark.yml — this file is yours.
+#
+# gt created it once and will never modify or delete it again. bulwark owns
+# what goes in it; gt only makes sure it exists, because the one setting below
+# is load-bearing for the pipeline and silently wrong by default.
+#
+# `coverage.source` says who produces the coverage bulwark gates on. In this
+# pipeline ci-test produces it and uploads it as the `gt-coverage` artifact,
+# which the bulwark stage extracts before bulwark runs — so `report` is
+# correct. Leaving it unset means `run`, and bulwark would execute your suite a
+# second time without saying so.
+#
+# A stage skipped by ci-preflight simply produces no report, which bulwark
+# treats as no coverage for that ecosystem rather than an error.
+#
+# Everything else bulwark supports — per-language enablement, coverage
+# tolerances, patch-coverage opt-outs, toolchain overrides — belongs here too.
+# See bulwark's README.
+coverage:
+  source: report

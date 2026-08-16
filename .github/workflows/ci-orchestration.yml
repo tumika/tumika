@@ -49,18 +49,42 @@ jobs:
     if: needs.attest.outputs.validated != 'true'
     uses: ./.github/workflows/ci-preflight.yml
     secrets: inherit
+    # packages: read because several repositories resolve private @scope
+    # dependencies from GitHub Packages during install, and a called workflow
+    # can only narrow what the caller grants — a stage cannot ask for it back.
+    # Read-only, so granting it where it is unused costs nothing. A stage
+    # needing more than this is a gt change.
+    permissions:
+      contents: read
+      packages: read
 
   build:
     needs: [attest, preflight]
     if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-build != 'false'
     uses: ./.github/workflows/ci-build.yml
     secrets: inherit
+    # packages: read because several repositories resolve private @scope
+    # dependencies from GitHub Packages during install, and a called workflow
+    # can only narrow what the caller grants — a stage cannot ask for it back.
+    # Read-only, so granting it where it is unused costs nothing. A stage
+    # needing more than this is a gt change.
+    permissions:
+      contents: read
+      packages: read
 
   test:
     needs: [attest, build, preflight]
     if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-test != 'false'
     uses: ./.github/workflows/ci-test.yml
     secrets: inherit
+    # packages: read because several repositories resolve private @scope
+    # dependencies from GitHub Packages during install, and a called workflow
+    # can only narrow what the caller grants — a stage cannot ask for it back.
+    # Read-only, so granting it where it is unused costs nothing. A stage
+    # needing more than this is a gt change.
+    permissions:
+      contents: read
+      packages: read
 
   conventional-commits:
     needs: [attest]
