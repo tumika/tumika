@@ -58,6 +58,7 @@ func NewRouter(deps Deps) http.Handler {
 	mux.HandleFunc("GET /v1/providers/{id}", h.getProvider)
 	mux.HandleFunc("GET /v1/providers/{id}/preflight", h.providerPreflight)
 	mux.HandleFunc("POST /v1/providers/{id}/select", h.selectProvider)
+	mux.HandleFunc("POST /v1/providers/{id}/install", h.installProvider)
 	mux.HandleFunc("PUT /v1/providers/{id}/credential", h.putCredential)
 	mux.HandleFunc("POST /v1/providers/{id}/verify", h.verifyCredential)
 	mux.HandleFunc("DELETE /v1/providers/{id}/credential", h.deleteCredential)
