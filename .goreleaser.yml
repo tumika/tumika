@@ -1,0 +1,140 @@
+# goreleaser configuration for tumika.
+#
+# One binary, four targets. The two archive formats are not redundant:
+#
+#   - the tar.gz is what a person downloads
+#   - the RAW binary is what `tumika update` fetches (ADR-0003)
+#
+# The self-updater replaces the running binary with an atomic rename, so it needs
+# a single uncompressed file at a predictable URL — not an archive it would have
+# to unpack into a temporary directory first. Removing the raw archive would
+# break self-update silently, at the next release rather than at build time.
+version: 2
+
+before:
+  hooks:
+    # download, NOT tidy. `go mod tidy` rewrites go.mod and go.sum in place, so a
+    # tagged tree that is not already tidy would be published as a binary built
+    # against a different dependency set than the commit the release claims to
+    # be — and the tag would no longer describe what was shipped.
+    - go mod download
+
+builds:
+  - id: tumika
+    main: ./source/cmd/tumika
+    binary: tumika
+    env:
+      # The project invariant, stated here as well as in CI: modernc.org/sqlite
+      # is pure Go precisely so every target links statically and the Pi build
+      # is free.
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # All four, including darwin/amd64. tumika is a daemon someone may already
+    # be running on an Intel Mac, and dropping a target is not something they
+    # would discover until their self-update found no asset for their machine.
+    flags:
+      - -trimpath
+    ldflags:
+      # These three names are `main`'s own vars, not the buildinfo package's —
+      # main.go calls buildinfo.Set with them. A typo here is silent: the binary
+      # keeps the "dev" default, and `IsDev()` then disables self-update
+      # entirely for the whole release.
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .FullCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: tumika
+    ids:
+      - tumika
+    name_template: >-
+      tumika_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+  # Raw, uncompressed. This is what the self-updater downloads, and what
+  # scripts/install.sh fetches — the name template is part of both contracts.
+  - id: raw
+    ids:
+      - tumika
+    formats:
+      - binary
+    name_template: >-
+      {{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  # ONE checksums file covering both archives, because the updater and the
+  # installer both verify against it before replacing anything.
+  #
+  # Phase 2, before any public release: sign this with an ECDSA key from Actions
+  # secrets and verify the signature in the updater. A checksum fetched from the
+  # same host as the binary proves the download was not corrupted; it does not
+  # prove who produced it.
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: tumika
+    name: tumika
+
+  # The tag glob in release.yml is v*.*.*, which also matches v1.0.0-rc1.
+  # goreleaser publishes a full release by default, and GitHub then resolves
+  # /releases/latest to it — so an RC would be served to every new user by
+  # install.sh AND by the documented
+  # releases/latest/download/install.sh URL. `auto` marks any tag with a
+  # prerelease segment as one.
+  prerelease: auto
+
+  # Published as a DRAFT, then promoted by the workflow only after the assets
+  # have been verified.
+  #
+  # Without this the verification runs after `release --clean` has already made
+  # everything public: a missing raw asset or an untaken ldflag would turn the
+  # workflow red while the broken release stayed downloadable. A gate that
+  # reports rather than prevents is not a gate.
+  draft: true
+  # Shipped with every release so it can be fetched from the stable
+  # releases/latest/download/install.sh URL.
+  extra_files:
+    - glob: scripts/install.sh
+  header: |
+    ## tumika
+
+    A self-hostable personal assistant daemon. It runs deterministic workflows on
+    a schedule, driving the vendored Claude Code CLI against a Claude
+    subscription rather than the paid API.
+
+    Statically linked, no cgo, no runtime dependencies.
+
+    **Install**
+
+    ```sh
+    curl -fsSL https://github.com/tumika/tumika/releases/latest/download/install.sh | sh
+    ```
+
+    Then `sudo tumika install` to run it as a service — a systemd unit on Linux,
+    a LaunchAgent on macOS.
+
+    **Container**
+
+    ```sh
+    docker volume create tumika
+    docker run --rm -v tumika:/var/lib/tumika ghcr.io/tumika/tumika:latest token rotate
+    docker run -v tumika:/var/lib/tumika -p 127.0.0.1:8737:8737 \
+      ghcr.io/tumika/tumika:latest serve --listen 0.0.0.0:8737
+    ```

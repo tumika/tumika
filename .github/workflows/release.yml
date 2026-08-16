@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Read-only at the top, elevated per JOB to the minimum each one needs:
+# `contents: write` for goreleaser to publish the release, `packages: write` for
+# the ghcr push. The gate job gets neither.
+#
+# A release workflow holds the most powerful token in the repository, and it runs
+# on a tag — which is exactly the trigger somebody would reach for.
+permissions:
+  contents: read
+
+# Never cancelled, unlike ci.yml. A half-run release is worse than a slow one,
+# and two tags pushed back to back would otherwise race on the ghcr :latest tag
+# and could leave it on the older of the two.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Nothing releases from a red tree.
+  #
+  # This is a full re-run rather than a reference to the CI run for the same
+  # commit: a tag can be pushed to any commit, including one whose PR checks
+  # never ran, and "the tests passed on main last week" is not the same claim as
+  # "the tests pass on the commit being released".
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Needed for the ancestry check below.
+          fetch-depth: 0
+
+      # Re-running the tests is not the same as knowing the commit was reviewed.
+      # Anyone able to push a tag could point it at an arbitrary commit that
+      # happens to pass `go test`, and the jobs below would build and publish it
+      # with contents:write and push it to ghcr with packages:write.
+      #
+      # A release must be something that went through main.
+      - name: the tag is reachable from main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_SHA is not an ancestor of main; releases are cut from main only" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      # The deployment target, and the no-cgo invariant. Same reasoning as
+      # ci.yml's cross-compile job: a release is exactly the wrong moment to
+      # discover that linux/arm64 stopped building.
+      - name: cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%%/*}"; goarch="${target##*/}"
+            echo "building $target"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build ./...
+            cgo=$(CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch" \
+              go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
+            if [ -n "$cgo" ]; then
+              echo "cgo on $target: $cgo" >&2
+              exit 1
+            fi
+          done
+
+      - name: install under a real systemd
+        run: deploy/testharness/verify.sh
+
+  goreleaser:
+    name: goreleaser
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # goreleaser builds the changelog from the commit range since the
+          # previous tag, so a shallow clone silently produces an empty one.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # goreleaser published a DRAFT (see .goreleaser.yml). Nothing below is
+      # downloadable until the promote step at the end, so a failure here leaves
+      # a draft to delete rather than a broken release people can install.
+      - name: the release ships what the updater and installer expect
+        run: scripts/verify-release-assets.sh
+
+      # install.sh is delivered by `release.extra_files`, so it never appears
+      # under dist/ and the script above cannot see it. Deleting those two lines
+      # from .goreleaser.yml would leave every check green and 404 the install
+      # command in this release's own notes — so the draft's asset list is what
+      # gets asked.
+      - name: the documented install command will work
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
+          echo "$assets"
+          for want in install.sh checksums.txt; do
+            grep -qx "$want" <<<"$assets" \
+              || { echo "the release has no $want; the documented install command would 404" >&2; exit 1; }
+          done
+
+      # Promoted only now. This is the step that makes the release public and
+      # moves /releases/latest onto it.
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  # Published AFTER goreleaser, so a release never exists with an image tag that
+  # points at nothing — the release notes tell people to pull it.
+  image:
+    name: image
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # QEMU, because the image builds the binary INSIDE the build stage: an
+      # arm64 image needs an arm64 toolchain run, not just an arm64 base. Slow,
+      # and it only runs on a tag.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: ghcr.io/tumika/tumika
+          tags: |
+            type=semver,pattern=v{{version}}
+            # type=raw is UNCONDITIONAL, unlike type=semver with latest=auto, so
+            # without this guard pushing v1.0.0-rc1 would move :latest onto the
+            # RC — and :latest is the tag this release's own notes tell people to
+            # run. A prerelease tag is the one with a hyphen in it.
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      # The version WITHOUT its leading v, and a real timestamp.
+      #
+      # goreleaser's {{ .Version }} strips the v, so passing github.ref_name
+      # made the image's binary report "tumika v0.1.0" while the released binary
+      # reported "tumika 0.1.0" for the same tag. ADR-0003 makes that string part
+      # of the update contract, and deploy/verify-image.sh only asserts the
+      # "tumika " prefix, so nothing would have caught the drift.
+      #
+      # github.event.repository.updated_at is not a build date at all: it moves
+      # when the description or topics change, and is identical for every image
+      # built from the same tag.
+      - id: buildmeta
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.buildmeta.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.buildmeta.outputs.date }}
