@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/tumika/tumika/source/internal/domain"
@@ -65,11 +67,14 @@ type installRequest struct {
 func (h *handlers) installProvider(w http.ResponseWriter, r *http.Request) {
 	var req installRequest
 	// An absent body is a valid request: "install the pinned version".
-	if r.ContentLength != 0 {
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-			return
-		}
+	//
+	// Keyed on the decode result rather than ContentLength, because a client
+	// sending Transfer-Encoding: chunked gets ContentLength -1 even with nothing
+	// in the body — so testing it for zero answered "install the pinned version"
+	// with `400 invalid JSON body: EOF`.
+	if err := decodeJSON(w, r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
 	}
 
 	result, err := h.deps.Providers.Install(r.Context(), r.PathValue("id"), req.Version)

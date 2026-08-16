@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -38,6 +39,10 @@ type fake struct {
 	promptExit int
 	// promptStderr is written to stderr before exiting.
 	promptStderr string
+	// authStderr is written to stderr on the auth-status path, with a non-zero
+	// exit, which is the only way to reach run()'s ExitError branch.
+	authStderr string
+	authExit   int
 
 	recordPath string
 }
@@ -81,9 +86,11 @@ func (f *fake) install(t *testing.T, opts ...DriverOption) *Driver {
 
 case "$3" in
   auth)
+    printf '%%s' %q >&2
     cat <<'JSON'
 %s
 JSON
+    exit %d
     ;;
   -p)
     printf '%%s' %q >&2
@@ -93,7 +100,7 @@ JSON
     exit %d
     ;;
 esac
-`, f.recordPath, f.authStatusJSON, f.promptStderr, f.promptJSON, f.promptExit)
+`, f.recordPath, f.authStderr, f.authStatusJSON, f.authExit, f.promptStderr, f.promptJSON, f.promptExit)
 
 	if err := os.WriteFile(filepath.Join(dir, BinaryName), []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake: %v", err)
@@ -178,6 +185,11 @@ func TestASpawnedClaudeInheritsNoCredentialPrecedenceVariable(t *testing.T) {
 		"AWS_ACCESS_KEY_ID":              "AKIAEXAMPLE",
 		"AWS_BEARER_TOKEN_BEDROCK":       "bedrock",
 		"GOOGLE_APPLICATION_CREDENTIALS": "/tmp/creds.json",
+		// Reroutes billing outright by injecting an Authorization header,
+		// without touching any of the variables above.
+		"ANTHROPIC_CUSTOM_HEADERS":   "Authorization: Bearer someone-elses-key",
+		"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example",
+		"ANTHROPIC_VERTEX_BASE_URL":  "https://vertex.example",
 	}
 	for name, value := range poison {
 		t.Setenv(name, value)
@@ -427,19 +439,99 @@ func TestVerifyWithNoStoredToken(t *testing.T) {
 }
 
 // stderr from an authentication endpoint is exactly the kind of thing that
-// echoes the rejected secret back, and it lands in the database and in a
-// response.
-func TestAFailureNeverCarriesTheTokenOut(t *testing.T) {
+// echoes the rejected secret back — and it reaches an operator's terminal and
+// the daemon's log.
+//
+// The earlier version of this test set authStatusJSON to rubbish, which failed
+// at json.Unmarshal: a path whose error text is a parse error and structurally
+// cannot contain a token. It could not fail, and deleting the Redact call left
+// it green. This one drives the CLI to exit non-zero with the token on stderr,
+// which is the branch that actually does the redacting.
+func TestStderrFromAFailedInvocationIsRedacted(t *testing.T) {
 	f := newFake()
-	f.authStatusJSON = "not json at all"
+	f.authStderr = "Error: rejected credential " + testToken + " (expired)"
+	f.authExit = 1
 	d := f.install(t)
 
 	_, err := d.Verify(t.Context(), domain.Credential{ProviderID: ID, Secret: testToken})
 	if err == nil {
-		t.Fatal("unparseable auth status was accepted")
+		t.Fatal("a failed `claude auth status` was accepted")
 	}
 	if strings.Contains(err.Error(), testToken) {
 		t.Errorf("the error carries the token: %v", err)
+	}
+	// The explanation itself must survive; redaction that discarded the message
+	// would make every failure look identical.
+	if !strings.Contains(err.Error(), "expired") {
+		t.Errorf("the provider's explanation was lost: %v", err)
+	}
+}
+
+// The same surface, on the path that reaches the DATABASE: last_verify_error is
+// stored and handed back to a client.
+func TestAStoredVerifyErrorIsRedacted(t *testing.T) {
+	f := newFake()
+	f.promptJSON = `{"type":"result","subtype":"success","is_error":true,"api_error_status":401,` +
+		`"result":"token ` + testToken + ` was revoked"}`
+	d := f.install(t)
+
+	meta, err := d.Verify(t.Context(), domain.Credential{ProviderID: ID, Secret: testToken})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if meta.Status != string(domain.CredentialInvalid) {
+		t.Fatalf("status = %q, want invalid", meta.Status)
+	}
+	if strings.Contains(meta.LastVerifyError, testToken) {
+		t.Errorf("the stored error carries the token: %q", meta.LastVerifyError)
+	}
+	if !strings.Contains(meta.LastVerifyError, "revoked") {
+		t.Errorf("the reason was lost: %q", meta.LastVerifyError)
+	}
+}
+
+// Every field of a result is optional to a JSON decoder, so `null`, `{}` and an
+// error envelope all decode into a zero value — and a zero value has is_error
+// false. Reading that as success reported a credential that produced no answer
+// at all as ACTIVE: the same mistake as keying on subtype, reached from the
+// other side.
+func TestADocumentThatIsNotAResultIsNotSuccess(t *testing.T) {
+	for _, body := range []string{
+		`null`,
+		`{}`,
+		`{"type":"error","error":{"message":"boom"}}`,
+		`{"is_error":false}`,
+	} {
+		f := newFake()
+		f.promptJSON = body
+		d := f.install(t)
+
+		meta, err := d.Verify(t.Context(), domain.Credential{ProviderID: ID, Secret: testToken})
+		if err == nil {
+			t.Errorf("%s was accepted as a working credential (status %q)", body, meta.Status)
+			continue
+		}
+		if !errors.Is(err, domain.ErrProviderUnavailable) {
+			t.Errorf("%s gave %v, want ErrProviderUnavailable", body, err)
+		}
+		if meta.Status == string(domain.CredentialActive) {
+			t.Errorf("%s was recorded as active", body)
+		}
+	}
+}
+
+// A real result is still accepted, so the check above cannot pass by refusing
+// everything.
+func TestARealResultIsStillAccepted(t *testing.T) {
+	f := newFake()
+	d := f.install(t)
+
+	meta, err := d.Verify(t.Context(), domain.Credential{ProviderID: ID, Secret: testToken})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if meta.Status != string(domain.CredentialActive) {
+		t.Fatalf("status = %q, want active", meta.Status)
 	}
 }
 
@@ -652,8 +744,10 @@ func TestTheDriverSatisfiesTheRegistry(t *testing.T) {
 		t.Errorf("no health checker: %v", err)
 	}
 
-	// The PTY login does not exist yet, and its ABSENCE is what makes
-	// POST …/login answer a documented 400 rather than hanging.
+	// The PTY login does not exist yet, and its absence is DISCOVERABLE: the
+	// registry answers with a sentinel rather than a nil driver, which is what
+	// the login endpoint will encode as a 400 when it is added. No such route
+	// exists today.
 	if _, err := reg.InteractiveAuthenticator(ID); !errors.Is(err, domain.ErrInteractiveAuthUnsupported) {
 		t.Errorf("= %v, want ErrInteractiveAuthUnsupported until the PTY flow lands", err)
 	}
@@ -729,29 +823,59 @@ func TestInstallDefaultsToThePin(t *testing.T) {
 
 // scrub is redundant against the fixed environment above — and exists for the
 // day someone adds a passthrough. Testing it directly is the only way to say so.
-func TestScrubDropsDeniedVariablesFromAnyEnvironment(t *testing.T) {
-	poisoned := []string{
-		"PATH=/usr/bin",
-		"ANTHROPIC_API_KEY=sk-ant-api-leak",
-		"CLAUDE_CODE_OAUTH_TOKEN=" + testToken,
-		"AWS_SECRET_ACCESS_KEY=secret",
-		"HOME=/home/tumika",
+//
+// The variables are named HERE rather than read from deniedEnv, because a test
+// that iterates the list it is checking passes for any list, including an empty
+// one. Every entry below is on the credential precedence chain ahead of
+// CLAUDE_CODE_OAUTH_TOKEN, so each is a way to bill the operator at API rates.
+func TestScrubDropsEveryOverridingVariable(t *testing.T) {
+	overriding := []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_PROFILE",
+		"ANTHROPIC_MODEL",
+		// Carries an Authorization header, so it reroutes billing without
+		// touching any of the above.
+		"ANTHROPIC_CUSTOM_HEADERS",
+		"ANTHROPIC_BEDROCK_BASE_URL",
+		"ANTHROPIC_VERTEX_BASE_URL",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_VERTEX",
+		"CLAUDE_CODE_USE_FOUNDRY",
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_SESSION_TOKEN",
+		"AWS_PROFILE",
+		"AWS_REGION",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"GOOGLE_APPLICATION_CREDENTIALS",
+		"GOOGLE_CLOUD_PROJECT",
+		"CLOUD_ML_REGION",
+		"AZURE_OPENAI_API_KEY",
 	}
 
-	got := scrub(poisoned)
-	for _, kv := range got {
+	env := []string{"PATH=/usr/bin", "HOME=/home/tumika", "CLAUDE_CODE_OAUTH_TOKEN=" + testToken}
+	for _, name := range overriding {
+		env = append(env, name+"=would-override-tumikas-token")
+	}
+
+	kept := map[string]bool{}
+	for _, kv := range scrub(env) {
 		name, _, _ := strings.Cut(kv, "=")
-		for _, denied := range deniedEnv {
-			if name == denied {
-				t.Errorf("scrub kept %s", name)
-			}
+		kept[name] = true
+	}
+
+	for _, name := range overriding {
+		if kept[name] {
+			t.Errorf("scrub kept %s; a claude given it would bill at API rates", name)
 		}
 	}
-	if !contains(got, "CLAUDE_CODE_OAUTH_TOKEN="+testToken) {
+	if !kept["CLAUDE_CODE_OAUTH_TOKEN"] {
 		t.Error("scrub dropped tumika's own token")
 	}
-	if !contains(got, "PATH=/usr/bin") {
-		t.Error("scrub dropped PATH")
+	if !kept["PATH"] || !kept["HOME"] {
+		t.Error("scrub dropped a variable the child needs")
 	}
 }
 
@@ -830,5 +954,58 @@ sleep 30
 	}
 	if string(first) != string(second) {
 		t.Error("a grandchild survived the timeout; on a daemon these accumulate")
+	}
+}
+
+// A caller going away is not the CLI hanging.
+//
+// Both contexts are cancelled when the deadline passes, so reading only the
+// derived one reported an HTTP client disconnect or a daemon shutdown as
+// "did not finish within 60s" — sending the operator to look for a stall that
+// never happened.
+func TestACancelledCallerIsNotReportedAsAHang(t *testing.T) {
+	home := t.TempDir()
+	providers := filepath.Join(home, "providers")
+	configDir := filepath.Join(home, "claude")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	dir := filepath.Join(providers, "claude-code", testVersion)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, BinaryName), []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// A verify timeout far longer than the test, so anything that finishes
+	// quickly finished because the CALLER stopped.
+	d, err := NewDriver(providers, configDir, testVersion, WithVerifyTimeout(10*time.Minute))
+	if err != nil {
+		t.Fatalf("NewDriver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err = d.Verify(ctx, domain.Credential{ProviderID: ID, Secret: testToken})
+	if err == nil {
+		t.Fatal("a cancelled verify reported success")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("cancellation took %s to take effect", elapsed)
+	}
+	if !errors.Is(err, domain.ErrProviderUnavailable) {
+		t.Errorf("= %v, want ErrProviderUnavailable", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("= %v, want it to name the cancellation", err)
+	}
+	if strings.Contains(err.Error(), "did not finish within") {
+		t.Errorf("a cancelled caller was reported as a hung CLI: %v", err)
 	}
 }

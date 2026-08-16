@@ -254,10 +254,23 @@ type authStatus struct {
 // the thing keyed on: a bad token returns subtype "success" ALONGSIDE
 // is_error true and api_error_status 401.
 type promptResult struct {
+	Type           string `json:"type"`
 	IsError        bool   `json:"is_error"`
 	APIErrorStatus int    `json:"api_error_status"`
 	Subtype        string `json:"subtype"`
 	Result         string `json:"result"`
+}
+
+// completed reports whether this document is a finished turn at all.
+//
+// Requiring POSITIVE evidence, not merely the absence of is_error. Every field
+// here is optional to a JSON decoder, so `null`, `{}` and a document like
+// {"type":"error", …} all decode successfully into a zero value — and a zero
+// value has IsError false. Reading that as success reported a credential that
+// produced no answer whatsoever as ACTIVE, which is the same mistake as keying
+// on subtype, arrived at from the other direction.
+func (r promptResult) completed() bool {
+	return r.Type == "result" || r.Subtype != "" || r.Result != ""
 }
 
 // Verify runs the two-stage check.
@@ -306,6 +319,13 @@ func (d *Driver) Verify(ctx context.Context, c domain.Credential) (domain.Creden
 	}
 
 	now := d.now()
+
+	if !result.IsError && !result.completed() {
+		// Parseable, and not a turn. Says nothing about the credential either
+		// way, so it must not be recorded as one.
+		return meta, fmt.Errorf("%w: `claude -p` returned a document that is not a result",
+			domain.ErrProviderUnavailable)
+	}
 
 	if result.IsError {
 		switch {
@@ -375,6 +395,12 @@ func (d *Driver) prompt(ctx context.Context, token string) (promptResult, error)
 // a crash all mean the check could not be carried out, and treating any of them
 // as a rejection would revoke a working token over an unrelated failure.
 func (d *Driver) run(ctx context.Context, token string, args ...string) ([]byte, error) {
+	// The parent is kept, not shadowed. Both contexts are cancelled when the
+	// deadline passes, so the derived one cannot tell "the CLI was slow" from
+	// "the caller went away" — and reporting an HTTP client disconnect or a
+	// daemon shutdown as a 60-second hang sends the operator looking for a
+	// stall that never happened.
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
@@ -393,9 +419,15 @@ func (d *Driver) run(ctx context.Context, token string, args ...string) ([]byte,
 		detail = ": " + truncate(logging.Redact(strings.TrimSpace(string(exitErr.Stderr))))
 	}
 
+	if parent.Err() != nil {
+		return out, fmt.Errorf("%w: `claude %s` was cancelled: %w",
+			domain.ErrProviderUnavailable, args[0], parent.Err())
+	}
 	if ctx.Err() != nil {
-		return out, fmt.Errorf("%w: `claude %s` did not finish within %s",
-			domain.ErrProviderUnavailable, args[0], d.timeout)
+		// The detail is carried here too. A CLI that explains itself on stderr
+		// before hanging is explaining exactly the thing being diagnosed.
+		return out, fmt.Errorf("%w: `claude %s` did not finish within %s%s",
+			domain.ErrProviderUnavailable, args[0], d.timeout, detail)
 	}
 	return out, fmt.Errorf("%w: `claude %s` failed: %w%s",
 		domain.ErrProviderUnavailable, args[0], err, detail)

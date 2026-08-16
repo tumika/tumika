@@ -30,8 +30,11 @@ const minimalPath = "/usr/local/bin:/usr/bin:/bin"
 //
 //	cloud vars → ANTHROPIC_AUTH_TOKEN → ANTHROPIC_API_KEY → apiKeyHelper → CLAUDE_CODE_OAUTH_TOKEN
 //
-// tumika's token is LAST. Every one of these outranks it, which is why the list
-// is exhaustive rather than the two obvious ones. See
+// tumika's token is LAST: every one of these outranks it, which is why the list
+// is long rather than the two obvious ones. It is NOT a proof of completeness —
+// Claude Code can add a variable tomorrow, and this file would not know. The
+// guarantee comes from building the environment from a fixed list; this is the
+// backstop for when that stops being true. See
 // .agents/rules/every-spawned-claude-process-is-credential-isolated.md.
 var deniedEnv = []string{
 	"ANTHROPIC_API_KEY",
@@ -39,6 +42,11 @@ var deniedEnv = []string{
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_PROFILE",
 	"ANTHROPIC_MODEL",
+	// Can carry an Authorization header, which reroutes billing outright
+	// without touching any of the variables above.
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_VERTEX_BASE_URL",
 	"CLAUDE_CODE_USE_BEDROCK",
 	"CLAUDE_CODE_USE_VERTEX",
 	"CLAUDE_CODE_USE_FOUNDRY",
@@ -56,11 +64,18 @@ var deniedEnv = []string{
 
 // command builds the one kind of claude process tumika ever spawns.
 //
-// This is the ONLY place a *exec.Cmd for the vendored binary is constructed —
-// verify, preflight and the PTY login all come through here. The five isolation
-// measures are one policy, and any one of them missing puts the operator on API
-// billing with no symptom at all: everything still works, and the difference
-// arrives weeks later on an invoice.
+// This is the ONLY place a *exec.Cmd for the vendored binary is constructed.
+// Today that means Verify's two stages; the PTY login will come through here
+// too, and a PTY does not exempt it. Preflight deliberately spawns nothing — it
+// only stats the binary.
+//
+// Nothing mechanical enforces the "only place" property: it is a review
+// obligation, and the reason the constructor is unexported and takes the token
+// as a parameter is to make going around it look as odd as it is.
+//
+// The isolation measures are ONE policy, and any one of them missing puts the
+// operator on API billing with no symptom at all: everything still works, and
+// the difference arrives weeks later on an invoice.
 //
 // The token is passed per call rather than held on the driver, because a
 // credential's lifetime is the call it was opened for.
@@ -136,8 +151,10 @@ func (d *Driver) command(ctx context.Context, token string, args ...string) *exe
 // scrub drops any denied variable from an assembled environment.
 //
 // Redundant against the fixed list above, and deliberately so: the list is a
-// property of today's code, and this is a property of the function. It is the
-// half that survives someone adding an environment passthrough later.
+// property of today's code, and this is a property of the function. It protects
+// what is passed THROUGH it and nothing else — a later `cmd.Env = append(...)`
+// after the call below would go straight round it. That is the case to watch
+// for in review; scrub cannot catch it.
 func scrub(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {

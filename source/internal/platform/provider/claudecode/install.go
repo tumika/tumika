@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/mod/semver"
@@ -42,6 +43,19 @@ type Installer struct {
 	// rename cannot cross a boundary.
 	staging string
 	release *releaseClient
+
+	// mu guards inflight, which maps a version to the install currently
+	// downloading it.
+	mu       sync.Mutex
+	inflight map[string]*install
+}
+
+// install is one in-flight download that later callers wait on rather than
+// repeat.
+type install struct {
+	done   chan struct{}
+	result domain.InstallResult
+	err    error
 }
 
 // InstallerOption configures the installer.
@@ -75,9 +89,10 @@ func NewInstaller(providersRoot string, opts ...InstallerOption) (*Installer, er
 	}
 
 	return &Installer{
-		root:    filepath.Join(providersRoot, "claude-code"),
-		staging: filepath.Join(providersRoot, ".claude-code-staging"),
-		release: release,
+		root:     filepath.Join(providersRoot, "claude-code"),
+		staging:  filepath.Join(providersRoot, ".claude-code-staging"),
+		release:  release,
+		inflight: map[string]*install{},
 	}, nil
 }
 
@@ -173,10 +188,48 @@ func (i *Installer) Installed(context.Context) ([]string, error) {
 // signature against the embedded key, and only then use its checksums to judge
 // the binary. Verifying a download against a checksum from an unsigned document
 // proves the bytes arrived intact, not that they are the right bytes.
+// Concurrent requests for the same version JOIN rather than duplicate.
+//
+// Install is reachable over HTTP, it is synchronous, and it downloads ~307 MB.
+// Without this, a handful of impatient retries — the entirely normal response to
+// a call that appears to hang — each open their own staging directory and pull
+// the whole payload. The publish is atomic so the result would still be correct,
+// and on the Raspberry Pi + SD card deployment this package is written for the
+// card would be full before any of them landed.
 func (i *Installer) Install(ctx context.Context, version string) (domain.InstallResult, error) {
 	if err := validateVersion(version); err != nil {
 		return domain.InstallResult{}, err
 	}
+
+	i.mu.Lock()
+	if leader, joined := i.inflight[version]; joined {
+		i.mu.Unlock()
+		select {
+		case <-leader.done:
+			// Whatever the leader got, including its failure: a second download
+			// started now would fail the same way.
+			return leader.result, leader.err
+		case <-ctx.Done():
+			// This caller gave up. The leader carries on — it is doing work
+			// somebody still wants.
+			return domain.InstallResult{}, ctx.Err()
+		}
+	}
+	leader := &install{done: make(chan struct{})}
+	i.inflight[version] = leader
+	i.mu.Unlock()
+
+	leader.result, leader.err = i.installOnce(ctx, version)
+
+	i.mu.Lock()
+	delete(i.inflight, version)
+	i.mu.Unlock()
+	close(leader.done)
+
+	return leader.result, leader.err
+}
+
+func (i *Installer) installOnce(ctx context.Context, version string) (domain.InstallResult, error) {
 
 	target := i.Path(version)
 	if usable(target) {

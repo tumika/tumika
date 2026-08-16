@@ -136,8 +136,9 @@ A provider is an LLM backend. Two ship in this branch:
 `claude-code` will also offer `interactive_cli` once the PTY login lands. It does **not**
 declare it today, and must not: the registry validates the descriptor against the interfaces
 actually implemented, so declaring a method ahead of its implementation stops the daemon at
-startup. That absence is what makes `POST …/login` answer a documented `400
-interactive_auth_unsupported` rather than hanging on a flow that does not exist.
+startup. The absence is discoverable by type assertion, which is what will let the login
+endpoint refuse with `400 interactive_auth_unsupported` when it lands. **There is no
+`POST /v1/providers/{id}/login` route yet** — that path answers 404 today, not 400.
 
 Providers **declare their capabilities by which interfaces they implement**, and the registry
 discovers them by type assertion. `Provider` and `HealthChecker` are mandatory;

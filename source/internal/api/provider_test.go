@@ -103,6 +103,27 @@ func doProvider(t *testing.T, svc *fakeProviderService, method, target, body str
 	return rec
 }
 
+// doProviderChunked sends a request with no body and an unknown length, which
+// is what net/http reports as ContentLength -1.
+func doProviderChunked(t *testing.T, svc *fakeProviderService, method, target string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(method, "http://127.0.0.1:8737"+target, strings.NewReader(""))
+	req.Header.Set("Authorization", "Bearer tmk_test")
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+
+	rec := httptest.NewRecorder()
+	api.NewRouter(api.Deps{
+		Config:    &fakeConfigService{},
+		Providers: svc,
+		Health:    stubHealth{},
+		Auth:      allowAll{},
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).ServeHTTP(rec, req)
+	return rec
+}
+
 func TestListProviders(t *testing.T) {
 	svc := &fakeProviderService{views: []domain.ProviderView{{
 		Descriptor:              domain.Descriptor{ID: "anthropic-api", DisplayName: "Anthropic API"},
@@ -331,5 +352,21 @@ func TestInstallRejectsAMalformedBody(t *testing.T) {
 		if svc.calls != 0 {
 			t.Errorf("body %q reached the service", body)
 		}
+	}
+}
+
+// A client that sends no body with Transfer-Encoding: chunked gets
+// ContentLength -1, not 0. Keying on that answered "install the pinned version"
+// with a 400.
+func TestInstallAcceptsAnEmptyChunkedBody(t *testing.T) {
+	svc := &fakeProviderService{install: domain.InstallResult{Version: "2.1.233"}}
+
+	rec := doProviderChunked(t, svc, http.MethodPost, "/v1/providers/claude-code/install")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if svc.lastVersion != "" {
+		t.Errorf("version = %q, want empty so the driver chooses its pin", svc.lastVersion)
 	}
 }

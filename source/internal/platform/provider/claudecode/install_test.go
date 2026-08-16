@@ -2,6 +2,7 @@ package claudecode
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,7 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 )
@@ -1156,5 +1159,109 @@ func TestPruneNeverEmptiesTheRoot(t *testing.T) {
 		if len(installed) != 1 || installed[0] != "2.1.233" {
 			t.Errorf("Prune(keep=%d) left %v, want only the newest", keep, installed)
 		}
+	}
+}
+
+// Concurrent installs of the same version must JOIN, not each download ~307 MB.
+//
+// Install is reachable over HTTP and synchronous, so impatient retries — the
+// normal response to a call that appears to hang — are the expected traffic. On
+// the Pi + SD card this package is written for, a handful of duplicates fill the
+// card before any of them lands.
+func TestConcurrentInstallsOfOneVersionDownloadItOnce(t *testing.T) {
+	b := newBucket(t)
+	server := b.serve(t)
+
+	var downloads atomic.Int64
+	release := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/"+BinaryName) {
+			downloads.Add(1)
+			// Held open so every caller is in flight at once; otherwise the
+			// first could finish and the rest would take the fast path, which
+			// proves nothing about single-flighting.
+			<-release
+		}
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	proxy := httptest.NewServer(mux)
+	t.Cleanup(proxy.Close)
+
+	inst, err := NewInstaller(t.TempDir(), WithBaseURL(proxy.URL), WithHTTPClient(proxy.Client()))
+	if err != nil {
+		t.Fatalf("NewInstaller: %v", err)
+	}
+	trust(inst, b.entity)
+
+	const callers = 5
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			_, err := inst.Install(context.Background(), b.version)
+			results <- err
+		}()
+	}
+
+	// Wait until the leader is actually downloading, so the others have had
+	// their chance to start one of their own.
+	deadline := time.After(10 * time.Second)
+	for downloads.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("no download started")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	for range callers {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("Install: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("an install never returned; the joiners may be deadlocked")
+		}
+	}
+
+	if got := downloads.Load(); got != 1 {
+		t.Errorf("the binary was downloaded %d times, want 1", got)
+	}
+
+	installed, err := inst.Installed(context.Background())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if len(installed) != 1 || installed[0] != b.version {
+		t.Errorf("Installed() = %v, want exactly the one version", installed)
+	}
+}
+
+// Different versions are independent: single-flighting must not serialise them.
+func TestConcurrentInstallsOfDifferentVersionsDoNotBlockEachOther(t *testing.T) {
+	b := newBucket(t)
+	inst, _ := installerFor(t, b)
+
+	// The second version is not in the bucket, so it fails — the point is that
+	// it fails on its own rather than waiting behind the first.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = inst.Install(context.Background(), "1.0.0")
+	}()
+
+	if _, err := inst.Install(context.Background(), b.version); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("an install of a different version was serialised behind this one")
 	}
 }
