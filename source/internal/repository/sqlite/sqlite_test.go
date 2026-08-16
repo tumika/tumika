@@ -277,7 +277,7 @@ func TestCredentialMetaRoundTrip(t *testing.T) {
 	expires := issued.Add(365 * 24 * time.Hour)
 	verified := time.Now().UTC().Truncate(time.Nanosecond)
 
-	err = repo.UpdateMeta(ctx, id, domain.CredentialMeta{
+	_, err = repo.UpdateMeta(ctx, id, domain.CredentialMeta{
 		Hint:             "…t9U",
 		AccountEmail:     "someone@example.com",
 		IssuedAt:         &issued,
@@ -310,8 +310,12 @@ func TestCredentialMetaRoundTrip(t *testing.T) {
 		t.Errorf("Ciphertext = %v", got.Ciphertext)
 	}
 
-	if err := repo.UpdateStatus(ctx, id, domain.CredentialInvalid, "api_error_status=401"); err != nil {
+	applied, err := repo.UpdateStatus(ctx, id, domain.CredentialInvalid, "api_error_status=401")
+	if err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
+	}
+	if !applied {
+		t.Error("the update should have applied to a live credential")
 	}
 	if _, err := repo.GetLive(ctx, "claude-code", domain.CredentialOAuthToken); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("an invalid credential must no longer be live, got %v", err)

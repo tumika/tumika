@@ -142,6 +142,19 @@ the login-session endpoints.
 `anthropic-api` exists precisely so the abstraction is not silently Claude-CLI-shaped: it
 implements neither `Installer` nor `InteractiveAuthenticator`.
 
+**The registry validates the correspondence at construction**, so a driver whose descriptor
+disagrees with the interfaces it implements stops the daemon at startup rather than producing a
+client that offers a flow the daemon rejects. The compiler cannot check that, which is why the
+registry does. Every driver must also pass the shared suite in
+`platform/provider/providertest` — written once, run against every implementation, so a second
+driver cannot quietly diverge from the first.
+
+**Credentials are stored before they are verified, deliberately.** Sealing and insertion happen
+in one transaction; verification is a network call made holding *no* transaction; the verdict
+lands in a second. Verifying inside the transaction would hold SQLite's single write lock across
+a network call, so a hanging provider would block every other write in the daemon. This is why
+the schema has an `unverified` status at all.
+
 ## Claude Code facts that are load-bearing
 
 tumika drives a **pinned** Claude Code build, never whatever is on `PATH`. The exact version is

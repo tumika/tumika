@@ -78,3 +78,47 @@ type Provider struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// Preflight is a driver's report on whether it can be used right now, and if
+// not, what an operator would have to do about it.
+//
+// Separate from health: health describes the daemon, preflight describes one
+// provider's readiness, and the answer is usually actionable rather than
+// alarming ("Claude Code is not installed" is a next step, not an incident).
+type Preflight struct {
+	Ready bool `json:"ready"`
+	// Blockers are stated in the operator's terms, not the driver's.
+	Blockers []string `json:"blockers,omitempty"`
+	// Details is driver-specific and purely informational — an installed
+	// version, a resolved binary path. Never credential material.
+	Details map[string]string `json:"details,omitempty"`
+}
+
+// InstallResult describes what an Installer did.
+type InstallResult struct {
+	Version string `json:"version"`
+	Path    string `json:"path"`
+	// AlreadyPresent distinguishes "installed it" from "it was already there",
+	// which matters because installing is expensive and pinned.
+	AlreadyPresent bool `json:"already_present"`
+}
+
+// ProviderView is a provider as a client sees it: what it is, what it can do,
+// and what tumika currently holds for it.
+//
+// The descriptor is embedded, so a client reads auth_methods and
+// requires_interactive_auth from the same object it reads the credential state
+// from — which is what lets it decide, in one look, whether to render a secret
+// field or drive the login endpoints.
+type ProviderView struct {
+	Descriptor
+	// RequiresInteractiveAuth is derived from AuthMethods and serialised
+	// explicitly, so a client does not have to re-derive it.
+	RequiresInteractiveAuth bool `json:"requires_interactive_auth"`
+	Enabled                 bool `json:"enabled"`
+	Selected                bool `json:"selected"`
+	// Credential is the non-secret half of the live credential, or nil when
+	// none is stored. The secret never appears here — see
+	// .agents/rules/never-log-or-return-a-credential-secret.md.
+	Credential *CredentialMeta `json:"credential,omitempty"`
+}

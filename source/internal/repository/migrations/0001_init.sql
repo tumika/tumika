@@ -16,7 +16,7 @@
 -- +goose Up
 
 -- Generic key/value configuration. Values are JSON so a new knob needs no
--- migration — which is the entire point of the table.
+-- migration  -  which is the entire point of the table.
 CREATE TABLE settings (
     key        TEXT NOT NULL PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -81,7 +81,7 @@ CREATE INDEX provider_credentials_by_provider
     ON provider_credentials (provider_id, status);
 
 -- Only interactive auth methods create a row here. A session cannot survive a
--- daemon restart, because its PTY and child process do not — every non-terminal
+-- daemon restart, because its PTY and child process do not  -  every non-terminal
 -- row is failed at startup.
 CREATE TABLE login_sessions (
     id            TEXT    NOT NULL PRIMARY KEY,
@@ -116,7 +116,7 @@ CREATE UNIQUE INDEX login_sessions_one_in_flight
     WHERE state NOT IN ('succeeded', 'failed', 'timed_out', 'canceled');
 
 -- A single row, guarded by CHECK (id = 1). It exists to survive the process
--- restart that completes an update — which is exactly why it cannot live in
+-- restart that completes an update  -  which is exactly why it cannot live in
 -- memory (ADR-0003).
 CREATE TABLE update_state (
     id            INTEGER PRIMARY KEY CHECK (id = 1),

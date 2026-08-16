@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/tumika/tumika/source/internal/domain"
 	"github.com/tumika/tumika/source/internal/service"
 )
 
@@ -25,10 +26,11 @@ const maxBodyBytes = 256 << 10 // 256 KiB
 // Deps are the services the API talks to. Everything here is an interface, so
 // handler tests need no database.
 type Deps struct {
-	Config service.ConfigService
-	Health service.HealthService
-	Auth   TokenVerifier
-	Logger *slog.Logger
+	Config    service.ConfigService
+	Providers service.ProviderService
+	Health    service.HealthService
+	Auth      TokenVerifier
+	Logger    *slog.Logger
 
 	// AllowedHosts are the Host header values accepted for a name-based
 	// request. Literal IPs are always accepted — they cannot be rebound.
@@ -52,6 +54,14 @@ func NewRouter(deps Deps) http.Handler {
 
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /v1/version", h.version)
+	mux.HandleFunc("GET /v1/providers", h.listProviders)
+	mux.HandleFunc("GET /v1/providers/{id}", h.getProvider)
+	mux.HandleFunc("GET /v1/providers/{id}/preflight", h.providerPreflight)
+	mux.HandleFunc("POST /v1/providers/{id}/select", h.selectProvider)
+	mux.HandleFunc("PUT /v1/providers/{id}/credential", h.putCredential)
+	mux.HandleFunc("POST /v1/providers/{id}/verify", h.verifyCredential)
+	mux.HandleFunc("DELETE /v1/providers/{id}/credential", h.deleteCredential)
+
 	mux.HandleFunc("GET /v1/config", h.listConfig)
 	mux.HandleFunc("PATCH /v1/config", h.patchConfig)
 	mux.HandleFunc("DELETE /v1/config/{key}", h.resetConfig)
@@ -115,6 +125,29 @@ func writeServiceError(w http.ResponseWriter, logger *slog.Logger, err error) {
 		writeError(w, http.StatusNotFound, "unknown_setting", err.Error())
 	case errors.Is(err, service.ErrInvalidSetting):
 		writeError(w, http.StatusBadRequest, "invalid_setting", err.Error())
+	case errors.Is(err, domain.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, domain.ErrCredentialInvalid):
+		writeError(w, http.StatusBadRequest, "credential_invalid", err.Error())
+	case errors.Is(err, domain.ErrInteractiveAuthRequired):
+		// The mirror of interactive_auth_unsupported: a secret was submitted to
+		// a provider that only hands one over through a login session.
+		writeError(w, http.StatusBadRequest, "interactive_auth_required", err.Error())
+	case errors.Is(err, domain.ErrInteractiveAuthUnsupported):
+		writeError(w, http.StatusBadRequest, "interactive_auth_unsupported", err.Error())
+	case errors.Is(err, domain.ErrInstallUnsupported):
+		writeError(w, http.StatusBadRequest, "install_unsupported", err.Error())
+	case errors.Is(err, domain.ErrProviderUnavailable):
+		// The provider could not be reached, which is not tumika failing. A 500
+		// would tell the operator to look at the wrong system, and would hide
+		// that the credential may well have been stored.
+		writeError(w, http.StatusBadGateway, "provider_unavailable", err.Error())
+	case errors.Is(err, domain.ErrSuperseded):
+		writeError(w, http.StatusConflict, "superseded", err.Error())
+	case errors.Is(err, domain.ErrConflict):
+		// Two submissions raced and the partial unique index refused the loser.
+		// Actionable — retry — rather than an internal failure.
+		writeError(w, http.StatusConflict, "conflict", err.Error())
 	default:
 		// The message is deliberately generic: an internal failure's text can
 		// carry paths, SQL or driver detail, none of which belongs in a

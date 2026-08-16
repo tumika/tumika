@@ -74,6 +74,13 @@ type CredentialRepository interface {
 	// GetLive returns the one live credential for a provider and kind — the
 	// row the partial unique index permits — or domain.ErrNotFound.
 	GetLive(ctx context.Context, providerID, kind string) (domain.SealedCredential, error)
+	// GetLatest returns the most recent credential for a provider and kind that
+	// the operator has not revoked, whatever its status.
+	//
+	// GetLive excludes 'invalid' and 'expired' because they must not be USED;
+	// this exists because they must still be re-CHECKABLE. A key rejected by a
+	// provider-side hiccup would otherwise be condemned permanently.
+	GetLatest(ctx context.Context, providerID, kind string) (domain.SealedCredential, error)
 	// ListLive returns every live credential, for the credential monitor and
 	// for /v1/health.
 	ListLive(ctx context.Context) ([]domain.SealedCredential, error)
@@ -82,12 +89,17 @@ type CredentialRepository interface {
 	// and kind; retiring the previous one is the caller's decision, not a
 	// silent overwrite.
 	Insert(ctx context.Context, c domain.SealedCredential) (int64, error)
-	// UpdateStatus records the outcome of a verification. verifyErr is stored
-	// as given and cleared when empty.
-	UpdateStatus(ctx context.Context, id int64, status domain.CredentialStatus, verifyErr string) error
-	// UpdateMeta records what verification learned that is not the status —
-	// the account it belongs to, when it expires, when it was last checked.
-	UpdateMeta(ctx context.Context, id int64, meta domain.CredentialMeta) error
+	// UpdateStatus records the outcome of a verification, and reports whether
+	// the row was still live.
+	//
+	// Verification runs outside a transaction — it is a network call — so the
+	// row may have been retired or replaced meanwhile. applied=false means the
+	// verdict arrived too late and was discarded, which is a normal outcome
+	// rather than an error.
+	UpdateStatus(ctx context.Context, id int64, status domain.CredentialStatus, verifyErr string) (applied bool, err error)
+	// UpdateMeta merges what verification learned into the stored metadata,
+	// leaving fields the driver did not report untouched.
+	UpdateMeta(ctx context.Context, id int64, meta domain.CredentialMeta) (applied bool, err error)
 	// Retire moves every live credential for a provider and kind to a terminal
 	// status, freeing the slot the partial unique index guards.
 	Retire(ctx context.Context, providerID, kind string, status domain.CredentialStatus) error

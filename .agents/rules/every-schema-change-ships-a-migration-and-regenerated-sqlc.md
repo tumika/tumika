@@ -30,6 +30,22 @@ operating against a schema it does not understand. That is the safety net for a 
 an update: an older binary meeting a newer database stops loudly instead of corrupting data.
 Before running migrations during an update, `VACUUM INTO` a backup and keep the last three.
 
+**Keep `.sql` files ASCII-only.** sqlc's SQLite parser computes statement offsets
+inconsistently between bytes and runes, so a single multi-byte character *in a comment*
+silently shifts every statement after it in the generated file. One em dash produced:
+
+```go
+const setProviderEnabled = `-- name: SetProviderEnabled :exec
+t;
+UPDATE providers ... WHERE id =
+```
+
+That compiles, reads plausibly, survives review, and fails at runtime with
+`no such column`. `sqlc diff` does not catch it either — the generated file matches what
+sqlc produces, because sqlc produces the corruption. `TestQueryFilesAreASCII` in
+`repository/sqlite` is the guard, alongside a check that no generated query ends in a
+dangling operator.
+
 ## Applies to
 
 | | |
@@ -38,6 +54,7 @@ Before running migrations during an update, `VACUUM INTO` a backup and keep the 
 | `source/internal/repository/queries/*.sql` | sqlc input |
 | `source/internal/repository/sqlite/**` | **generated** — never hand-edit; regenerate |
 | `sqlc.yaml` | engine `sqlite`; changing it means regenerating everything |
+| `repository/sqlite/generated_test.go` | guards the ASCII rule above, and that no generated query is truncated |
 | `.github/workflows/ci.yml` (`sqlc` job) | enforcement point: `sqlc diff` must be clean |
 | `UpdateService.ConfirmBoot` / daemon startup | the schema-version guard and the pre-migration backup |
 

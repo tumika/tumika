@@ -32,6 +32,20 @@ var (
 	// requested for a provider with no interactive auth method.
 	ErrInteractiveAuthUnsupported = errors.New("interactive auth unsupported")
 
+	// ErrInteractiveAuthRequired is the mirror image: a secret was submitted
+	// directly to a provider that only hands one over through a login session.
+	ErrInteractiveAuthRequired = errors.New("this provider requires an interactive login")
+
+	// ErrProviderUnavailable means a check could not be carried out — the
+	// provider was unreachable, rate-limiting, or failing. It says nothing about
+	// the credential, and must never be treated as a verdict on one.
+	ErrProviderUnavailable = errors.New("provider unavailable")
+
+	// ErrSuperseded means a result arrived for a credential that has since been
+	// replaced or removed. Expected, because verification deliberately runs
+	// outside a transaction.
+	ErrSuperseded = errors.New("superseded")
+
 	// ErrSchemaTooNew is returned when the database has been migrated by a newer
 	// binary than this one. tumika refuses to start rather than operate against
 	// a schema it does not understand — the safety net for a rollback after a
