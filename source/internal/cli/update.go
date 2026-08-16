@@ -10,6 +10,7 @@ import (
 	"github.com/tumika/tumika/source/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/release"
+	"github.com/tumika/tumika/source/internal/service"
 )
 
 // newUpdateCmd updates the tumika binary in place.
@@ -48,44 +49,7 @@ func newUpdateCmd(g *globals) *cobra.Command {
 			}
 
 			return withDaemon(g, cmd, func(d *daemon.Daemon) error {
-				updates := d.UpdateService()
-				if updates == nil {
-					return errors.New("self-update is disabled for this build")
-				}
-
-				available, newer, err := updates.Check(cmd.Context())
-				if err != nil {
-					if errors.Is(err, release.ErrNoRelease) {
-						printf(cmd, "No release has been published yet.\n")
-						return nil
-					}
-					return err
-				}
-
-				printf(cmd, "  running    %s\n", buildinfo.Version())
-				printf(cmd, "  available  %s\n", available)
-
-				if version == "" {
-					if !newer {
-						printf(cmd, "\nAlready up to date.\n")
-						return nil
-					}
-					version = available
-				}
-
-				if check {
-					printf(cmd, "\nRun `tumika update` to install %s.\n", version)
-					return nil
-				}
-
-				printf(cmd, "\nInstalling %s…\n", version)
-				if err := updates.Apply(cmd.Context(), version); err != nil {
-					return err
-				}
-
-				printf(cmd, "Installed. The previous binary is kept alongside it as tumika.old\n")
-				printf(cmd, "Restart the service to run it: tumika stop && tumika start\n")
-				return nil
+				return runUpdate(cmd, d.UpdateService(), buildinfo.Version(), check, version)
 			})
 		},
 	}
@@ -97,6 +61,55 @@ func newUpdateCmd(g *globals) *cobra.Command {
 	return cmd
 }
 
+// runUpdate is the update command's body, separated from the command so it can
+// be tested.
+//
+// Extracting it is not merely convenient: the guards above key on
+// buildinfo.IsDev(), which is always true in a test binary, so everything below
+// them was unreachable — the command was covered at 20% and the untested part
+// was the part that installs software.
+func runUpdate(cmd *cobra.Command, updates service.UpdateService,
+	current string, check bool, version string,
+) error {
+	if updates == nil {
+		return errors.New("self-update is disabled for this build")
+	}
+
+	available, newer, err := updates.Check(cmd.Context())
+	if err != nil {
+		if errors.Is(err, release.ErrNoRelease) {
+			printf(cmd, "No release has been published yet.\n")
+			return nil
+		}
+		return err
+	}
+
+	printf(cmd, "  running    %s\n", current)
+	printf(cmd, "  available  %s\n", available)
+
+	if version == "" {
+		if !newer {
+			printf(cmd, "\nAlready up to date.\n")
+			return nil
+		}
+		version = available
+	}
+
+	if check {
+		printf(cmd, "\nRun `tumika update` to install %s.\n", version)
+		return nil
+	}
+
+	printf(cmd, "\nInstalling %s…\n", version)
+	if err := updates.Apply(cmd.Context(), version); err != nil {
+		return err
+	}
+
+	printf(cmd, "Installed. The previous binary is kept alongside it as tumika.old\n")
+	printf(cmd, "Restart the service to run it: tumika stop && tumika start\n")
+	return nil
+}
+
 // newUpdateStatusCmd reports where a self-update has got to.
 func newUpdateStatusCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
@@ -105,35 +118,40 @@ func newUpdateStatusCmd(g *globals) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withDaemon(g, cmd, func(d *daemon.Daemon) error {
-				updates := d.UpdateService()
-				if updates == nil {
-					printf(cmd, "  status   disabled for this build\n")
-					return nil
-				}
-				state, err := updates.State(cmd.Context())
-				if err != nil {
-					return err
-				}
-
-				printf(cmd, "  status   %s\n", state.Status)
-				if state.Status == domain.UpdateIdle {
-					return nil
-				}
-				printf(cmd, "  from     %s\n", state.FromVersion)
-				printf(cmd, "  to       %s\n", state.ToVersion)
-				if state.Status == domain.UpdatePending {
-					printf(cmd, "  boots    %d of %d before rollback\n",
-						state.BootAttempts, domain.MaxBootAttempts)
-				}
-				if state.StartedAt != nil {
-					printf(cmd, "  started  %s\n", state.StartedAt.Format("2006-01-02 15:04:05 MST"))
-				}
-				if state.Status == domain.UpdateRolledBack {
-					printf(cmd, "\n  %s failed to boot and the previous binary was restored.\n", state.ToVersion)
-					printf(cmd, "  Check the logs from that attempt before trying again.\n")
-				}
-				return nil
+				return runUpdateStatus(cmd, d.UpdateService())
 			})
 		},
 	}
+}
+
+// runUpdateStatus is the status command's body, separated for the same reason.
+func runUpdateStatus(cmd *cobra.Command, updates service.UpdateService) error {
+	if updates == nil {
+		printf(cmd, "  status   disabled for this build\n")
+		return nil
+	}
+
+	state, err := updates.State(cmd.Context())
+	if err != nil {
+		return err
+	}
+
+	printf(cmd, "  status   %s\n", state.Status)
+	if state.Status == domain.UpdateIdle {
+		return nil
+	}
+	printf(cmd, "  from     %s\n", state.FromVersion)
+	printf(cmd, "  to       %s\n", state.ToVersion)
+	if state.Status == domain.UpdatePending {
+		printf(cmd, "  boots    %d of %d before rollback\n",
+			state.BootAttempts, domain.MaxBootAttempts)
+	}
+	if state.StartedAt != nil {
+		printf(cmd, "  started  %s\n", state.StartedAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	if state.Status == domain.UpdateRolledBack {
+		printf(cmd, "\n  %s failed to boot and the previous binary was restored.\n", state.ToVersion)
+		printf(cmd, "  Check the logs from that attempt before trying again.\n")
+	}
+	return nil
 }

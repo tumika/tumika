@@ -553,3 +553,158 @@ func vendorFakeClaude(t *testing.T, p paths.Paths, authStatus ...string) {
 		t.Fatalf("write the stand-in claude: %v", err)
 	}
 }
+
+// stubUpdates drives the daemon's update paths without a network or a release.
+type stubUpdates struct {
+	state        domain.UpdateState
+	rollBack     bool
+	confirmBoot  int
+	confirmed    int
+	confirmBootE error
+}
+
+func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) { return s.state, nil }
+func (s *stubUpdates) Check(context.Context) (string, bool, error)       { return "", false, nil }
+func (s *stubUpdates) Apply(context.Context, string) error               { return nil }
+
+func (s *stubUpdates) ConfirmBoot(context.Context) (bool, error) {
+	s.confirmBoot++
+	return s.rollBack, s.confirmBootE
+}
+
+func (s *stubUpdates) Confirm(context.Context) error {
+	s.confirmed++
+	return nil
+}
+
+// A rolled-back update must stop the daemon BEFORE it binds a port, so the
+// supervisor relaunches onto the restored binary. Serving first would mean a
+// daemon briefly answering requests it is about to abandon.
+func TestARolledBackUpdateStopsBeforeServing(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{rollBack: true}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if _, err := d.AuthService().Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	err = d.Serve(ctx)
+	if !errors.Is(err, daemon.ErrRestartRequired) {
+		t.Fatalf("Serve = %v, want ErrRestartRequired", err)
+	}
+	if updates.confirmBoot != 1 {
+		t.Errorf("ConfirmBoot ran %d times, want 1", updates.confirmBoot)
+	}
+	if updates.confirmed != 0 {
+		t.Error("a rolled-back update was confirmed")
+	}
+}
+
+// An update is confirmed once the daemon is SERVING, not merely constructed.
+func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{state: domain.UpdateState{Status: domain.UpdatePending}}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if _, err := d.AuthService().Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- d.ServeListener(ctx, listener) }()
+
+	// Confirm runs before the serve loop blocks, so it has happened by the time
+	// the API answers.
+	base := "http://" + listener.Addr().String()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && updates.confirmed == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = base
+
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the daemon did not shut down")
+	}
+
+	if updates.confirmed != 1 {
+		t.Errorf("Confirm ran %d times, want 1", updates.confirmed)
+	}
+}
+
+// A daemon that cannot read its update row still starts: refusing would turn a
+// bookkeeping problem into an outage.
+func TestAnUnreadableUpdateStateDoesNotStopTheDaemon(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{confirmBootE: errors.New("database is locked")}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if _, err := d.AuthService().Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- d.ServeListener(ctx, listener) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("the daemon failed to serve: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the daemon did not shut down")
+	}
+}

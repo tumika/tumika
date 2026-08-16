@@ -57,6 +57,14 @@ type Options struct {
 	// than at Anthropic — and the same seam a future deployment pointing at a
 	// gateway would use.
 	Providers []provider.Provider
+
+	// Updates overrides the self-update service.
+	//
+	// The same kind of seam as Providers. Without it the update paths are
+	// unreachable in a test: a test binary is a development build, so New leaves
+	// updates nil and ConfirmBoot, Confirm and the restart-on-update path are
+	// never exercised until a real release runs them on someone's machine.
+	Updates service.UpdateService
 }
 
 // Daemon owns the process-wide resources: the database and the HTTP server.
@@ -183,6 +191,8 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	var updates service.UpdateService
 	var updateRunner *runner.Update
 	switch {
+	case opts.Updates != nil:
+		updates = opts.Updates
 	case buildinfo.IsDev():
 		opts.Logger.InfoContext(ctx, "self-update disabled", "reason", "development build")
 	case paths.InContainer():

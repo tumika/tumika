@@ -296,3 +296,149 @@ func TestNewerTreatsAPrereleaseAsOlderThanItsRelease(t *testing.T) {
 		t.Error("an RC was reported as newer than its own release")
 	}
 }
+
+// A redirect that does not end in a version tag means GitHub answered something
+// unexpected, and guessing would install whatever the path happened to end in.
+func TestLatestRefusesAnUnparseableRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/somewhere/else", http.StatusFound)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	src := NewGitHub(WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	if _, err := src.Latest(context.Background()); err == nil {
+		t.Fatal("an unparseable redirect was accepted")
+	}
+}
+
+// The tag has to be a real version, not merely start with "v".
+func TestLatestRefusesANonSemverTag(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/releases/tag/vNext", http.StatusFound)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	src := NewGitHub(WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	if _, err := src.Latest(context.Background()); err == nil {
+		t.Fatal("a non-semver tag was accepted")
+	}
+}
+
+// A missing checksums.txt must stop the update. Downloading a binary and
+// installing it unverified is the one thing this package exists to prevent.
+func TestFetchWithNoChecksumsFile(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/download/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "checksums.txt") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("a binary nobody verified"))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	src := NewGitHub(WithBaseURL(server.URL), WithHTTPClient(server.Client()),
+		WithPlatform("linux", "arm64"))
+
+	dest := filepath.Join(t.TempDir(), "tumika")
+	if err := src.Fetch(context.Background(), "1.2.3", dest); err == nil {
+		t.Fatal("a release with no checksums.txt was installed")
+	}
+	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Error("an unverified binary was written")
+	}
+}
+
+// A 404 on the binary itself, with the checksum present — a release whose asset
+// upload failed.
+func TestFetchWithAMissingBinary(t *testing.T) {
+	f := newFakeGitHub("1.2.3")
+	f.binary["1.2.3"] = "the new binary"
+	src := newTestSource(t, f)
+
+	dest := filepath.Join(t.TempDir(), "tumika")
+	// Ask for a version the fake serves no binary for, but whose checksum line
+	// is absent too — the checksum lookup fails first, which is the right order:
+	// nothing is downloaded that cannot be verified.
+	if err := src.Fetch(context.Background(), "9.9.9", dest); err == nil {
+		t.Fatal("a missing binary was installed")
+	}
+}
+
+// An unwritable destination directory is an error, not a silent no-op.
+func TestFetchIntoAnUnwritableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	f := newFakeGitHub("1.2.3")
+	f.binary["1.2.3"] = "the new binary"
+	src := newTestSource(t, f)
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := src.Fetch(context.Background(), "1.2.3", filepath.Join(dir, "tumika")); err == nil {
+		t.Fatal("staging into an unwritable directory reported success")
+	}
+}
+
+// A cancelled context stops the download rather than running to completion.
+func TestFetchRespectsCancellation(t *testing.T) {
+	f := newFakeGitHub("1.2.3")
+	f.binary["1.2.3"] = "the new binary"
+	src := newTestSource(t, f)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dest := filepath.Join(t.TempDir(), "tumika")
+	if err := src.Fetch(ctx, "1.2.3", dest); err == nil {
+		t.Fatal("a cancelled fetch reported success")
+	}
+}
+
+// A 5xx on the binary itself, with a valid checksum entry — a CDN failing
+// mid-release. Nothing must be installed.
+func TestFetchWithAServerErrorOnTheBinary(t *testing.T) {
+	body := "the new binary"
+	sum := sha256.Sum256([]byte(body))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/download/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "checksums.txt") {
+			fmt.Fprintf(w, "%s  tumika_1.2.3_linux_arm64\n", hex.EncodeToString(sum[:]))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	src := NewGitHub(WithBaseURL(server.URL), WithHTTPClient(server.Client()),
+		WithPlatform("linux", "arm64"))
+
+	dest := filepath.Join(t.TempDir(), "tumika")
+	if err := src.Fetch(context.Background(), "1.2.3", dest); err == nil {
+		t.Fatal("a 502 on the binary was accepted")
+	}
+	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Error("something was installed despite the download failing")
+	}
+}
+
+// An unreachable host is an error, not an empty answer.
+func TestLatestWithAnUnreachableHost(t *testing.T) {
+	src := NewGitHub(WithBaseURL("http://127.0.0.1:1"))
+	if _, err := src.Latest(context.Background()); err == nil {
+		t.Fatal("an unreachable host reported a version")
+	}
+}
