@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tumika/tumika/source/internal/domain"
@@ -21,6 +22,14 @@ const preflightTimeout = 10 * time.Second
 
 // oldSuffix names the binary kept for a rollback.
 const oldSuffix = ".old"
+
+// ErrFallbackNotRemoved means an update was confirmed but the previous binary
+// could not be deleted.
+//
+// A distinct error because the UPDATE succeeded: the caller logs this and
+// carries on rather than treating a completed update as a failure. It matters
+// because the next Apply refuses to overwrite a stale .old.
+var ErrFallbackNotRemoved = errors.New("the previous binary could not be removed")
 
 // UpdateService owns the self-update state machine.
 //
@@ -59,6 +68,13 @@ type UpdateService interface {
 }
 
 type updateService struct {
+	// mu serialises the whole state machine.
+	//
+	// Apply, ConfirmBoot and Confirm all read the row, act on the filesystem,
+	// and write the row back. Two Applies interleaving is not a theoretical
+	// race: the scheduled runner and POST /v1/update/apply can both fire, and
+	// each is a multi-second download followed by two renames.
+	mu      sync.Mutex
 	repo    repository.UpdateStateRepository
 	source  release.Source
 	tx      repository.Txer
@@ -133,6 +149,9 @@ func (s *updateService) Check(ctx context.Context) (string, bool, error) {
 // Reversing 2 and 4 is the tempting simplification, and it is how you end up
 // with a daemon that cannot start and no record that anything happened.
 func (s *updateService) Apply(ctx context.Context, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	version = strings.TrimPrefix(version, "v")
 
 	if !release.Newer(version, s.version) {
@@ -140,9 +159,41 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 			domain.ErrConflict, version, s.version)
 	}
 
-	// Staged beside the live binary, not over it: the file being replaced is the
-	// one this process is executing.
-	staged := s.binary + ".new"
+	// REFUSE when an update is already installed and waiting for its restart.
+	//
+	// This process still reports the OLD version — it is still executing the old
+	// binary — so release.Newer above stays true after a successful apply, and a
+	// second Apply would sail straight through. It would then move the NEW
+	// binary to .old and install the new one again, so .old would hold the
+	// broken version and a rollback would "restore" it. The daemon would
+	// crash-loop with no way back.
+	//
+	// Reachable from an operator running `tumika update` twice, from two
+	// concurrent POSTs, and from the runner racing the API — all of which end at
+	// the same destroyed fallback.
+	current, err := s.repo.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("read the update state: %w", err)
+	}
+	if current.Status == domain.UpdatePending {
+		return fmt.Errorf("%w: %s is already installed and waiting for a restart; restart the service to run it",
+			domain.ErrConflict, current.ToVersion)
+	}
+
+	// A UNIQUE staging NAME, so two applies cannot stomp each other's download
+	// and the deferred cleanup only ever removes this call's file.
+	//
+	// The file is removed immediately: only the name is wanted. Leaving the
+	// 0600 file CreateTemp makes would have Fetch write into it and the
+	// pre-flight then fail to execute it — the mode of an existing file is not
+	// changed by a write.
+	stagedFile, err := os.CreateTemp(filepath.Dir(s.binary), ".tumika-staged-*")
+	if err != nil {
+		return fmt.Errorf("stage an update next to %s: %w", s.binary, err)
+	}
+	staged := stagedFile.Name()
+	_ = stagedFile.Close()
+	_ = os.Remove(staged)
 	defer func() { _ = os.Remove(staged) }()
 
 	if err := s.source.Fetch(ctx, version, staged); err != nil {
@@ -187,6 +238,17 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// has to restore from, and downloading it again would need the network to be
 	// working — which, on the boot after a failed update, is exactly what cannot
 	// be assumed.
+	//
+	// A pre-existing .old is left alone rather than clobbered: it belongs to the
+	// version currently running, and replacing it is exactly how the fallback
+	// gets destroyed. The pending guard above should make this unreachable, so
+	// reaching it means the state row and the filesystem disagree — which is
+	// worth refusing rather than papering over.
+	if _, statErr := os.Stat(s.binary + oldSuffix); statErr == nil {
+		return fmt.Errorf("%w: %s already exists but no update is pending; "+
+			"remove it once you are satisfied the running version is good",
+			domain.ErrConflict, s.binary+oldSuffix)
+	}
 	if err := os.Rename(s.binary, s.binary+oldSuffix); err != nil {
 		return fmt.Errorf("keep the current binary as %s: %w", s.binary+oldSuffix, err)
 	}
@@ -254,6 +316,9 @@ func parseVersion(out string) (string, error) {
 // afterwards: a binary that crashes during startup must still have its attempt
 // counted, or it would loop forever without ever reaching the rollback.
 func (s *updateService) ConfirmBoot(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	state, err := s.repo.Get(ctx)
 	if err != nil {
 		return false, err
@@ -298,15 +363,26 @@ func (s *updateService) rollBack(ctx context.Context, state domain.UpdateState) 
 			state.ToVersion, state.BootAttempts, old)
 	}
 
+	// The row is written BEFORE the rename, not after.
+	//
+	// The rename is irreversible; the row is not. Renaming first and failing to
+	// persist left the row saying `pending`, which the very next step — Confirm,
+	// during the same startup — promoted to `confirmed`. An operator would then
+	// see "confirmed 0.1.0 → 0.2.0" on a machine whose binary is 0.1.0, with the
+	// fallback deleted. Writing first can at worst mark a rollback that did not
+	// happen, which the next boot retries.
+	state.Status = domain.UpdateRolledBack
+	state.UpdatedAt = s.now()
+	if err := s.tx.InTx(ctx, func(ctx context.Context) error {
+		return s.repo.Put(ctx, state)
+	}); err != nil {
+		return fmt.Errorf("record the rollback of %s: %w", state.ToVersion, err)
+	}
+
 	if err := os.Rename(old, s.binary); err != nil {
 		return fmt.Errorf("restore %s: %w", s.binary, err)
 	}
-
-	state.Status = domain.UpdateRolledBack
-	state.UpdatedAt = s.now()
-	return s.tx.InTx(ctx, func(ctx context.Context) error {
-		return s.repo.Put(ctx, state)
-	})
+	return nil
 }
 
 // Confirm marks a pending update successful and removes the fallback.
@@ -315,6 +391,9 @@ func (s *updateService) rollBack(ctx context.Context, state domain.UpdateState) 
 // starts and then fails every request has proven nothing, and deleting .old at
 // startup would throw away the rollback while the evidence was still missing.
 func (s *updateService) Confirm(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	state, err := s.repo.Get(ctx)
 	if err != nil {
 		return err
@@ -331,11 +410,16 @@ func (s *updateService) Confirm(ctx context.Context) error {
 		return err
 	}
 
-	// Best-effort: the update is confirmed either way, and a leftover .old costs
-	// one binary's disk. Failing here would turn a successful update into a
-	// reported failure.
+	// Best-effort, and REPORTED. The update is confirmed either way — the row is
+	// already written — so a removal failure must not be returned as an error.
+	// But it must not vanish either: a leftover .old is what the next Apply
+	// refuses to overwrite, so an operator needs to know it is there.
+	//
+	// Both arms of this used to return nil, which made the failure
+	// indistinguishable from success and the branch impossible to test.
 	if err := os.Remove(s.binary + oldSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil
+		return fmt.Errorf("%w: %s could not be removed: %w",
+			ErrFallbackNotRemoved, s.binary+oldSuffix, err)
 	}
 	return nil
 }

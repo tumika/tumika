@@ -159,6 +159,15 @@ func (g *GitHub) Latest(ctx context.Context) (string, error) {
 func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
 	asset := g.AssetName(version)
 
+	// Sweep anything a previous attempt left behind.
+	//
+	// The deferred cleanup below only covers THIS call: a kill or a power cut
+	// mid-download leaves a partial file in the live binary's directory, and
+	// nothing else ever removes it. On the Pi + SD card this is written for,
+	// repeated failed updates accumulate ~20 MB each until the card is full.
+
+	sweepStagingFiles(filepath.Dir(dest))
+
 	want, err := g.checksum(ctx, version, asset)
 	if err != nil {
 		return err
@@ -264,6 +273,20 @@ func (g *GitHub) download(ctx context.Context, url string, w io.Writer) (string,
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// sweepStagingFiles removes leftovers from interrupted downloads.
+//
+// Best-effort throughout: this runs before an update, and failing to tidy is
+// never a reason to refuse one.
+func sweepStagingFiles(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, ".tumika-update-*"))
+	if err != nil {
+		return
+	}
+	for _, path := range matches {
+		_ = os.Remove(path)
+	}
 }
 
 // Newer reports whether candidate is a strictly greater version than current.

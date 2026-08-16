@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/tumika/tumika/source/internal/platform/release"
@@ -43,6 +44,10 @@ type Update struct {
 	// exit is closed once an update has been installed and the process should
 	// restart onto it.
 	exit chan struct{}
+	// exitOnce guards the close. The daemon drains for up to its shutdown grace
+	// after an update lands, so a tick can fire in that window and reach the
+	// close a second time — which panics the whole process, not just the runner.
+	exitOnce sync.Once
 	// jitter offsets the first check. Without it every tumika on earth would
 	// ask GitHub at the same moment after a coordinated restart.
 	jitter time.Duration
@@ -88,17 +93,25 @@ func (u *Update) Start(ctx context.Context) error {
 	u.once(ctx)
 
 	for {
+		// Checked at the TOP of every iteration, including immediately after the
+		// startup check above. Only testing it after a tick meant an update
+		// applied at startup left the loop running, so the next tick applied a
+		// second time — destroying the rollback fallback — and then closed an
+		// already-closed channel. Deterministic whenever the check interval is
+		// shorter than the daemon's drain, which is an operator-settable value.
+		select {
+		case <-u.exit:
+			return nil
+		default:
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-u.exit:
+			return nil
 		case <-ticker.C:
 			u.once(ctx)
-			select {
-			case <-u.exit:
-				// An update landed. Stop ticking; the daemon is shutting down.
-				return nil
-			default:
-			}
 		}
 	}
 }
@@ -149,5 +162,5 @@ func (u *Update) once(ctx context.Context) {
 
 	u.log.InfoContext(ctx, "update installed; exiting so the supervisor restarts onto it",
 		"version", available)
-	close(u.exit)
+	u.exitOnce.Do(func() { close(u.exit) })
 }

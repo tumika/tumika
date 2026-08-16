@@ -406,7 +406,6 @@ func String(ctx context.Context, cfg SettingGetter, key string) (string, error) 
 	return str, nil
 }
 
-// Bool reads a bool-kind setting, applying the default when unset.
 // SettingGetter is the single method the value helpers below need.
 //
 // They take this rather than ConfigService so a caller that only reads one
@@ -416,6 +415,7 @@ type SettingGetter interface {
 	Get(ctx context.Context, key string) (domain.SettingView, error)
 }
 
+// Bool reads a bool-kind setting, applying the default when unset.
 func Bool(ctx context.Context, cfg SettingGetter, key string) (bool, error) {
 	view, err := cfg.Get(ctx, key)
 	if err != nil {

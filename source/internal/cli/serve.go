@@ -31,6 +31,12 @@ func newServeCmd(g *globals) *cobra.Command {
 				Logger: g.logger,
 				Listen: listen,
 			})
+			// A rollback now happens during CONSTRUCTION, before migrations, so
+			// New can ask for a restart just as Serve can. Exiting zero is what
+			// makes the supervisor relaunch onto the restored binary.
+			if errors.Is(err, daemon.ErrRestartRequired) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}

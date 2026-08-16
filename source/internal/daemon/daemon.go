@@ -105,6 +105,37 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		return nil, err
 	}
 
+	// The previous boot is resolved FIRST — before migrations, before key
+	// custody, before the provider registry.
+	//
+	// Everything below this point is something a new binary can fail at: a bad
+	// migration, a changed key backend, a driver whose descriptor no longer
+	// validates. Resolving the update afterwards meant those failures never
+	// incremented the boot counter, so the rollback never fired and
+	// Restart=always looped forever — the exact "daemon that cannot start"
+	// outcome the design exists to prevent. The pre-flight cannot catch them
+	// either: `tumika version` never opens the database.
+	updates, err := newUpdateService(ctx, opts, store)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	if updates != nil {
+		rolledBack, bootErr := updates.ConfirmBoot(ctx)
+		if bootErr != nil {
+			// Not fatal on its own: a daemon that cannot read its update row can
+			// still do its job, and refusing to start would turn a bookkeeping
+			// problem into an outage. On a FRESH database the table does not
+			// exist yet, which is this same path and is entirely normal.
+			opts.Logger.WarnContext(ctx, "resolving the previous update failed", "err", bootErr)
+		}
+		if rolledBack {
+			_ = store.Close()
+			opts.Logger.WarnContext(ctx, "rolled back to the previous binary; exiting so the supervisor restarts onto it")
+			return nil, ErrRestartRequired
+		}
+	}
+
 	if err := sqlite.Migrate(ctx, store); err != nil {
 		// Closing here matters: New returning an error means the caller has no
 		// handle to close, and the writer connection holds a lock on the file.
@@ -188,29 +219,20 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// unit of deployment, so a container that rewrote its own binary would no
 	// longer match its tag (ADR-0003). Both leave updates nil, and the API says
 	// so rather than answering 404.
-	var updates service.UpdateService
+	// The runner is built here rather than beside the service above, because it
+	// needs the resolved check interval and therefore the config service — which
+	// does not exist until after migrations.
 	var updateRunner *runner.Update
-	switch {
-	case opts.Updates != nil:
-		updates = opts.Updates
-	case buildinfo.IsDev():
-		opts.Logger.InfoContext(ctx, "self-update disabled", "reason", "development build")
-	case paths.InContainer():
-		opts.Logger.InfoContext(ctx, "self-update disabled", "reason", "running in a container")
-	default:
-		binary, err := service.BinaryPath()
-		if err != nil {
-			_ = store.Close()
-			return nil, err
-		}
-		updates = service.NewUpdateService(
-			sqlite.NewUpdateStateRepo(store), release.NewGitHub(), store,
-			buildinfo.Version(), binary)
-
+	if updates != nil {
 		interval, err := service.Duration(ctx, config, service.KeyUpdateCheckInterval)
 		if err != nil {
 			_ = store.Close()
 			return nil, fmt.Errorf("resolve the update check interval: %w", err)
+		}
+		binary, err := service.BinaryPath()
+		if err != nil {
+			_ = store.Close()
+			return nil, err
 		}
 		// A jitter derived from the binary's own path, so a fleet restarted
 		// together does not ask GitHub in lockstep — and so the same host picks
@@ -290,26 +312,6 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		return fmt.Errorf("%w: run `tumika token rotate` to create one", service.ErrNoToken)
 	}
 
-	// Resolve whatever the previous process left behind, BEFORE binding a port.
-	//
-	// A pending update that has failed to boot enough times restores the
-	// previous binary and exits, so the supervisor relaunches onto it. Doing
-	// this after listening would mean a rolled-back daemon briefly served
-	// requests it was about to abandon.
-	if d.updates != nil {
-		rolledBack, err := d.updates.ConfirmBoot(ctx)
-		if err != nil {
-			// Not fatal: a daemon that cannot read its update row can still do
-			// its job, and refusing to start would turn a bookkeeping problem
-			// into an outage.
-			d.log.ErrorContext(ctx, "resolving the previous update failed", "err", err)
-		}
-		if rolledBack {
-			d.log.WarnContext(ctx, "rolled back to the previous binary; exiting so the supervisor restarts onto it")
-			return ErrRestartRequired
-		}
-	}
-
 	// Listen before announcing, so "listening" in the log means the port is
 	// actually bound rather than that we were about to try.
 	listener, err := net.Listen("tcp", addr)
@@ -357,18 +359,35 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
-	// The update is confirmed once the daemon is SERVING, not merely
-	// constructed. A binary that starts and then cannot bind, or dies on its
-	// first request, has proven nothing — and confirming early would delete the
-	// .old binary that a rollback needs.
+	// Confirmed once the listener is bound and the server is about to accept.
+	//
+	// Precisely what that proves, and does not: everything up to here has
+	// succeeded — migrations, key custody, the provider registry, seeding,
+	// resolving the listen address, and binding the port. That is the large
+	// majority of what a bad release breaks. It does NOT prove the binary can
+	// serve a REQUEST; a panic on first request is confirmed and its fallback
+	// deleted. Waiting for a request instead would mean a daemon nobody happens
+	// to call keeps a stale .old forever, which is its own failure.
 	if d.updates != nil {
 		if err := d.updates.Confirm(ctx); err != nil {
-			d.log.ErrorContext(ctx, "confirming the update failed", "err", err)
+			// A stale .old is worth saying out loud: the next Apply refuses to
+			// overwrite it, so an update would be blocked until it is removed.
+			d.log.WarnContext(ctx, "the update was confirmed but its fallback remains", "err", err)
 		}
 	}
 
 	// The update runner shares the server's lifetime. Cancelling runnerCtx on
 	// return stops it whether the server exited cleanly or not.
+	// DEFER ORDER MATTERS, and getting it wrong deadlocks the shutdown.
+	//
+	// Defers unwind last-in-first-out, so the wait is declared FIRST in order to
+	// run LAST: cancel, then wait. Declaring the wait after the cancel — the
+	// order that reads naturally — makes it run first, blocking on a runner that
+	// has not yet been told to stop. That hung the shutdown until the test
+	// timed out.
+	var runners sync.WaitGroup
+	defer runners.Wait()
+
 	runnerCtx, stopRunners := context.WithCancel(ctx)
 	defer stopRunners()
 
@@ -387,8 +406,15 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 		}
 	}()
 
+	// The runner is JOINED on the way out (see the WaitGroup above), not merely
+	// cancelled. It can be inside Apply, between the rename that sets the old
+	// binary aside and the rename that installs the new one — and exiting the
+	// process in that window leaves NO file at the binary path, so the
+	// supervisor has nothing to start.
 	if d.updateRunner != nil {
+		runners.Add(1)
 		go func() {
+			defer runners.Done()
 			if err := d.updateRunner.Start(runnerCtx); err != nil {
 				d.log.ErrorContext(runnerCtx, "the update runner stopped", "err", err)
 			}
@@ -443,6 +469,31 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 		}
 		return <-serveErr
 	}
+}
+
+// newUpdateService builds the updater, or nil where self-update does not apply.
+//
+// Separated from New's body so it can run immediately after the store opens —
+// the boot resolution has to happen before anything a new binary might fail at.
+func newUpdateService(ctx context.Context, opts Options, store *sqlite.Store) (service.UpdateService, error) {
+	switch {
+	case opts.Updates != nil:
+		return opts.Updates, nil
+	case buildinfo.IsDev():
+		opts.Logger.InfoContext(ctx, "self-update disabled", "reason", "development build")
+		return nil, nil
+	case paths.InContainer():
+		opts.Logger.InfoContext(ctx, "self-update disabled", "reason", "running in a container")
+		return nil, nil
+	}
+
+	binary, err := service.BinaryPath()
+	if err != nil {
+		return nil, err
+	}
+	return service.NewUpdateService(
+		sqlite.NewUpdateStateRepo(store), release.NewGitHub(), store,
+		buildinfo.Version(), binary), nil
 }
 
 // jitterFor spreads a fleet's update checks out.

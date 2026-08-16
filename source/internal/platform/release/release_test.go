@@ -442,3 +442,42 @@ func TestLatestWithAnUnreachableHost(t *testing.T) {
 		t.Fatal("an unreachable host reported a version")
 	}
 }
+
+// A kill or power cut mid-download leaves a partial file in the LIVE binary's
+// directory, and the deferred cleanup only covers the call that made it. On the
+// Pi + SD card this targets, repeated failed updates accumulate ~20 MB each
+// until the card is full.
+func TestFetchSweepsLeftoversFromInterruptedDownloads(t *testing.T) {
+	f := newFakeGitHub("1.2.3")
+	f.binary["1.2.3"] = "the new binary"
+	src := newTestSource(t, f)
+
+	dir := t.TempDir()
+	stale := []string{
+		filepath.Join(dir, ".tumika-update-111"),
+		filepath.Join(dir, ".tumika-update-222"),
+	}
+	for _, path := range stale {
+		if err := os.WriteFile(path, []byte("half a binary"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	// Something that is NOT ours must survive.
+	keep := filepath.Join(dir, "unrelated.txt")
+	if err := os.WriteFile(keep, []byte("not ours"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := src.Fetch(context.Background(), "1.2.3", filepath.Join(dir, "tumika")); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	for _, path := range stale {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s survived; leftovers accumulate until the disk fills", filepath.Base(path))
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("the sweep removed a file that was not ours")
+	}
+}

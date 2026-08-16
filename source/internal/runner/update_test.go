@@ -273,3 +273,56 @@ func TestName(t *testing.T) {
 
 var _ service.UpdateService = (*fakeUpdates)(nil)
 var _ service.SettingGetter = (*fakeConfig)(nil)
+
+// The runner must stop after applying, not keep ticking.
+//
+// It used to check Exit only AFTER a tick, so an update applied by the startup
+// check left the loop running: the next tick applied a second time — destroying
+// the rollback fallback — and then closed an already-closed channel, panicking
+// the whole process. Deterministic whenever the check interval is shorter than
+// the daemon's drain, and the interval is operator-settable with no minimum.
+func TestTheRunnerStopsAfterApplyingAndDoesNotPanic(t *testing.T) {
+	updates := &fakeUpdates{available: "0.2.0", newer: true}
+	r := runner.NewUpdate(updates, &fakeConfig{auto: true}, quietLogger(), 10*time.Millisecond, 0)
+
+	// A context that stays alive well past several ticks, standing in for the
+	// daemon's drain window.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				panicked <- p
+			}
+		}()
+		done <- r.Start(ctx)
+	}()
+
+	select {
+	case <-r.Exit():
+	case p := <-panicked:
+		t.Fatalf("the runner panicked: %v", p)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner never signalled a restart")
+	}
+
+	// It must return promptly rather than tick again — the daemon is draining,
+	// and a second apply in that window is what destroys the fallback.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Start returned %v", err)
+		}
+	case p := <-panicked:
+		t.Fatalf("the runner panicked after applying: %v", p)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the runner kept running after applying an update")
+	}
+
+	if got := updates.appliedVersions(); len(got) != 1 {
+		t.Errorf("applied %d times, want exactly 1: %v", len(got), got)
+	}
+}

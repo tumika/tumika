@@ -282,11 +282,25 @@ func TestUpdateStatusCommandShape(t *testing.T) {
 	}
 }
 
-// update-status opens the daemon, so on a machine with no home it fails rather
-// than reporting a state it never read.
-func TestUpdateStatusNeedsAResolvableHome(t *testing.T) {
-	if _, _, err := run(t, "--home", "relative-not-absolute", "update-status"); err == nil {
-		t.Skip("the home resolved anyway on this platform")
+// update-status runs end to end against a scratch home.
+//
+// On a test binary self-update is disabled, so the command reports that rather
+// than a state — which is the answer an operator on a development build should
+// get, and it exercises the whole command including withDaemon.
+//
+// An earlier version of this asserted that a RELATIVE --home is refused. It is
+// not: paths.Resolve calls filepath.Abs, so relative homes are supported by
+// design. The test skipped when err was nil and passed otherwise, so both
+// branches were green and it could never fail.
+func TestUpdateStatusRunsEndToEnd(t *testing.T) {
+	t.Setenv("TUMIKA_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+
+	out, _, err := run(t, "--home", t.TempDir(), "update-status")
+	if err != nil {
+		t.Fatalf("update-status: %v", err)
+	}
+	if !strings.Contains(out, "disabled") {
+		t.Errorf("output does not report that self-update is off:\n%s", out)
 	}
 }
 

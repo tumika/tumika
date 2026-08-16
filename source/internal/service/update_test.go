@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,7 +37,14 @@ func (f *fakeSource) Fetch(_ context.Context, version, dest string) error {
 	if !ok {
 		body = "binary " + version
 	}
-	return os.WriteFile(dest, []byte(body), 0o755) //nolint:gosec // a stand-in for an executable
+	if err := os.WriteFile(dest, []byte(body), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		return err
+	}
+	// Chmod explicitly, because WriteFile does NOT apply its mode to a file that
+	// already exists — and the real Fetch guarantees an executable file at dest.
+	// Without this the fake is more permissive than production in one direction
+	// and less in another, which is how a fake stops testing anything.
+	return os.Chmod(dest, 0o755) //nolint:gosec // a stand-in for an executable
 }
 
 // fakeUpdateRepo is the single-row state table, in memory.
@@ -610,5 +618,161 @@ func TestApplyWithARealExecThatCannotRun(t *testing.T) {
 	body, _ := os.ReadFile(binary) //nolint:gosec // a path this test created
 	if string(body) != "old" {
 		t.Error("the running binary was replaced by something that cannot execute")
+	}
+}
+
+// THE bug that would have bricked a daemon.
+//
+// After a successful apply this process still reports the OLD version — it is
+// still executing the old binary — so release.Newer stays true and a second
+// Apply used to sail straight through. It moved the NEW binary to .old and
+// installed the new one again, so .old held the broken version and a rollback
+// "restored" it. The daemon would crash-loop with no way back.
+//
+// Reachable from `tumika update` run twice, two concurrent POSTs, or the runner
+// racing the API.
+func TestASecondApplyCannotDestroyTheRollbackFallback(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+
+	if err := h.svc.Apply(t.Context(), "0.2.0"); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if got := h.read(t, h.binary+".old"); got != "binary 0.1.0" {
+		t.Fatalf(".old is %q after the first apply", got)
+	}
+
+	err := h.svc.Apply(t.Context(), "0.2.0")
+	if err == nil {
+		t.Fatal("a second apply was accepted while an update was already pending")
+	}
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Errorf("= %v, want ErrConflict", err)
+	}
+	// Two guards can stop this — the pending check and the refusal to clobber a
+	// stale .old — and they are NOT interchangeable to the person reading the
+	// message. Someone who ran `tumika update` twice needs "restart the
+	// service", not "remove this file once you are satisfied". Asserting the
+	// message is what keeps the pending guard load-bearing; without it, deleting
+	// that guard leaves every test green.
+	if !strings.Contains(err.Error(), "waiting for a restart") {
+		t.Errorf("the error tells the operator the wrong thing to do: %v", err)
+	}
+
+	// The fallback still points at the version that is known to work.
+	if got := h.read(t, h.binary+".old"); got != "binary 0.1.0" {
+		t.Errorf(".old is %q; the rollback fallback was destroyed", got)
+	}
+}
+
+// Concurrent applies are serialised and only one wins. Without the lock two
+// downloads race on the same staging path and both reach the renames.
+func TestConcurrentAppliesAreSerialised(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+
+	const callers = 5
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- h.svc.Apply(context.Background(), "0.2.0")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	succeeded := 0
+	for err := range errs {
+		if err == nil {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Errorf("%d of %d concurrent applies succeeded, want exactly 1", succeeded, callers)
+	}
+	if got := h.read(t, h.binary+".old"); got != "binary 0.1.0" {
+		t.Errorf(".old is %q; a concurrent apply destroyed the fallback", got)
+	}
+}
+
+// A stale .old with no pending update means the row and the filesystem
+// disagree. Overwriting it is how the fallback is lost, so it is refused.
+func TestApplyRefusesToClobberAStaleFallback(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	if err := os.WriteFile(h.binary+".old", []byte("binary 0.0.9"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := h.svc.Apply(t.Context(), "0.2.0"); err == nil {
+		t.Fatal("a stale fallback was overwritten")
+	}
+	if got := h.read(t, h.binary+".old"); got != "binary 0.0.9" {
+		t.Errorf(".old is %q, want the stale one left untouched", got)
+	}
+	if got := h.read(t, h.binary); got != "binary 0.1.0" {
+		t.Error("the running binary was replaced")
+	}
+}
+
+// The rollback row is written BEFORE the irreversible rename.
+//
+// Renaming first and failing to persist left the row saying `pending`, which
+// Confirm — during the very same startup — promoted to `confirmed`. An operator
+// would see "confirmed 0.1.0 → 0.2.0" on a machine running 0.1.0, with the
+// fallback deleted.
+func TestRollbackRecordsBeforeItRenames(t *testing.T) {
+	h := newHarness(t, "0.2.0")
+	if err := os.WriteFile(h.binary+".old", []byte("binary 0.1.0"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+	h.repo.state = domain.UpdateState{
+		Status: domain.UpdatePending, FromVersion: "0.1.0", ToVersion: "0.2.0",
+		BootAttempts: domain.MaxBootAttempts - 1,
+	}
+	h.repo.putErr = errors.New("database is locked")
+
+	if _, err := h.svc.ConfirmBoot(t.Context()); err == nil {
+		t.Fatal("a failed write reported a successful rollback")
+	}
+	// The rename did not happen, so the state and the filesystem still agree:
+	// the new binary is in place and still pending.
+	if got := h.read(t, h.binary); got != "binary 0.2.0" {
+		t.Errorf("the binary was swapped despite the state write failing: %q", got)
+	}
+}
+
+// A confirmed update whose fallback cannot be removed is still CONFIRMED — but
+// it says so, because the next Apply refuses to overwrite a stale .old.
+func TestConfirmReportsAFallbackItCannotRemove(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this relies on")
+	}
+
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "tumika")
+	for _, path := range []string{binary, binary + ".old"} {
+		if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+			t.Fatalf("write: %v", err)
+		}
+	}
+	// A read-only directory blocks the unlink without blocking the state write.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	repo := newUpdateRepo()
+	repo.state = domain.UpdateState{Status: domain.UpdatePending, ToVersion: "0.2.0"}
+	svc := service.NewUpdateService(repo, &fakeSource{contents: map[string]string{}},
+		&fakeTxer{}, "0.2.0", binary)
+
+	err := svc.Confirm(t.Context())
+	if !errors.Is(err, service.ErrFallbackNotRemoved) {
+		t.Fatalf("= %v, want ErrFallbackNotRemoved", err)
+	}
+	// The update is confirmed regardless: the row is what matters.
+	if repo.state.Status != domain.UpdateConfirmed {
+		t.Errorf("status = %q, want confirmed", repo.state.Status)
 	}
 }

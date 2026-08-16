@@ -631,19 +631,14 @@ func TestARolledBackUpdateStopsBeforeServing(t *testing.T) {
 	t.Cleanup(cancel)
 
 	updates := &stubUpdates{rollBack: true}
-	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
-	if err != nil {
-		t.Fatalf("daemon.New: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
 
-	if _, err := d.AuthService().Rotate(ctx); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-
-	err = d.Serve(ctx)
+	// The rollback now fires during CONSTRUCTION — before migrations, key
+	// custody or the provider registry, all of which a bad release can fail at.
+	// Resolving it later meant those failures never counted a boot attempt, so
+	// the rollback never fired at all.
+	_, err = daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
 	if !errors.Is(err, daemon.ErrRestartRequired) {
-		t.Fatalf("Serve = %v, want ErrRestartRequired", err)
+		t.Fatalf("daemon.New = %v, want ErrRestartRequired", err)
 	}
 	boots, confirms := updates.counts()
 	if boots != 1 {
@@ -687,7 +682,6 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 
 	// Confirm runs before the serve loop blocks, so it has happened by the time
 	// the API answers.
-	base := "http://" + listener.Addr().String()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, confirms := updates.counts(); confirms > 0 {
@@ -695,7 +689,9 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = base
+	if _, confirms := updates.counts(); confirms == 0 {
+		t.Fatal("the update was never confirmed")
+	}
 
 	cancel()
 	select {
@@ -711,6 +707,10 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 
 // A daemon that cannot read its update row still starts: refusing would turn a
 // bookkeeping problem into an outage.
+//
+// Driven through Serve, not ServeListener. The previous version of this test
+// called ServeListener, which never calls ConfirmBoot at all — so the stub's
+// error was never returned and a regression making it fatal would have passed.
 func TestAnUnreadableUpdateStateDoesNotStopTheDaemon(t *testing.T) {
 	useTestKeyCustody(t)
 
@@ -723,28 +723,28 @@ func TestAnUnreadableUpdateStateDoesNotStopTheDaemon(t *testing.T) {
 	t.Cleanup(cancel)
 
 	updates := &stubUpdates{confirmBootE: errors.New("database is locked")}
-	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
 	if err != nil {
-		t.Fatalf("daemon.New: %v", err)
+		t.Fatalf("daemon.New failed because the update row could not be read: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
+
+	if boots, _ := updates.counts(); boots != 1 {
+		t.Fatalf("ConfirmBoot ran %d times, want 1 — the error path was not exercised", boots)
+	}
 
 	if _, err := d.AuthService().Rotate(ctx); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
 	served := make(chan error, 1)
-	go func() { served <- d.ServeListener(ctx, listener) }()
+	go func() { served <- d.Serve(ctx) }()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	cancel()
 	select {
 	case err := <-served:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("the daemon failed to serve: %v", err)
 		}
 	case <-time.After(15 * time.Second):
