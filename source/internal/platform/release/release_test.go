@@ -415,7 +415,7 @@ func TestFetchWithAServerErrorOnTheBinary(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/releases/download/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "checksums.txt") {
-			fmt.Fprintf(w, "%s  tumika_1.2.3_linux_arm64\n", hex.EncodeToString(sum[:]))
+			_, _ = fmt.Fprintf(w, "%s  tumika_1.2.3_linux_arm64\n", hex.EncodeToString(sum[:]))
 			return
 		}
 		w.WriteHeader(http.StatusBadGateway)
