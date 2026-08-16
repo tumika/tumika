@@ -67,3 +67,14 @@ type LoginSession struct {
 	UpdatedAt time.Time
 	ExpiresAt time.Time
 }
+
+// LoginEvent is a step in an interactive login, streamed to the client so a UI
+// can follow along without polling. The PTY driver produces these; the login
+// session endpoints forward them.
+type LoginEvent struct {
+	State   LoginState `json:"state"`
+	AuthURL string     `json:"auth_url,omitempty"`
+	Prompt  string     `json:"prompt,omitempty"`
+	Message string     `json:"message,omitempty"`
+	Err     string     `json:"error,omitempty"`
+}

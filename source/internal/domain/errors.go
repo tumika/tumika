@@ -32,6 +32,10 @@ var (
 	// requested for a provider with no interactive auth method.
 	ErrInteractiveAuthUnsupported = errors.New("interactive auth unsupported")
 
+	// ErrInteractiveAuthRequired is the mirror image: a secret was submitted
+	// directly to a provider that only hands one over through a login session.
+	ErrInteractiveAuthRequired = errors.New("this provider requires an interactive login")
+
 	// ErrSchemaTooNew is returned when the database has been migrated by a newer
 	// binary than this one. tumika refuses to start rather than operate against
 	// a schema it does not understand — the safety net for a rollback after a
