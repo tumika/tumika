@@ -27,6 +27,15 @@ dependabot_auto_merge:
   schedule: 0 1 * * *
   max_bump: minor
   delete_branch: true
+  # Merge with a token from the org's bot App rather than GITHUB_TOKEN.
+  #
+  # GITHUB_TOKEN is a GitHub App installation token without the `workflows`
+  # permission, and that permission is not grantable — there is no `workflows:`
+  # key for a workflow's permissions block. So it cannot merge any PR touching
+  # .github/workflows/**, which is every github-actions bump Dependabot opens.
+  # Five of the six open here were exactly that, piling up with nothing able to
+  # land them.
+  github_app: true
 bulwark:
   enabled: true
 pipeline:
