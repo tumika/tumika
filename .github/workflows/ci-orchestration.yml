@@ -46,10 +46,15 @@ jobs:
     # A called workflow may only narrow these. Granting less than
     # reusable-attest declares fails the run at parse time, before any job
     # starts — so ci-gate never reports and every PR blocks.
+    #
+    # pull-requests: write is for the note attest leaves when it skips the
+    # pipeline. A skipped job is indistinguishable from a broken one at a
+    # glance, so the reason is said out loud on the pull request and withdrawn
+    # when it stops being true.
     permissions:
       contents: read
       statuses: read
-      pull-requests: read
+      pull-requests: write
 
   preflight:
     needs: [attest]
@@ -223,8 +228,11 @@ jobs:
           # tree of the merged result — which is exactly what a squash merge
           # puts on the default branch.
           tree=$(git rev-parse "HEAD^{tree}")
+          # target_url so a later run can link back to the one that did the
+          # work, rather than asserting an earlier run exists somewhere.
           gh api "repos/${REPO}/statuses/${SHA}" \
             -f state=success \
             -f context=gt/validated-tree \
-            -f description="$tree" >/dev/null
+            -f description="$tree" \
+            -f target_url="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}" >/dev/null
           echo "attested tree ${tree} on ${SHA}"
