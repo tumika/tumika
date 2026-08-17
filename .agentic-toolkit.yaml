@@ -1,5 +1,8 @@
 root: agentic
 extends:
-  - github.com/wardnet/agentic-stacks/wardnet.yaml@main
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/default.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/plannotator.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/serena.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/rtk.yaml
 mcp:
   - github.com/pedromvgomes/agentic-toolkit.git/definitions/mcp/chrome-devtools.yaml@main

@@ -1,8 +1,5 @@
 version: 2
 sources:
-- url: github.com/wardnet/agentic-stacks.git
-  ref: main
-  sha: 3a19c994319dd8a0d16db16629d19df46cd7e920
 - url: github.com/pedromvgomes/agentic-toolkit.git
   ref: main
   sha: d799db63c59db174486ff181f980009d45071c92
