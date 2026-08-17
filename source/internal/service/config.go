@@ -381,7 +381,7 @@ func mustMarshal(v any) json.RawMessage {
 // Duration reads a duration-kind setting, applying the default when unset. The
 // runners that schedule work take their intervals through this, so a bad stored
 // value cannot stop the daemon starting.
-func Duration(ctx context.Context, cfg ConfigService, key string) (time.Duration, error) {
+func Duration(ctx context.Context, cfg SettingGetter, key string) (time.Duration, error) {
 	view, err := cfg.Get(ctx, key)
 	if err != nil {
 		return 0, err
@@ -394,7 +394,7 @@ func Duration(ctx context.Context, cfg ConfigService, key string) (time.Duration
 }
 
 // String reads a string- or address-kind setting, applying the default when unset.
-func String(ctx context.Context, cfg ConfigService, key string) (string, error) {
+func String(ctx context.Context, cfg SettingGetter, key string) (string, error) {
 	view, err := cfg.Get(ctx, key)
 	if err != nil {
 		return "", err
@@ -406,8 +406,17 @@ func String(ctx context.Context, cfg ConfigService, key string) (string, error) 
 	return str, nil
 }
 
+// SettingGetter is the single method the value helpers below need.
+//
+// They take this rather than ConfigService so a caller that only reads one
+// setting is not handed the interface that can also read and write SECRETS.
+// ConfigService satisfies it, so nothing at a call site changes.
+type SettingGetter interface {
+	Get(ctx context.Context, key string) (domain.SettingView, error)
+}
+
 // Bool reads a bool-kind setting, applying the default when unset.
-func Bool(ctx context.Context, cfg ConfigService, key string) (bool, error) {
+func Bool(ctx context.Context, cfg SettingGetter, key string) (bool, error) {
 	view, err := cfg.Get(ctx, key)
 	if err != nil {
 		return false, err

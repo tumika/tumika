@@ -30,7 +30,17 @@ type Deps struct {
 	Providers service.ProviderService
 	Health    service.HealthService
 	Auth      TokenVerifier
-	Logger    *slog.Logger
+	// Updates is optional: nil disables the update endpoints and omits update
+	// state from /v1/version. A container has no supervisor to relaunch it, so
+	// there is nothing sensible for a self-update to do there (ADR-0003).
+	Updates service.UpdateService
+	// UpdateApplied is called after a successful apply, once the response has
+	// been written. The daemon uses it to shut down so the supervisor relaunches
+	// on the new binary — the handler never exits the process itself, or the
+	// caller would see a dropped connection and be unable to tell success from a
+	// crash.
+	UpdateApplied func()
+	Logger        *slog.Logger
 
 	// AllowedHosts are the Host header values accepted for a name-based
 	// request. Literal IPs are always accepted — they cannot be rebound.
@@ -54,6 +64,9 @@ func NewRouter(deps Deps) http.Handler {
 
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /v1/version", h.version)
+	mux.HandleFunc("GET /v1/update", h.updateState)
+	mux.HandleFunc("POST /v1/update/check", h.updateCheck)
+	mux.HandleFunc("POST /v1/update/apply", h.updateApply)
 	mux.HandleFunc("GET /v1/providers", h.listProviders)
 	mux.HandleFunc("GET /v1/providers/{id}", h.getProvider)
 	mux.HandleFunc("GET /v1/providers/{id}/preflight", h.providerPreflight)

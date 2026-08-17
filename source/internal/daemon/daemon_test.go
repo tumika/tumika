@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -551,5 +552,258 @@ func vendorFakeClaude(t *testing.T, p paths.Paths, authStatus ...string) {
 
 	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o700); err != nil {
 		t.Fatalf("write the stand-in claude: %v", err)
+	}
+}
+
+// stubUpdates drives the daemon's update paths without a network or a release.
+//
+// The counters are mutex-guarded because the daemon calls these from its own
+// goroutine while the test reads them — `go test -race` catches that, and it is
+// the test's bug rather than the daemon's.
+type stubUpdates struct {
+	mu           sync.Mutex
+	state        domain.UpdateState
+	rollBack     bool
+	confirmBoot  int
+	confirmed    int
+	confirmBootE error
+	available    string
+	applied      []string
+}
+
+func (s *stubUpdates) State(context.Context) (domain.UpdateState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state, nil
+}
+
+func (s *stubUpdates) Check(context.Context) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.available, s.available != "", nil
+}
+
+func (s *stubUpdates) Apply(_ context.Context, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = append(s.applied, version)
+	return nil
+}
+
+func (s *stubUpdates) ConfirmBoot(context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.confirmBoot++
+	return s.rollBack, s.confirmBootE
+}
+
+func (s *stubUpdates) Confirm(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.confirmed++
+	return nil
+}
+
+func (s *stubUpdates) appliedVersions() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.applied...)
+}
+
+func (s *stubUpdates) counts() (boots, confirms int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.confirmBoot, s.confirmed
+}
+
+// A rolled-back update must stop the daemon BEFORE it binds a port, so the
+// supervisor relaunches onto the restored binary. Serving first would mean a
+// daemon briefly answering requests it is about to abandon.
+func TestARolledBackUpdateStopsBeforeServing(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{rollBack: true}
+
+	// The rollback now fires during CONSTRUCTION — before migrations, key
+	// custody or the provider registry, all of which a bad release can fail at.
+	// Resolving it later meant those failures never counted a boot attempt, so
+	// the rollback never fired at all.
+	_, err = daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
+	if !errors.Is(err, daemon.ErrRestartRequired) {
+		t.Fatalf("daemon.New = %v, want ErrRestartRequired", err)
+	}
+	boots, confirms := updates.counts()
+	if boots != 1 {
+		t.Errorf("ConfirmBoot ran %d times, want 1", boots)
+	}
+	if confirms != 0 {
+		t.Error("a rolled-back update was confirmed")
+	}
+}
+
+// An update is confirmed once the daemon is SERVING, not merely constructed.
+func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{state: domain.UpdateState{Status: domain.UpdatePending}}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if _, err := d.AuthService().Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- d.ServeListener(ctx, listener) }()
+
+	// Confirm runs before the serve loop blocks, so it has happened by the time
+	// the API answers.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, confirms := updates.counts(); confirms > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, confirms := updates.counts(); confirms == 0 {
+		t.Fatal("the update was never confirmed")
+	}
+
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the daemon did not shut down")
+	}
+
+	if _, confirms := updates.counts(); confirms != 1 {
+		t.Errorf("Confirm ran %d times, want 1", confirms)
+	}
+}
+
+// A daemon that cannot read its update row still starts: refusing would turn a
+// bookkeeping problem into an outage.
+//
+// Driven through Serve, not ServeListener. The previous version of this test
+// called ServeListener, which never calls ConfirmBoot at all — so the stub's
+// error was never returned and a regression making it fatal would have passed.
+func TestAnUnreadableUpdateStateDoesNotStopTheDaemon(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{confirmBootE: errors.New("database is locked")}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("daemon.New failed because the update row could not be read: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if boots, _ := updates.counts(); boots != 1 {
+		t.Fatalf("ConfirmBoot ran %d times, want 1 — the error path was not exercised", boots)
+	}
+
+	if _, err := d.AuthService().Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- d.Serve(ctx) }()
+
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the daemon failed to serve: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the daemon did not shut down")
+	}
+}
+
+// An operator applying an update over HTTP gets a response FIRST, and then the
+// daemon shuts down so the supervisor relaunches onto the new binary.
+//
+// The order matters: exiting inside the handler would drop the connection, and
+// the operator could not tell a successful update from a crash.
+func TestApplyingAnUpdateOverHTTPRestartsTheDaemon(t *testing.T) {
+	useTestKeyCustody(t)
+
+	p, err := paths.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	updates := &stubUpdates{available: "0.2.0"}
+	d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	token, err := d.AuthService().Rotate(ctx)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- d.ServeListener(ctx, listener) }()
+
+	base := "http://" + listener.Addr().String()
+	status, body := request(t, token, http.MethodPost, base+"/v1/update/apply", "")
+	if status != http.StatusOK {
+		t.Fatalf("apply = %d: %s", status, body)
+	}
+	if got := updates.appliedVersions(); len(got) != 1 || got[0] != "0.2.0" {
+		t.Errorf("applied %v, want [0.2.0]", got)
+	}
+
+	// The daemon drains and then asks to be restarted — WITHOUT the context
+	// being cancelled, which is what distinguishes this from a shutdown.
+	select {
+	case err := <-served:
+		if !errors.Is(err, daemon.ErrRestartRequired) {
+			t.Errorf("ServeListener = %v, want ErrRestartRequired", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the daemon kept serving after an update was applied")
 	}
 }
