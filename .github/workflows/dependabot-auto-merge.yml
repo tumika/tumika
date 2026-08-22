@@ -34,5 +34,5 @@ jobs:
     # Both are optional and resolve to the empty string where the organization
     # has no bot App, which the called workflow treats as "not configured".
     secrets:
-      APP_ID: ${{ secrets.APP_ID }}
+      APP_CLIENT_ID: ${{ secrets.APP_CLIENT_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
