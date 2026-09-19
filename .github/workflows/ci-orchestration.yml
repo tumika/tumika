@@ -58,7 +58,7 @@ jobs:
 
   preflight:
     needs: [attest]
-    if: needs.attest.outputs.validated != 'true'
+    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push')
     uses: ./.github/workflows/ci-preflight.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -79,7 +79,7 @@ jobs:
 
   build:
     needs: [attest, preflight]
-    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-build != 'false'
+    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push') && needs.preflight.outputs.run-build != 'false'
     uses: ./.github/workflows/ci-build.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -100,7 +100,7 @@ jobs:
 
   test:
     needs: [attest, build, preflight]
-    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-test != 'false'
+    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push') && needs.preflight.outputs.run-test != 'false'
     uses: ./.github/workflows/ci-test.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -159,7 +159,11 @@ jobs:
     # ci-gate counts skipped as a pass. Without it a preflight that skips tests
     # would silently disable the security gate while the required check stayed
     # green. bulwark still runs *after* tests, to consume their coverage.
-    if: "!cancelled() && needs.attest.outputs.validated != 'true'"
+    # The push exemption is bulwark's baseline: it records one from a run on the
+    # merge-base, and without that every baseline falls back to measuring a bare
+    # worktree — which for a repo using `coverage.source: report` measures the
+    # wrong thing, or nothing at all.
+    if: "!cancelled() && (needs.attest.outputs.validated != 'true' || github.event_name == 'push')"
     uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
     # Named explicitly, NOT `inherit`. GitHub documents inherit as working for
     # "reusable workflows in the same organization or enterprise", and gt lives
