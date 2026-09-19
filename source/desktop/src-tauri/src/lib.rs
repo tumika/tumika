@@ -120,9 +120,9 @@ fn build_tray(app: &mut App) -> tauri::Result<()> {
 /// is black plus alpha and carries no colour of its own.
 const fn icon_bytes(kind: IconKind) -> &'static [u8] {
     match kind {
-        IconKind::AllClear => include_bytes!("../icons/tray-template.png"),
-        IconKind::NeedsYou => include_bytes!("../icons/tray-template.png"),
-        IconKind::Stopped => include_bytes!("../icons/tray-template.png"),
+        IconKind::AllClear => include_bytes!("../icons/tray-all-clear.png"),
+        IconKind::NeedsYou => include_bytes!("../icons/tray-needs-you.png"),
+        IconKind::Stopped => include_bytes!("../icons/tray-stopped.png"),
     }
 }
 
