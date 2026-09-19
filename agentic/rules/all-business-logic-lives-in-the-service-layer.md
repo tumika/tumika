@@ -4,17 +4,17 @@ description: "An HTTP handler decodes, calls exactly one service method, and enc
 
 # An HTTP handler decodes, calls exactly one service method, and encodes — nothing else
 
-Every handler in `source/internal/api` is transport code. Its whole job is:
+Every handler in `source/daemon/internal/api` is transport code. Its whole job is:
 
 1. decode the request (path values, query, JSON body — subject to the body cap),
 2. call **exactly one** service method,
 3. map the returned value or error onto a status code and encode the response.
 
-Anything that is not one of those three things belongs in `source/internal/service`.
+Anything that is not one of those three things belongs in `source/daemon/internal/service`.
 
 Concretely, a handler must never:
 
-- open a database handle, build SQL, or import `source/internal/repository` (depguard fails
+- open a database handle, build SQL, or import `source/daemon/internal/repository` (depguard fails
   the build if it does);
 - **branch on domain state** — `if cred.Status == "expired" { … }`, `if len(sessions) > 0 { … }`,
   "verify first, then store if it worked". Each of those is a business rule, and a rule split
@@ -33,11 +33,11 @@ that the CLI (which talks to the daemon over HTTP) can never reuse.
 
 | | |
 |---|---|
-| `source/internal/api/**` | the rule binds here |
-| `source/internal/service/**` | where the logic goes instead |
-| `.golangci.yml` (`depguard`) | mechanical enforcement: `api` may not import `repository` |
+| `source/daemon/internal/api/**` | the rule binds here |
+| `source/daemon/internal/service/**` | where the logic goes instead |
+| `source/daemon/.golangci.yml` (`depguard`) | mechanical enforcement: `api` may not import `repository` |
 
-`.golangci.yml` is the enforcement point for the import half of this rule. The
+`source/daemon/.golangci.yml` is the enforcement point for the import half of this rule. The
 "no branching on domain state" half is not mechanically checkable — it is a review rule, and
 it is the half that actually erodes.
 

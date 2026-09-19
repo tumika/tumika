@@ -56,20 +56,25 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       - name: go build
+        working-directory: source/daemon
         run: go build ./...
 
       - name: go vet
+        working-directory: source/daemon
         run: go vet ./...
 
       - name: go test
+        working-directory: source/daemon
         run: go test -race ./...
 
       # The deployment target, and the no-cgo invariant. Same reasoning as
       # ci-build.yml's cross-compile job: a release is exactly the wrong moment to
       # discover that linux/arm64 stopped building.
       - name: cross-compile
+        working-directory: source/daemon
         run: |
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             goos="${target%%/*}"; goarch="${target##*/}"
@@ -103,11 +108,12 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --config source/daemon/.goreleaser.yml --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

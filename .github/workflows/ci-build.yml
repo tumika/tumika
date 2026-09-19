@@ -27,8 +27,10 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       - name: go vet
+        working-directory: source/daemon
         run: go vet ./...
 
       # golangci-lint runs depguard, which is the mechanical enforcement of the
@@ -38,6 +40,7 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12.2
+          working-directory: source/daemon
 
   sqlc:
     name: sqlc
@@ -49,6 +52,7 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       # Installed from source at a pinned version rather than via a third-party
       # setup action: one fewer action to trust, and the version that generated
@@ -63,6 +67,7 @@ jobs:
       # mechanical rather than a habit — stale generated code otherwise fails at
       # the exact query, at runtime, on the one path nobody exercised.
       - name: sqlc diff
+        working-directory: source/daemon
         run: sqlc diff
 
   cross-compile:
@@ -83,12 +88,14 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       - name: build
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.target.goos }}
           GOARCH: ${{ matrix.target.goarch }}
+        working-directory: source/daemon
         run: go build ./...
 
       # Every leg, with this leg's GOOS/GOARCH: see the note above. CGO_ENABLED=1
@@ -98,6 +105,7 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.target.goos }}
           GOARCH: ${{ matrix.target.goarch }}
+        working-directory: source/daemon
         run: |
           cgo=$(go list -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' || true)
           if [ -n "$cgo" ]; then
@@ -211,6 +219,7 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       # release --snapshot, not build --snapshot: `build` produces no archives
       # and no checksums, which is most of what the next step verifies.
@@ -218,7 +227,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
-          args: release --snapshot --skip=publish --clean
+          args: release --config source/daemon/.goreleaser.yml --snapshot --skip=publish --clean
 
       # The names install.sh and `tumika update` depend on, and the ldflags that
       # decide whether self-update works at all. None of it is checked by the

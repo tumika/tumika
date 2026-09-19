@@ -76,7 +76,7 @@ claude -p "Reply with the single word: ok" --output-format json --max-turns 1 --
 
 | | |
 |---|---|
-| `source/internal/platform/provider/claudecode/` | the single `*exec.Cmd` constructor — the only place a `claude` process is built |
+| `source/daemon/internal/platform/provider/claudecode/` | the single `*exec.Cmd` constructor — the only place a `claude` process is built |
 | `…/claudecode` `Verify` | the two-stage check: `authMethod == "oauth_token"`, then `is_error` |
 | `…/claudecode` PTY login (step 14) | spawns through the same constructor; a PTY does not exempt it |
 | the precedence regression test | runs `Verify` with `ANTHROPIC_API_KEY` set in the daemon's own environment and asserts `authMethod` is still `oauth_token` |

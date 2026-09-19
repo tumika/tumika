@@ -7,8 +7,6 @@
 # It also keeps the layer cache from being busted by unrelated local changes.
 
 *
-!go.mod
-!go.sum
 !source/
 
 source/**/*_test.go
