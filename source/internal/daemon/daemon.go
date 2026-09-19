@@ -16,11 +16,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/tumika/tumika/source/internal/api"
 	"github.com/tumika/tumika/source/internal/platform/buildinfo"
+	"github.com/tumika/tumika/source/internal/platform/filelock"
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/provider"
 	"github.com/tumika/tumika/source/internal/platform/provider/anthropicapi"
@@ -178,7 +180,12 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// AuthService reaches settings through ConfigService rather than taking the
 	// repository: it is owned there, and a second writer would bypass the rules
 	// that live with it.
-	auth := service.NewAuthService(config, resolveTokenCustody(opts))
+	//
+	// The lock file lives in the Run directory, created by the layout above.
+	// It is what keeps two `tumika token rotate` processes from interleaving a
+	// rotation's hash write and its custody write.
+	auth := service.NewAuthService(config, resolveTokenCustody(opts),
+		filelock.New(filepath.Join(opts.Paths.Run, "token-rotate.lock")))
 
 	// Key custody is resolved at startup, not lazily: a daemon that cannot seal
 	// is a daemon that cannot store a credential, and finding that out on the

@@ -49,3 +49,6 @@ stores only the SHA-256.
 - Custody failure is non-fatal, so a Keychain that is locked or denied leaves the operator
   with the printed token and an app that cannot authenticate until the next rotate.
 - The daemon still cannot recover a token; only the Keychain copy and the printed one exist.
+- A rotation writes the hash and then the Keychain copy, so rotations are serialized across
+  processes by an advisory lock on a file under the Run directory; interleaved, two of them
+  would leave the Keychain holding a token the daemon rejects.

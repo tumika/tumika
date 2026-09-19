@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/tumika/tumika/source/internal/domain"
+	"github.com/tumika/tumika/source/internal/platform/filelock"
 	"github.com/tumika/tumika/source/internal/service"
 )
 
@@ -45,7 +49,7 @@ func newAuthWithCustody(t *testing.T, custody *fakeCustodian) (service.AuthServi
 	t.Helper()
 	cfg, _, _ := newService(t)
 	custody.cfg = cfg
-	return service.NewAuthService(cfg, custody), cfg, custody
+	return service.NewAuthService(cfg, custody, filelock.NewNoop()), cfg, custody
 }
 
 func TestRotateMintsAVerifiableToken(t *testing.T) {
@@ -263,6 +267,158 @@ func TestRotateStoresTheHashBeforeCallingCustody(t *testing.T) {
 	sum := sha256.Sum256([]byte(minted.Token))
 	if custody.hashAtStore != hex.EncodeToString(sum[:]) {
 		t.Errorf("hash at custody time = %q, want the new token's hash", custody.hashAtStore)
+	}
+}
+
+// recordingCustodian keeps the last token it was handed. It is the half of the
+// rotation the hash cannot speak for: the two writes have to describe the same
+// token, and only the custodian knows which one it received last.
+type recordingCustodian struct {
+	mu     sync.Mutex
+	calls  int
+	stored string
+}
+
+func (c *recordingCustodian) Store(_ context.Context, token string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	c.stored = token
+	return nil
+}
+
+func (c *recordingCustodian) last() (string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stored, c.calls
+}
+
+// syncConfigRepo is an in-memory repository that guards itself.
+//
+// Rotations are serialised through the filesystem, and the race detector sees
+// no happens-before edge in a flock: correctly serialised writes to an
+// unguarded map still trip it. Guarding the fake keeps the concurrency test
+// about the rotation's two writes.
+type syncConfigRepo struct {
+	mu   sync.Mutex
+	data map[string]domain.Setting
+}
+
+func newSyncRepo() *syncConfigRepo {
+	return &syncConfigRepo{data: map[string]domain.Setting{}}
+}
+
+func (r *syncConfigRepo) Get(_ context.Context, key string) (domain.Setting, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.data[key]
+	if !ok {
+		return domain.Setting{}, domain.ErrNotFound
+	}
+	return s, nil
+}
+
+func (r *syncConfigRepo) List(context.Context) ([]domain.Setting, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]domain.Setting, 0, len(r.data))
+	for _, s := range r.data {
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (r *syncConfigRepo) Upsert(_ context.Context, s domain.Setting) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.data[s.Key] = s
+	return nil
+}
+
+func (r *syncConfigRepo) Delete(_ context.Context, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.data, key)
+	return nil
+}
+
+// directTxer runs the callback with no bookkeeping, so the transaction
+// boundary itself is not a shared counter under concurrency.
+type directTxer struct{}
+
+func (directTxer) InTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
+
+// Concurrent rotations do not interleave their two writes.
+//
+// Unserialised, one rotation's hash lands with another's token in custody:
+// both callers are told they succeeded and the token an operator can retrieve
+// authenticates against nothing. The assertion is that the last token custody
+// received is the one the stored hash accepts.
+func TestConcurrentRotationsAgreeOnTheStoredToken(t *testing.T) {
+	cfg := service.NewConfigService(newSyncRepo(), directTxer{})
+	custody := &recordingCustodian{}
+	locker := filelock.New(filepath.Join(t.TempDir(), "token-rotate.lock"))
+	auth := service.NewAuthService(cfg, custody, locker)
+
+	const rotations = 8
+	var wg sync.WaitGroup
+	for range rotations {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := auth.Rotate(context.Background()); err != nil {
+				t.Errorf("Rotate: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	last, calls := custody.last()
+	if calls != rotations {
+		t.Fatalf("custody Store called %d times, want %d", calls, rotations)
+	}
+
+	ok, err := auth.Verify(t.Context(), last)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("the token left in custody does not match the stored hash")
+	}
+}
+
+// failingLocker refuses, standing in for a lock file that cannot be taken.
+type failingLocker struct{ err error }
+
+func (l failingLocker) Lock(context.Context) (func(), error) { return nil, l.err }
+
+// A rotation that cannot take the lock changes nothing: no hash is written and
+// custody is never offered a token, so the live credential is still the one the
+// operator holds.
+func TestRotateRefusesWhenTheLockCannotBeTaken(t *testing.T) {
+	cfg, _, _ := newService(t)
+	custody := &recordingCustodian{}
+	refused := errors.New("lock file is unwritable")
+	auth := service.NewAuthService(cfg, custody, failingLocker{err: refused})
+	ctx := t.Context()
+
+	minted, err := auth.Rotate(ctx)
+	if !errors.Is(err, refused) {
+		t.Fatalf("Rotate error = %v, want the locker's refusal", err)
+	}
+	if minted.Token != "" {
+		t.Error("Rotate returned a token it could not have stored")
+	}
+	if _, calls := custody.last(); calls != 0 {
+		t.Errorf("custody Store called %d times after a lock failure", calls)
+	}
+
+	configured, err := auth.Configured(ctx)
+	if err != nil {
+		t.Fatalf("Configured: %v", err)
+	}
+	if configured {
+		t.Error("a refused rotation wrote a token hash")
 	}
 }
 

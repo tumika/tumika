@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/tumika/tumika/source/internal/platform/filelock"
 	"github.com/tumika/tumika/source/internal/platform/tokencustody"
 )
 
@@ -53,6 +54,7 @@ type AuthService interface {
 	// Rotate mints a new token, replacing any existing one, and returns the
 	// plaintext together with the outcome of handing it to the platform's
 	// secret store. A custody failure is reported in the result, not as an error.
+	// Rotations are serialised against each other, including across processes.
 	Rotate(ctx context.Context) (RotateResult, error)
 	// Configured reports whether a token has been set.
 	Configured(ctx context.Context) (bool, error)
@@ -63,6 +65,7 @@ type AuthService interface {
 type authService struct {
 	cfg     ConfigService
 	custody tokencustody.Custodian
+	locker  filelock.Locker
 }
 
 // NewAuthService builds the service.
@@ -76,11 +79,27 @@ type authService struct {
 // The Custodian is the platform's secret store. It is injected rather than
 // selected here so a test never reaches a real keystore — see
 // platform/tokencustody.
-func NewAuthService(cfg ConfigService, custody tokencustody.Custodian) AuthService {
-	return &authService{cfg: cfg, custody: custody}
+//
+// The Locker serialises rotations; see Rotate for what it guards.
+func NewAuthService(cfg ConfigService, custody tokencustody.Custodian, locker filelock.Locker) AuthService {
+	return &authService{cfg: cfg, custody: custody, locker: locker}
 }
 
 func (s *authService) Rotate(ctx context.Context) (RotateResult, error) {
+	// One rotation at a time, across processes. `tumika token rotate` runs in
+	// its own process, and a rotation is two writes — the hash, then custody.
+	// Interleaved, two of them leave the hash from one rotation and the
+	// Keychain copy from the other: both report success, and the token the
+	// operator can retrieve is one the daemon rejects.
+	//
+	// The lock is taken before anything is minted, so a caller that cannot
+	// take it has changed nothing.
+	unlock, err := s.locker.Lock(ctx)
+	if err != nil {
+		return RotateResult{}, fmt.Errorf("serialize token rotation: %w", err)
+	}
+	defer unlock()
+
 	raw := make([]byte, tokenBytes)
 	if _, err := rand.Read(raw); err != nil {
 		return RotateResult{}, fmt.Errorf("generate API token: %w", err)
