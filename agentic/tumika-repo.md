@@ -277,6 +277,11 @@ the real login Keychain and writes a key into it, so `go test ./...` would mutat
 the Keychain of whoever ran it. Unit tests use the constructors; anything that
 builds a `daemon` sets `TUMIKA_MASTER_KEY` (see `useTestKeyCustody`).
 
+The API token's Keychain copy follows the same rule from the other direction:
+`daemon.Options.TokenCustody` nil means store nothing, and only `cli.Execute`
+supplies `tokencustody.New()`. A test that builds a daemon or a command tree
+gets the no-op without asking.
+
 **There is no fallback off the Keychain on macOS, deliberately.** A locked
 keychain or a denied prompt fails the daemon closed. Falling back to a file would
 find no key, mint a fresh one, start cleanly — and be unable to open a single
