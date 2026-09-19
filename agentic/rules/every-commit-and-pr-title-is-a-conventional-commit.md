@@ -1,3 +1,7 @@
+---
+description: "Every commit message and every pull request title is a Conventional Commit"
+---
+
 # Every commit message and every pull request title is a Conventional Commit
 
 This repository follows the [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/)
@@ -19,7 +23,7 @@ are what this repo uses.
 |---|---|---|
 | `feat` | a new feature | MINOR |
 | `fix` | a bug fix | PATCH |
-| `docs` | documentation only — including `AGENTS.md`, `.agents/rules/`, ADRs | — |
+| `docs` | documentation only — including `agentic/tumika-repo.md`, `agentic/rules/`, ADRs | — |
 | `style` | formatting that does not change meaning — rare here, `gofmt` settles it | — |
 | `refactor` | a change that neither fixes a bug nor adds a feature | — |
 | `perf` | a change that improves performance | — |

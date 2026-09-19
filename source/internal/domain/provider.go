@@ -54,7 +54,7 @@ type Descriptor struct {
 // It is derived from AuthMethods rather than stored, so it cannot disagree with
 // them. The driver's AuthMethods must in turn match the interfaces it actually
 // implements — see
-// .agents/rules/provider-drivers-declare-capabilities-by-interface.md.
+// agentic/rules/provider-drivers-declare-capabilities-by-interface.md.
 func (d Descriptor) RequiresInteractiveAuth() bool {
 	for _, m := range d.AuthMethods {
 		if m.Interactive() {
@@ -119,6 +119,6 @@ type ProviderView struct {
 	Selected                bool `json:"selected"`
 	// Credential is the non-secret half of the live credential, or nil when
 	// none is stored. The secret never appears here — see
-	// .agents/rules/never-log-or-return-a-credential-secret.md.
+	// agentic/rules/never-log-or-return-a-credential-secret.md.
 	Credential *CredentialMeta `json:"credential,omitempty"`
 }

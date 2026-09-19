@@ -1,3 +1,7 @@
+---
+description: "Every spawned `claude` process is credential-isolated, and its auth method is asserted afterwards"
+---
+
 # Every spawned `claude` process is credential-isolated, and its auth method is asserted afterwards
 
 There is exactly one place in tumika that builds a `*exec.Cmd` for the vendored `claude`
@@ -31,7 +35,7 @@ login flow parses that version's TUI output; a silent self-update is a silent br
 also why the binary is executed by **absolute path**, with no launcher symlink that could be
 repointed.
 
-Bumping the pin is routine and expected (see `AGENTS.md`, "Bumping the pin"). What must never
+Bumping the pin is routine and expected (see `agentic/tumika-repo.md`, "Bumping the pin"). What must never
 happen is the version moving **without** the transcripts and the parser moving with it.
 
 > This one is not hypothetical either, and it did not take long. The version pinned during the

@@ -32,7 +32,7 @@ jobs:
         run: go vet ./...
 
       # golangci-lint runs depguard, which is the mechanical enforcement of the
-      # layering rules in .agents/rules/ and ADR-0004. A forbidden import fails
+      # layering rules in agentic/rules/ and ADR-0004. A forbidden import fails
       # the build here rather than becoming a review argument.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -59,7 +59,7 @@ jobs:
 
       # Fails when the committed generated code disagrees with the queries or
       # the schema. That is what makes
-      # .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md
+      # agentic/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md
       # mechanical rather than a habit — stale generated code otherwise fails at
       # the exact query, at runtime, on the one path nobody exercised.
       - name: sqlc diff

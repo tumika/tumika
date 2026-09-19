@@ -252,7 +252,7 @@ func truncate(s string) string {
 //
 // The last four characters, which is enough for an operator to tell two keys
 // apart and useless to anyone else. See
-// .agents/rules/never-log-or-return-a-credential-secret.md.
+// agentic/rules/never-log-or-return-a-credential-secret.md.
 func hint(secret string) string {
 	const shown = 4
 	if len(secret) <= shown {

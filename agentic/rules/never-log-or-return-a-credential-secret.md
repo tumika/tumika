@@ -1,3 +1,7 @@
+---
+description: "A credential secret never crosses the API boundary, never reaches a log, and never rests unsealed"
+---
+
 # A credential secret never crosses the API boundary, never reaches a log, and never rests unsealed
 
 A secret — an OAuth token, an API key, the auth code pasted during login — exists in plaintext

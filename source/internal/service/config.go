@@ -4,7 +4,7 @@
 // Services depend on repository and platform *interfaces*, never on their
 // implementations — which is what lets business logic be tested against
 // in-memory fakes with no database and no HTTP. See
-// .agents/rules/all-business-logic-lives-in-the-service-layer.md.
+// agentic/rules/all-business-logic-lives-in-the-service-layer.md.
 package service
 
 import (

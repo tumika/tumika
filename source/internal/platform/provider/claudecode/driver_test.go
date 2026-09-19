@@ -26,7 +26,7 @@ const testVersion = "2.1.233"
 //
 // It records its own argv and environment before answering, which is what makes
 // the isolation policy testable: the guarantees in
-// .agents/rules/every-spawned-claude-process-is-credential-isolated.md are all
+// agentic/rules/every-spawned-claude-process-is-credential-isolated.md are all
 // statements about how the child process is built, and the only way to check
 // them is to ask the child.
 type fake struct {

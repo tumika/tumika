@@ -1,3 +1,7 @@
+---
+description: "A provider declares what it can do by implementing an interface, and its AuthMethods must match"
+---
+
 # A provider declares what it can do by implementing an interface, and its AuthMethods must match
 
 Provider capabilities are discovered by **type assertion in the registry**, never by a boolean

@@ -227,7 +227,7 @@ var sensitiveKeys = []string{
 // It is exported because redaction is required at capture time as well as at log
 // time: the PTY transcript of an interactive login contains the OAuth token by
 // construction, and is scrubbed before it is ever persisted. See
-// .agents/rules/never-log-or-return-a-credential-secret.md — this is a backstop
+// agentic/rules/never-log-or-return-a-credential-secret.md — this is a backstop
 // against mistakes, never a licence to pass a secret to a log call.
 func Redact(s string) string {
 	s = redactPrefixedTokens(s)

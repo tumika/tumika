@@ -45,7 +45,7 @@ func (s CredentialStatus) Live() bool {
 
 // Credential carries the plaintext secret. It never crosses the API boundary,
 // is never logged, and is deliberately not JSON-tagged — see
-// .agents/rules/never-log-or-return-a-credential-secret.md.
+// agentic/rules/never-log-or-return-a-credential-secret.md.
 type Credential struct {
 	ID         int64
 	ProviderID string

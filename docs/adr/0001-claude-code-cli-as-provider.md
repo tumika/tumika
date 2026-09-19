@@ -60,7 +60,7 @@ than the default.
   settings-file key `apiKeyHelper` *above* `CLAUDE_CODE_OAUTH_TOKEN`, so a scrubbed environment
   is not sufficient protection. Mitigated by `--setting-sources ''` on every invocation plus an
   assertion that `authMethod == "oauth_token"`, with a dedicated regression test. See
-  `.agents/rules/every-spawned-claude-process-is-credential-isolated.md`.
+  `agentic/rules/every-spawned-claude-process-is-credential-isolated.md`.
 - **We accept 320 MB per installed version** (the `linux-arm64` binary), which is material on a
   Raspberry Pi's SD card. Retention is capped at two versions. Claude Code also wants 4 GB+ of
   RAM, so the Pi model has to be checked before deploying.

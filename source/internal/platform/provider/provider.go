@@ -4,7 +4,7 @@
 // registry discovers that by type assertion — never by a boolean field, never by
 // a switch on the provider ID, and never by a method that exists only to return
 // "not supported". See
-// .agents/rules/provider-drivers-declare-capabilities-by-interface.md.
+// agentic/rules/provider-drivers-declare-capabilities-by-interface.md.
 package provider
 
 import (

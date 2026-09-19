@@ -1,7 +1,7 @@
 // Package runner holds the supervised long-lived processes the daemon owns.
 //
 // A runner depends on SERVICES, never on repositories — see
-// .agents/rules/runners-depend-on-services-never-repositories.md. It is the
+// agentic/rules/runners-depend-on-services-never-repositories.md. It is the
 // scheduling and lifecycle half; every decision belongs to the service it calls.
 package runner
 

@@ -21,7 +21,7 @@ const ID = "claude-code"
 //
 // Shape validation only. A well-formed token that has been revoked still fails
 // at Verify, which is the only source of truth — see
-// .agents/rules/every-spawned-claude-process-is-credential-isolated.md.
+// agentic/rules/every-spawned-claude-process-is-credential-isolated.md.
 const tokenPrefix = "sk-ant-oat01-" // #nosec G101 -- the public prefix of a token format, not a token
 
 // minTokenLength is a floor, not a specification: enough to reject a truncated
@@ -530,7 +530,7 @@ func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
 // hint is the only part of a token that may be shown or stored in the clear:
 // the last four characters, enough to tell two apart and useless to anyone else.
-// See .agents/rules/never-log-or-return-a-credential-secret.md.
+// See agentic/rules/never-log-or-return-a-credential-secret.md.
 func hint(secret string) string {
 	const shown = 4
 	if len(secret) <= shown {

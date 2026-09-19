@@ -4,7 +4,7 @@
 // business rules, returns domain types rather than rows, and never calls a
 // service — `depguard` enforces the import half of that. Each interface here has
 // exactly one owning service; when a service needs data owned by another, it
-// calls that service. See .agents/rules/a-repository-has-exactly-one-owning-service.md.
+// calls that service. See agentic/rules/a-repository-has-exactly-one-owning-service.md.
 //
 // | Service        | Owns                                      |
 // |----------------|-------------------------------------------|

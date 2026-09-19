@@ -47,7 +47,7 @@ enforces is an architecture with a half-life.
   `repository`; `platform` may not import `service`, `repository` or `api`; `domain` imports
   none of ours. A violation is a red build.
 
-- **The rules live in `.agents/rules/`**, one intent-named file each, in the agentic toolkit's
+- **The rules live in `agentic/rules/`**, one intent-named file each, in the agentic toolkit's
   existing convention — so `wrap-session` maintains them and every agent loads them
   automatically. Each layering rule names `.golangci.yml` as its enforcement point under
   `## Applies to`, and the two change in the same commit.

@@ -18,7 +18,7 @@ import (
 // Injected at release time via -ldflags "-X main.version=… -X main.commit=… -X main.date=…".
 //
 // Keep these names and this package stable: goreleaser writes them, and the
-// self-updater short-circuits on the "dev" default (AGENTS.md, "Version
+// self-updater short-circuits on the "dev" default (agentic/tumika-repo.md, "Version
 // injection").
 var (
 	version = "dev"
