@@ -29,10 +29,10 @@ how a data model with rules degrades into a table with two writers.
 
 | | |
 |---|---|
-| `source/internal/service/**` | constructors take only their own repositories |
-| `source/internal/daemon/**` | the composition root; the only place repositories are wired, and therefore the only place this rule can be violated by construction |
-| `source/internal/runner/**` | never receives a repository at all — see `runners-depend-on-services-never-repositories.md` |
-| `.golangci.yml` (`depguard`) | enforces the coarse half: `runner` and `api` may not import `repository` at all. Cross-service repository sharing is **not** mechanically detectable — it is caught in `daemon`'s wiring at review time |
+| `source/daemon/internal/service/**` | constructors take only their own repositories |
+| `source/daemon/internal/daemon/**` | the composition root; the only place repositories are wired, and therefore the only place this rule can be violated by construction |
+| `source/daemon/internal/runner/**` | never receives a repository at all — see `runners-depend-on-services-never-repositories.md` |
+| `source/daemon/.golangci.yml` (`depguard`) | enforces the coarse half: `runner` and `api` may not import `repository` at all. Cross-service repository sharing is **not** mechanically detectable — it is caught in `daemon`'s wiring at review time |
 
 ## Example
 

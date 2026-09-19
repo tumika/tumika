@@ -20,14 +20,14 @@
 # comment together, so the version stays readable.
 FROM golang@sha256:ab563819a16cfe5faff0f96a8bb598fbb0e400ab2ac751996e60abcb23b106a3 AS build
 
-WORKDIR /src
+WORKDIR /src/source/daemon
 
 # Modules first, so a source-only change does not re-download the dependency
 # graph on every build.
-COPY go.mod go.sum ./
+COPY source/daemon/go.mod source/daemon/go.sum ./
 RUN go mod download
 
-COPY source/ ./source/
+COPY source/daemon/ ./
 
 # CGO_ENABLED=0 is a project invariant, not a container convenience: the daemon
 # cross-compiles for the Pi and modernc.org/sqlite is pure Go precisely so it
@@ -42,7 +42,7 @@ RUN CGO_ENABLED=0 go build \
         -X main.version=${VERSION} \
         -X main.commit=${COMMIT} \
         -X main.date=${BUILD_DATE}" \
-      -o /out/tumika ./source/cmd/tumika
+      -o /out/tumika ./cmd/tumika
 
 # --- runtime (debian:trixie-slim) --------------------------------------------
 #

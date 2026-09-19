@@ -28,8 +28,8 @@ case "${TARGET_ARCH:-$(uname -m)}" in
 esac
 
 echo "==> building the linux binary ($ARCH)"
-( cd "$ROOT" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
-    go build -o /tmp/tumika-linux ./source/cmd/tumika )
+( cd "$ROOT/source/daemon" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
+    go build -o /tmp/tumika-linux ./cmd/tumika )
 
 echo "==> building the harness image"
 podman build -q -t tumika-harness -f "$HERE/Dockerfile" "$HERE" >/dev/null

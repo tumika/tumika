@@ -32,11 +32,11 @@ claim is, whether a crashed run is retried), and every one belongs to a service.
 
 | | |
 |---|---|
-| `source/internal/runner/**` | the rule binds here |
+| `source/daemon/internal/runner/**` | the rule binds here |
 | `UpdateRunner` | calls `UpdateService.Check` / `Apply`, not `UpdateStateRepository` |
 | `CredentialMonitorRunner` | calls `ProviderService.VerifyCredential`, not `CredentialRepository.UpdateStatus` |
-| `source/internal/daemon/**` | wires runners; the only place the dependency could be passed |
-| `.golangci.yml` (`depguard`) | mechanical enforcement: `runner` may not import `repository` |
+| `source/daemon/internal/daemon/**` | wires runners; the only place the dependency could be passed |
+| `source/daemon/.golangci.yml` (`depguard`) | mechanical enforcement: `runner` may not import `repository` |
 
 ## Example
 
