@@ -1,18 +1,55 @@
 package service_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/tumika/tumika/source/internal/domain"
+	"github.com/tumika/tumika/source/internal/platform/filelock"
 	"github.com/tumika/tumika/source/internal/service"
 )
 
+// fakeCustodian stands in for the platform's secret store, so no test ever
+// reaches a real keystore. It can refuse, which is the interesting case: a
+// custody failure must not cost the caller the token.
+type fakeCustodian struct {
+	err    error
+	calls  int
+	stored string
+
+	// cfg and hashAtStore record the stored hash as it stood when Store ran.
+	// That is how the ordering is pinned: custody must not be offered a token
+	// the daemon does not yet accept.
+	cfg         service.ConfigService
+	hashAtStore string
+}
+
+func (c *fakeCustodian) Store(ctx context.Context, token string) error {
+	c.calls++
+	c.stored = token
+	if c.cfg != nil {
+		c.hashAtStore, _ = c.cfg.ReadSecret(ctx, service.KeyAPITokenHash)
+	}
+	return c.err
+}
+
 func newAuth(t *testing.T) (service.AuthService, service.ConfigService) {
 	t.Helper()
+	auth, cfg, _ := newAuthWithCustody(t, &fakeCustodian{})
+	return auth, cfg
+}
+
+func newAuthWithCustody(t *testing.T, custody *fakeCustodian) (service.AuthService, service.ConfigService, *fakeCustodian) {
+	t.Helper()
 	cfg, _, _ := newService(t)
-	return service.NewAuthService(cfg), cfg
+	custody.cfg = cfg
+	return service.NewAuthService(cfg, custody, filelock.NewNoop()), cfg, custody
 }
 
 func TestRotateMintsAVerifiableToken(t *testing.T) {
@@ -27,10 +64,11 @@ func TestRotateMintsAVerifiableToken(t *testing.T) {
 		t.Fatal("a fresh install must have no token")
 	}
 
-	token, err := auth.Rotate(ctx)
+	minted, err := auth.Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	if !strings.HasPrefix(token, service.TokenPrefix) {
 		t.Errorf("token %q lacks the %q prefix that makes it redactable by shape", token, service.TokenPrefix)
@@ -54,10 +92,11 @@ func TestOnlyTheHashIsStored(t *testing.T) {
 	auth, cfg := newAuth(t)
 	ctx := t.Context()
 
-	token, err := auth.Rotate(ctx)
+	minted, err := auth.Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	stored, err := cfg.ReadSecret(ctx, service.KeyAPITokenHash)
 	if err != nil {
@@ -77,10 +116,11 @@ func TestVerifyRejectsEverythingElse(t *testing.T) {
 	auth, _ := newAuth(t)
 	ctx := t.Context()
 
-	token, err := auth.Rotate(ctx)
+	minted, err := auth.Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	for _, presented := range []string{
 		"",
@@ -113,14 +153,14 @@ func TestRotateInvalidatesThePreviousToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Rotate: %v", err)
 	}
-	if first == second {
+	if first.Token == second.Token {
 		t.Fatal("Rotate returned the same token twice")
 	}
 
-	if ok, _ := auth.Verify(ctx, first); ok {
+	if ok, _ := auth.Verify(ctx, first.Token); ok {
 		t.Error("the previous token still verifies after a rotation")
 	}
-	if ok, _ := auth.Verify(ctx, second); !ok {
+	if ok, _ := auth.Verify(ctx, second.Token); !ok {
 		t.Error("the new token does not verify")
 	}
 }
@@ -151,13 +191,247 @@ func TestTokensAreUnique(t *testing.T) {
 	seen := make(map[string]struct{}, 32)
 
 	for range 32 {
-		token, err := auth.Rotate(t.Context())
+		minted, err := auth.Rotate(t.Context())
 		if err != nil {
 			t.Fatalf("Rotate: %v", err)
 		}
+		token := minted.Token
 		if _, dup := seen[token]; dup {
 			t.Fatal("Rotate produced a duplicate token")
 		}
 		seen[token] = struct{}{}
+	}
+}
+
+func TestRotateHandsTheTokenToCustody(t *testing.T) {
+	auth, _, custody := newAuthWithCustody(t, &fakeCustodian{})
+
+	minted, err := auth.Rotate(t.Context())
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if custody.calls != 1 {
+		t.Fatalf("custody Store called %d times, want once", custody.calls)
+	}
+	if custody.stored != minted.Token {
+		t.Error("custody was handed a different token than the caller was")
+	}
+	if minted.CustodyErr != nil {
+		t.Errorf("CustodyErr = %v on a working custodian", minted.CustodyErr)
+	}
+}
+
+// Custody is the backup copy, not the credential. A store that refuses must
+// still leave the caller with a usable token to print, because the hash is
+// already live by then and no second chance to read the plaintext exists.
+func TestRotateSurvivesACustodyFailure(t *testing.T) {
+	refused := errors.New("keystore is locked")
+	auth, cfg, _ := newAuthWithCustody(t, &fakeCustodian{err: refused})
+	ctx := t.Context()
+
+	minted, err := auth.Rotate(ctx)
+	if err != nil {
+		t.Fatalf("Rotate returned an error for a custody failure: %v", err)
+	}
+	if minted.Token == "" {
+		t.Fatal("Rotate returned no token after a custody failure")
+	}
+	if !errors.Is(minted.CustodyErr, refused) {
+		t.Errorf("CustodyErr = %v, want the custodian's refusal", minted.CustodyErr)
+	}
+
+	stored, err := cfg.ReadSecret(ctx, service.KeyAPITokenHash)
+	if err != nil {
+		t.Fatalf("ReadSecret: %v", err)
+	}
+	sum := sha256.Sum256([]byte(minted.Token))
+	if stored != hex.EncodeToString(sum[:]) {
+		t.Error("the hash of the returned token is not the one stored")
+	}
+
+	if ok, _ := auth.Verify(ctx, minted.Token); !ok {
+		t.Error("the token does not verify after a custody failure")
+	}
+}
+
+// The hash lands before custody is offered the token. The other order puts a
+// token in the operator's keystore that the daemon would reject.
+func TestRotateStoresTheHashBeforeCallingCustody(t *testing.T) {
+	auth, _, custody := newAuthWithCustody(t, &fakeCustodian{})
+
+	minted, err := auth.Rotate(t.Context())
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	sum := sha256.Sum256([]byte(minted.Token))
+	if custody.hashAtStore != hex.EncodeToString(sum[:]) {
+		t.Errorf("hash at custody time = %q, want the new token's hash", custody.hashAtStore)
+	}
+}
+
+// recordingCustodian keeps the last token it was handed. It is the half of the
+// rotation the hash cannot speak for: the two writes have to describe the same
+// token, and only the custodian knows which one it received last.
+type recordingCustodian struct {
+	mu     sync.Mutex
+	calls  int
+	stored string
+}
+
+func (c *recordingCustodian) Store(_ context.Context, token string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	c.stored = token
+	return nil
+}
+
+func (c *recordingCustodian) last() (string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stored, c.calls
+}
+
+// syncConfigRepo is an in-memory repository that guards itself.
+//
+// Rotations are serialised through the filesystem, and the race detector sees
+// no happens-before edge in a flock: correctly serialised writes to an
+// unguarded map still trip it. Guarding the fake keeps the concurrency test
+// about the rotation's two writes.
+type syncConfigRepo struct {
+	mu   sync.Mutex
+	data map[string]domain.Setting
+}
+
+func newSyncRepo() *syncConfigRepo {
+	return &syncConfigRepo{data: map[string]domain.Setting{}}
+}
+
+func (r *syncConfigRepo) Get(_ context.Context, key string) (domain.Setting, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.data[key]
+	if !ok {
+		return domain.Setting{}, domain.ErrNotFound
+	}
+	return s, nil
+}
+
+func (r *syncConfigRepo) List(context.Context) ([]domain.Setting, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]domain.Setting, 0, len(r.data))
+	for _, s := range r.data {
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (r *syncConfigRepo) Upsert(_ context.Context, s domain.Setting) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.data[s.Key] = s
+	return nil
+}
+
+func (r *syncConfigRepo) Delete(_ context.Context, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.data, key)
+	return nil
+}
+
+// directTxer runs the callback with no bookkeeping, so the transaction
+// boundary itself is not a shared counter under concurrency.
+type directTxer struct{}
+
+func (directTxer) InTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
+
+// Concurrent rotations do not interleave their two writes.
+//
+// Unserialised, one rotation's hash lands with another's token in custody:
+// both callers are told they succeeded and the token an operator can retrieve
+// authenticates against nothing. The assertion is that the last token custody
+// received is the one the stored hash accepts.
+func TestConcurrentRotationsAgreeOnTheStoredToken(t *testing.T) {
+	cfg := service.NewConfigService(newSyncRepo(), directTxer{})
+	custody := &recordingCustodian{}
+	locker := filelock.New(filepath.Join(t.TempDir(), "token-rotate.lock"))
+	auth := service.NewAuthService(cfg, custody, locker)
+
+	const rotations = 8
+	var wg sync.WaitGroup
+	for range rotations {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := auth.Rotate(context.Background()); err != nil {
+				t.Errorf("Rotate: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	last, calls := custody.last()
+	if calls != rotations {
+		t.Fatalf("custody Store called %d times, want %d", calls, rotations)
+	}
+
+	ok, err := auth.Verify(t.Context(), last)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !ok {
+		t.Fatal("the token left in custody does not match the stored hash")
+	}
+}
+
+// failingLocker refuses, standing in for a lock file that cannot be taken.
+type failingLocker struct{ err error }
+
+func (l failingLocker) Lock(context.Context) (func(), error) { return nil, l.err }
+
+// A rotation that cannot take the lock changes nothing: no hash is written and
+// custody is never offered a token, so the live credential is still the one the
+// operator holds.
+func TestRotateRefusesWhenTheLockCannotBeTaken(t *testing.T) {
+	cfg, _, _ := newService(t)
+	custody := &recordingCustodian{}
+	refused := errors.New("lock file is unwritable")
+	auth := service.NewAuthService(cfg, custody, failingLocker{err: refused})
+	ctx := t.Context()
+
+	minted, err := auth.Rotate(ctx)
+	if !errors.Is(err, refused) {
+		t.Fatalf("Rotate error = %v, want the locker's refusal", err)
+	}
+	if minted.Token != "" {
+		t.Error("Rotate returned a token it could not have stored")
+	}
+	if _, calls := custody.last(); calls != 0 {
+		t.Errorf("custody Store called %d times after a lock failure", calls)
+	}
+
+	configured, err := auth.Configured(ctx)
+	if err != nil {
+		t.Fatalf("Configured: %v", err)
+	}
+	if configured {
+		t.Error("a refused rotation wrote a token hash")
+	}
+}
+
+// A custody error is reported, and reporting it must not be how the token
+// escapes. Everything the caller can surface is checked, not just the message.
+func TestCustodyErrorNeverCarriesTheToken(t *testing.T) {
+	auth, _, _ := newAuthWithCustody(t, &fakeCustodian{err: errors.New("keystore is locked")})
+
+	minted, err := auth.Rotate(t.Context())
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if strings.Contains(minted.CustodyErr.Error(), minted.Token) {
+		t.Fatal("the custody error carries the token")
 	}
 }

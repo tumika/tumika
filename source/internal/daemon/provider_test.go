@@ -57,10 +57,11 @@ func startWithProvider(t *testing.T, upstream http.HandlerFunc) (string, string,
 		}
 	})
 
-	token, err := d.AuthService().Rotate(ctx)
+	minted, err := d.AuthService().Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

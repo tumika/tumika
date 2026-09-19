@@ -13,6 +13,7 @@ import (
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
 	"github.com/tumika/tumika/source/internal/platform/servicemgr"
+	"github.com/tumika/tumika/source/internal/service"
 )
 
 // managerFactory builds the platform's service manager. A variable so the
@@ -104,7 +105,7 @@ func newInstallCmd(g *globals) *cobra.Command {
 			// a crash loop — so a fresh install would report success and leave
 			// systemd restarting a failing unit every five seconds forever.
 			// Found by running the install under a real systemd.
-			token, err := ensureAPIToken(g, cmd)
+			minted, err := ensureAPIToken(g, cmd)
 			if err != nil {
 				return err
 			}
@@ -112,7 +113,8 @@ func newInstallCmd(g *globals) *cobra.Command {
 			// stored, so an install that fails after this point would otherwise
 			// leave a daemon with a token nobody has ever seen — and a re-run
 			// finds one configured and prints nothing.
-			printToken(cmd, token)
+			printToken(cmd, minted.Token)
+			warnTokenCustody(cmd, minted.CustodyErr)
 
 			if err := mgr.Install(cmd.Context(), cfg); err != nil {
 				return err
@@ -163,6 +165,23 @@ func printToken(cmd *cobra.Command, token string) {
 		return
 	}
 	printf(cmd, "\nYour API token (shown once, only its hash is stored):\n\n  %s\n\n", token)
+}
+
+// warnTokenCustody reports that the platform's secret store would not take the
+// token.
+//
+// Always called AFTER the token itself has been printed: custody is the backup
+// copy, and a warning about it is worthless to an operator who was never shown
+// the copy they have to keep. It goes to stderr so `token rotate --quiet`
+// stays pipeable, and it carries the failure, never the token.
+func warnTokenCustody(cmd *cobra.Command, err error) {
+	if err == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+		"Warning: the API token could not be saved to this platform's secret store: %v\n", err)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+		"Keep the copy printed above; only its hash is stored and it cannot be shown again.\n")
 }
 
 // sealKeyIfSupported seals a host-bound master key, when the host can.
@@ -223,10 +242,11 @@ func sealKeyIfSupported(cmd *cobra.Command, p paths.Paths, user string) (string,
 }
 
 // ensureAPIToken mints a token when there is none, and returns it so install can
-// print it. An existing token is left alone and "" comes back: rotating on every
-// install would break every client an operator already configured.
-func ensureAPIToken(g *globals, cmd *cobra.Command) (string, error) {
-	var token string
+// print it. An existing token is left alone and a zero result comes back:
+// rotating on every install would break every client an operator already
+// configured.
+func ensureAPIToken(g *globals, cmd *cobra.Command) (service.RotateResult, error) {
+	var minted service.RotateResult
 
 	err := withDaemon(g, cmd, func(d *daemon.Daemon) error {
 		configured, err := d.AuthService().Configured(cmd.Context())
@@ -236,10 +256,10 @@ func ensureAPIToken(g *globals, cmd *cobra.Command) (string, error) {
 		if configured {
 			return nil
 		}
-		token, err = d.AuthService().Rotate(cmd.Context())
+		minted, err = d.AuthService().Rotate(cmd.Context())
 		return err
 	})
-	return token, err
+	return minted, err
 }
 
 // installedBinary is the copy the service will run.

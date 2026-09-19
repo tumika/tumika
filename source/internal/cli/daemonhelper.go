@@ -18,7 +18,14 @@ func withDaemon(g *globals, cmd *cobra.Command, fn func(*daemon.Daemon) error) e
 		return err
 	}
 
-	d, err := daemon.New(cmd.Context(), daemon.Options{Paths: p, Logger: g.logger})
+	d, err := daemon.New(cmd.Context(), daemon.Options{
+		Paths:  p,
+		Logger: g.logger,
+		// Nil unless Execute supplied one, and nil means store nothing — so
+		// `token rotate` and `install` reach the platform secret store from a
+		// real invocation and from nowhere else.
+		TokenCustody: g.tokenCustody,
+	})
 	if err != nil {
 		return err
 	}

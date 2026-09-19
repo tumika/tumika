@@ -16,17 +16,20 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/tumika/tumika/source/internal/api"
 	"github.com/tumika/tumika/source/internal/platform/buildinfo"
+	"github.com/tumika/tumika/source/internal/platform/filelock"
 	"github.com/tumika/tumika/source/internal/platform/paths"
 	"github.com/tumika/tumika/source/internal/platform/provider"
 	"github.com/tumika/tumika/source/internal/platform/provider/anthropicapi"
 	"github.com/tumika/tumika/source/internal/platform/provider/claudecode"
 	"github.com/tumika/tumika/source/internal/platform/release"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
+	"github.com/tumika/tumika/source/internal/platform/tokencustody"
 	"github.com/tumika/tumika/source/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/internal/runner"
 	"github.com/tumika/tumika/source/internal/service"
@@ -65,6 +68,24 @@ type Options struct {
 	// updates nil and ConfirmBoot, Confirm and the restart-on-update path are
 	// never exercised until a real release runs them on someone's machine.
 	Updates service.UpdateService
+
+	// TokenCustody is the platform secret store the minted API token is handed
+	// to. Nil means store nothing.
+	//
+	// The zero value is the safe one, and that direction is deliberate: the real
+	// custodian on macOS writes into the login Keychain of whoever is running
+	// the process, so a daemon built without asking for custody — every test
+	// that builds one, including ones not written yet — leaves the Keychain
+	// alone. Only the real entry point supplies tokencustody.New().
+	TokenCustody tokencustody.Custodian
+}
+
+// resolveTokenCustody applies the nil-means-no-op rule for Options.TokenCustody.
+func resolveTokenCustody(opts Options) tokencustody.Custodian {
+	if opts.TokenCustody == nil {
+		return tokencustody.NewNoop()
+	}
+	return opts.TokenCustody
 }
 
 // Daemon owns the process-wide resources: the database and the HTTP server.
@@ -159,7 +180,12 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// AuthService reaches settings through ConfigService rather than taking the
 	// repository: it is owned there, and a second writer would bypass the rules
 	// that live with it.
-	auth := service.NewAuthService(config)
+	//
+	// The lock file lives in the Run directory, created by the layout above.
+	// It is what keeps two `tumika token rotate` processes from interleaving a
+	// rotation's hash write and its custody write.
+	auth := service.NewAuthService(config, resolveTokenCustody(opts),
+		filelock.New(filepath.Join(opts.Paths.Run, "token-rotate.lock")))
 
 	// Key custody is resolved at startup, not lazily: a daemon that cannot seal
 	// is a daemon that cannot store a credential, and finding that out on the
