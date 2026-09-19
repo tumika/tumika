@@ -24,6 +24,18 @@ on:
   # On the default branch an already-validated tree skips every stage.
   push:
     branches: [main]
+  # Unconditional, and load-bearing. A queued pull request reports its required
+  # check from this event and no other, so a repository whose orchestrator lacks
+  # it would sit in the queue forever waiting on a check nothing can report —
+  # and the governance stage that would have said so is inside that same check.
+  #
+  # Rendered even where there is no queue — most repositories cannot have one,
+  # since GitHub offers them only on organization-owned public repositories —
+  # so the file is ready before the rule that needs it. `gt repo settings apply`
+  # withholds the queue rule until this trigger is on the default branch, which
+  # is what makes that ordering a guarantee rather than a habit. An unused
+  # trigger costs nothing.
+  merge_group:
   workflow_dispatch:
 
 # Superseded pushes to the same PR are cancelled; runs on the default branch and
@@ -58,7 +70,7 @@ jobs:
 
   preflight:
     needs: [attest]
-    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push')
+    if: needs.attest.outputs.validated != 'true'
     uses: ./.github/workflows/ci-preflight.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -72,14 +84,14 @@ jobs:
     # dependencies from GitHub Packages during install, and a called workflow
     # can only narrow what the caller grants — a stage cannot ask for it back.
     # Read-only, so granting it where it is unused costs nothing. A stage
-    # needing more than this is a gt change.
+    # needing more says so in pipeline.ci.stage_permissions.
     permissions:
       contents: read
       packages: read
 
   build:
     needs: [attest, preflight]
-    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push') && needs.preflight.outputs.run-build != 'false'
+    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-build != 'false'
     uses: ./.github/workflows/ci-build.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -93,14 +105,14 @@ jobs:
     # dependencies from GitHub Packages during install, and a called workflow
     # can only narrow what the caller grants — a stage cannot ask for it back.
     # Read-only, so granting it where it is unused costs nothing. A stage
-    # needing more than this is a gt change.
+    # needing more says so in pipeline.ci.stage_permissions.
     permissions:
       contents: read
       packages: read
 
   test:
     needs: [attest, build, preflight]
-    if: (needs.attest.outputs.validated != 'true' || github.event_name == 'push') && needs.preflight.outputs.run-test != 'false'
+    if: needs.attest.outputs.validated != 'true' && needs.preflight.outputs.run-test != 'false'
     uses: ./.github/workflows/ci-test.yml
     # `inherit` rather than an enumerated `secrets:` block, and semgrep's
     # secrets-inherit rule is answered rather than silenced: gt renders this
@@ -114,7 +126,7 @@ jobs:
     # dependencies from GitHub Packages during install, and a called workflow
     # can only narrow what the caller grants — a stage cannot ask for it back.
     # Read-only, so granting it where it is unused costs nothing. A stage
-    # needing more than this is a gt change.
+    # needing more says so in pipeline.ci.stage_permissions.
     permissions:
       contents: read
       packages: read
@@ -135,7 +147,7 @@ jobs:
     # dependencies from GitHub Packages during install, and a called workflow
     # can only narrow what the caller grants — a stage cannot ask for it back.
     # Read-only, so granting it where it is unused costs nothing. A stage
-    # needing more than this is a gt change.
+    # needing more says so in pipeline.ci.stage_permissions.
     permissions:
       contents: read
       packages: read
@@ -159,11 +171,7 @@ jobs:
     # ci-gate counts skipped as a pass. Without it a preflight that skips tests
     # would silently disable the security gate while the required check stayed
     # green. bulwark still runs *after* tests, to consume their coverage.
-    # The push exemption is bulwark's baseline: it records one from a run on the
-    # merge-base, and without that every baseline falls back to measuring a bare
-    # worktree — which for a repo using `coverage.source: report` measures the
-    # wrong thing, or nothing at all.
-    if: "!cancelled() && (needs.attest.outputs.validated != 'true' || github.event_name == 'push')"
+    if: "!cancelled() && needs.attest.outputs.validated != 'true'"
     uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
     # Named explicitly, NOT `inherit`. GitHub documents inherit as working for
     # "reusable workflows in the same organization or enterprise", and gt lives
