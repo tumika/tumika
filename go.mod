@@ -12,7 +12,7 @@ require (
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/spf13/cobra v1.10.2
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/mod v0.40.0
+	golang.org/x/mod v0.41.0
 	modernc.org/sqlite v1.58.0
 )
 
