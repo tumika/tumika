@@ -44,10 +44,10 @@ can return a documented code:
 
 | | |
 |---|---|
-| `source/internal/platform/provider/` | the interfaces and the registry's type assertions |
-| `source/internal/platform/provider/claudecode/` | `Provider`, `HealthChecker`, `StaticAuthenticator` (`manual_token`), `Installer`, and (step 14) `InteractiveAuthenticator` |
-| `source/internal/platform/provider/anthropicapi/` | `Provider`, `HealthChecker`, `StaticAuthenticator` (`api_key`) — and nothing else |
-| `source/internal/service/` (`ProviderService`) | where the sentinel errors originate |
+| `source/daemon/internal/platform/provider/` | the interfaces and the registry's type assertions |
+| `source/daemon/internal/platform/provider/claudecode/` | `Provider`, `HealthChecker`, `StaticAuthenticator` (`manual_token`), `Installer`, and (step 14) `InteractiveAuthenticator` |
+| `source/daemon/internal/platform/provider/anthropicapi/` | `Provider`, `HealthChecker`, `StaticAuthenticator` (`api_key`) — and nothing else |
+| `source/daemon/internal/service/` (`ProviderService`) | where the sentinel errors originate |
 | the provider conformance test suite | run against **every** driver; asserts descriptor validity and the `AuthMethods` ⟺ interfaces correspondence |
 
 ## Example

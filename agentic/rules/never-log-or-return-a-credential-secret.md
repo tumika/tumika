@@ -78,13 +78,13 @@ defaults the AAD to `nil` defeats the whole scheme, so there is not one.
 
 | | |
 |---|---|
-| `source/internal/domain` | `Credential` (secret, never serialised) vs `CredentialMeta` (safe, JSON-tagged) |
-| `source/internal/api/**` | encodes `CredentialMeta` only; the `sk-ant-` response assertion lives here |
-| `source/internal/platform/logging` | the redaction `slog.Handler` — the backstop |
-| `source/internal/platform/tokencustody` | the only writer of the API token's Keychain copy |
-| `source/internal/platform/secrets` | `Seal`/`Open`, AAD binding, key custody per backend |
-| `source/internal/platform/provider/claudecode/` | PTY transcript redaction at capture time |
-| `source/internal/service/` (`ProviderService`, `LoginService`) | the only layers that hold plaintext |
+| `source/daemon/internal/domain` | `Credential` (secret, never serialised) vs `CredentialMeta` (safe, JSON-tagged) |
+| `source/daemon/internal/api/**` | encodes `CredentialMeta` only; the `sk-ant-` response assertion lives here |
+| `source/daemon/internal/platform/logging` | the redaction `slog.Handler` — the backstop |
+| `source/daemon/internal/platform/tokencustody` | the only writer of the API token's Keychain copy |
+| `source/daemon/internal/platform/secrets` | `Seal`/`Open`, AAD binding, key custody per backend |
+| `source/daemon/internal/platform/provider/claudecode/` | PTY transcript redaction at capture time |
+| `source/daemon/internal/service/` (`ProviderService`, `LoginService`) | the only layers that hold plaintext |
 
 ## Example
 

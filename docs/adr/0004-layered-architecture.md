@@ -42,18 +42,18 @@ enforces is an architecture with a half-life.
   API surface, one set of business rules, and the CLI works identically against a local or a
   remote daemon.
 
-- **`depguard` in `.golangci.yml` is the enforcement point.** `api` may not import
+- **`depguard` in `source/daemon/.golangci.yml` is the enforcement point.** `api` may not import
   `repository`; `repository` may not import `service` or `api`; `runner` may not import
   `repository`; `platform` may not import `service`, `repository` or `api`; `domain` imports
   none of ours. A violation is a red build.
 
 - **The rules live in `agentic/rules/`**, one intent-named file each, in the agentic toolkit's
   existing convention — so `wrap-session` maintains them and every agent loads them
-  automatically. Each layering rule names `.golangci.yml` as its enforcement point under
+  automatically. Each layering rule names `source/daemon/.golangci.yml` as its enforcement point under
   `## Applies to`, and the two change in the same commit.
 
 - **All source lives under `/source`**, with one `go.mod` at the repo root. `internal/`
-  visibility is scoped to its own parent, so `source/internal/...` is importable throughout
+  visibility is scoped to its own parent, so `source/daemon/internal/...` is importable throughout
   `source/`, which is all of our code.
 
 ## Considered alternatives
@@ -85,7 +85,7 @@ enforces is an architecture with a half-life.
 - Cross-service calls form a directed graph (`LoginService → ProviderService`,
   `HealthService → ProviderService`). A change that needs a reverse edge is a signal that two
   services are really one, or that a third is missing — not a reason to inject the repository.
-- Changing a layering rule requires editing `.golangci.yml`, the corresponding rule file, and
+- Changing a layering rule requires editing `source/daemon/.golangci.yml`, the corresponding rule file, and
   the code, together. That friction is intentional.
 - Stage 2 slots in without structural change: `WorkflowRunner` implements `Runner`, and
   `Inferencer` is added to the provider drivers as another optional capability interface.

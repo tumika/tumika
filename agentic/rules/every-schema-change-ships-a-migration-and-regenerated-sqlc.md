@@ -5,7 +5,7 @@ description: "A schema change ships its goose migration and its regenerated sqlc
 # A schema change ships its goose migration and its regenerated sqlc output in the same commit
 
 The database schema has exactly one source of truth: the goose migrations in
-`source/internal/repository/migrations/`, embedded with `//go:embed` and applied by the daemon
+`source/daemon/internal/repository/migrations/`, embedded with `//go:embed` and applied by the daemon
 at startup. There is no hand-maintained `schema.sql` that drifts, and no `CREATE TABLE`
 executed anywhere else.
 
@@ -54,10 +54,10 @@ dangling operator.
 
 | | |
 |---|---|
-| `source/internal/repository/migrations/*.sql` | goose migrations, `//go:embed`ed; append-only once released |
-| `source/internal/repository/queries/*.sql` | sqlc input |
-| `source/internal/repository/sqlite/**` | **generated** — never hand-edit; regenerate |
-| `sqlc.yaml` | engine `sqlite`; changing it means regenerating everything |
+| `source/daemon/internal/repository/migrations/*.sql` | goose migrations, `//go:embed`ed; append-only once released |
+| `source/daemon/internal/repository/queries/*.sql` | sqlc input |
+| `source/daemon/internal/repository/sqlite/**` | **generated** — never hand-edit; regenerate |
+| `source/daemon/sqlc.yaml` | engine `sqlite`; changing it means regenerating everything |
 | `repository/sqlite/generated_test.go` | guards the ASCII rule above, and that no generated query is truncated |
 | `.github/workflows/ci.yml` (`sqlc` job) | enforcement point: `sqlc diff` must be clean |
 | `UpdateService.ConfirmBoot` / daemon startup | the schema-version guard and the pre-migration backup |

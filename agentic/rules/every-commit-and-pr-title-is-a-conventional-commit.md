@@ -74,7 +74,6 @@ well as `revert: …`. Nobody should be editing a PR title during an incident.
 |---|---|
 | every commit message | the subject line |
 | **every pull request title** | this is the one that is easy to forget, and the one that matters most — see `## Why` |
-| the **Merge Commit Message** section required in each PR description | it becomes a commit, so it follows the same format |
 | `.github/workflows/pr-title.yml` | **enforcement point** — rejects a non-conforming PR title, and re-runs on `edited` so a correction clears it immediately |
 | `.github/dependabot.yml` | keeps automated PRs inside the convention rather than exempt from it |
 | release automation, if it is added later | `feat`/`fix`/`BREAKING CHANGE` are what a changelog or a semver bump would be derived from |

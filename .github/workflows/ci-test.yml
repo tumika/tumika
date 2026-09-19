@@ -35,8 +35,10 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+          cache-dependency-path: source/daemon/go.sum
 
       - name: go build
+        working-directory: source/daemon
         run: go build ./...
 
       # -coverpkg=./... credits coverage across package boundaries.
@@ -47,7 +49,8 @@ jobs:
       # of it counted. That understated the real figure by about five points and
       # made the coverage gates argue with reality rather than with the code.
       - name: go test
-        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+        working-directory: source/daemon
+        run: go test -race -coverpkg=./... -coverprofile="$GITHUB_WORKSPACE/coverage.out" ./...
 
       # Only the Linux profile feeds the coverage gate, so the baseline is
       # measured the same way every time. Build-tagged files for the other

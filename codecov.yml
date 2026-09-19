@@ -9,16 +9,16 @@ ignore:
   # against a code generator's output rather than against our queries — and the
   # queries themselves are covered through the repository tests that use them.
   # `sqlc diff` in CI is what guards this code, not coverage.
-  - "source/internal/repository/sqlite/*.sql.go"
-  - "source/internal/repository/sqlite/db.go"
-  - "source/internal/repository/sqlite/models.go"
+  - "source/daemon/internal/repository/sqlite/*.sql.go"
+  - "source/daemon/internal/repository/sqlite/db.go"
+  - "source/daemon/internal/repository/sqlite/models.go"
 
   # The provider conformance suite. It is a test helper that happens to live in
   # a normal package so every driver's tests can call it, and most of its
   # branches are t.Errorf calls that execute ONLY when a driver is broken. A
   # green suite therefore cannot cover them, and making them coverable would
   # mean deliberately shipping a broken driver.
-  - "source/internal/platform/provider/providertest"
+  - "source/daemon/internal/platform/provider/providertest"
 
 coverage:
   status:
