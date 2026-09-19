@@ -1,0 +1,49 @@
+/* The window is transparent and frameless, so the document paints no background
+   of its own: only `.popover` is visible, and its corners are the window's. */
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  /* A frameless window has no title bar to drag by, and a popover is not moved
+     by the user anyway. */
+  user-select: none;
+  cursor: default;
+}
+
+.popover {
+  box-sizing: border-box;
+  height: 100%;
+  padding: 16px;
+  border-radius: 12px;
+  background: #ffffff;
+  color: #1c1c1e;
+}
+
+.popover h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.status {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: #6e6e73;
+}
+
+@media (prefers-color-scheme: dark) {
+  .popover {
+    background: #1e1e1e;
+    color: #f5f5f7;
+  }
+
+  .status {
+    color: #a1a1a6;
+  }
+}
