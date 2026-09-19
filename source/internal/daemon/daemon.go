@@ -27,6 +27,7 @@ import (
 	"github.com/tumika/tumika/source/internal/platform/provider/claudecode"
 	"github.com/tumika/tumika/source/internal/platform/release"
 	"github.com/tumika/tumika/source/internal/platform/secrets"
+	"github.com/tumika/tumika/source/internal/platform/tokencustody"
 	"github.com/tumika/tumika/source/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/internal/runner"
 	"github.com/tumika/tumika/source/internal/service"
@@ -159,7 +160,7 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// AuthService reaches settings through ConfigService rather than taking the
 	// repository: it is owned there, and a second writer would bypass the rules
 	// that live with it.
-	auth := service.NewAuthService(config)
+	auth := service.NewAuthService(config, tokencustody.NewNoop())
 
 	// Key custody is resolved at startup, not lazily: a daemon that cannot seal
 	// is a daemon that cannot store a credential, and finding that out on the

@@ -49,7 +49,7 @@ func newTokenRotateCmd(g *globals) *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withDaemon(g, cmd, func(d *daemon.Daemon) error {
-				token, err := d.AuthService().Rotate(cmd.Context())
+				res, err := d.AuthService().Rotate(cmd.Context())
 				if err != nil {
 					return err
 				}
@@ -59,12 +59,14 @@ func newTokenRotateCmd(g *globals) *cobra.Command {
 				// exactly what the redaction rules exist to prevent — and not
 				// into a file, so the only copy is the one the operator keeps.
 				if quiet {
-					printf(cmd, "%s\n", token)
+					printf(cmd, "%s\n", res.Token)
+					warnTokenCustody(cmd, res.CustodyErr)
 					return nil
 				}
 
-				printf(cmd, "New API token (shown once, store it now):\n\n  %s\n\n", token)
+				printf(cmd, "New API token (shown once, store it now):\n\n  %s\n\n", res.Token)
 				printf(cmd, "Use it as: Authorization: Bearer <token>\n")
+				warnTokenCustody(cmd, res.CustodyErr)
 				return nil
 			})
 		},
