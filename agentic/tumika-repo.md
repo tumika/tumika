@@ -69,6 +69,7 @@ source/internal/platform/release/       # ReleaseSource (self-update)
 source/internal/platform/paths/         # filesystem layout resolution
 source/internal/platform/logging/       # slog setup + secret redaction handler
 source/internal/platform/buildinfo/     # version/commit/date, injected at build time
+source/desktop/                         # macOS tray app (Tauri: Rust core + React popover); not Go
 deploy/Dockerfile                       # shipped image (tumika as PID 1)
 deploy/verify-image.sh                  # exercises the shipped image, not just its build
 deploy/testharness/Dockerfile           # CI-only: debian + systemd, exercises `tumika install`
@@ -377,6 +378,15 @@ depguard never sees `import "C"`, in either cgo mode. And
 exclude the file, the pattern match skips the package, and the build exits zero.
 Both were verified by adding a cgo package. `go list` reporting a non-empty
 `CgoFiles` is what actually fires.
+
+## Desktop tray app
+
+`source/desktop/` is a macOS-only Tauri app and a client of the daemon exactly as the CLI is:
+it holds no state. Its Rust core reads the API token from the login Keychain via
+`/usr/bin/security` and polls `/v1/health`; the React popover renders the result. It is not
+part of the Go module, the daemon image, or the release archives. Toolchain and commands are in
+`source/desktop/README.md`; it has its own lint (`eslint`) and licence check (`cargo-deny`) and
+its own CI job.
 
 ## Self-update
 
