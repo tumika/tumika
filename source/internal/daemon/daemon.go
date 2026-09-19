@@ -66,6 +66,24 @@ type Options struct {
 	// updates nil and ConfirmBoot, Confirm and the restart-on-update path are
 	// never exercised until a real release runs them on someone's machine.
 	Updates service.UpdateService
+
+	// TokenCustody is the platform secret store the minted API token is handed
+	// to. Nil means store nothing.
+	//
+	// The zero value is the safe one, and that direction is deliberate: the real
+	// custodian on macOS writes into the login Keychain of whoever is running
+	// the process, so a daemon built without asking for custody — every test
+	// that builds one, including ones not written yet — leaves the Keychain
+	// alone. Only the real entry point supplies tokencustody.New().
+	TokenCustody tokencustody.Custodian
+}
+
+// resolveTokenCustody applies the nil-means-no-op rule for Options.TokenCustody.
+func resolveTokenCustody(opts Options) tokencustody.Custodian {
+	if opts.TokenCustody == nil {
+		return tokencustody.NewNoop()
+	}
+	return opts.TokenCustody
 }
 
 // Daemon owns the process-wide resources: the database and the HTTP server.
@@ -160,7 +178,7 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// AuthService reaches settings through ConfigService rather than taking the
 	// repository: it is owned there, and a second writer would bypass the rules
 	// that live with it.
-	auth := service.NewAuthService(config, tokencustody.NewNoop())
+	auth := service.NewAuthService(config, resolveTokenCustody(opts))
 
 	// Key custody is resolved at startup, not lazily: a daemon that cannot seal
 	// is a daemon that cannot store a credential, and finding that out on the

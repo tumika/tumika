@@ -18,6 +18,7 @@ import (
 	"github.com/tumika/tumika/source/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/internal/platform/logging"
 	"github.com/tumika/tumika/source/internal/platform/paths"
+	"github.com/tumika/tumika/source/internal/platform/tokencustody"
 )
 
 // globals holds what every command needs, populated once in the root command's
@@ -32,6 +33,32 @@ type globals struct {
 	resolvedErr error
 	didResolve  bool
 	logger      *slog.Logger
+
+	// tokenCustody is the platform secret store a minted API token is handed to.
+	// Nil means store nothing, which is what newRootCmd builds and therefore
+	// what every in-process test of the command tree gets: the real custodian
+	// writes into the login Keychain of whoever runs the process, so it is
+	// supplied by Execute alone.
+	tokenCustody tokencustody.Custodian
+}
+
+// rootOption supplies a dependency that only the real entry point has any
+// business reaching. Each one is an opt-in, so a command tree built without it
+// stays inert.
+type rootOption func(*globals)
+
+// withTokenCustody points the command tree at a platform secret store.
+func withTokenCustody(c tokencustody.Custodian) rootOption {
+	return func(g *globals) { g.tokenCustody = c }
+}
+
+// newGlobals builds the shared state a command tree runs on.
+func newGlobals(opts ...rootOption) *globals {
+	g := &globals{}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Paths resolves the filesystem layout on first use.
@@ -53,7 +80,10 @@ func (g *globals) Paths() (paths.Paths, error) {
 // Execute runs the CLI and returns the process exit code. ctx is cancelled on
 // SIGINT/SIGTERM, so a command that respects it shuts down gracefully.
 func Execute(ctx context.Context) int {
-	return execute(ctx, newRootCmd())
+	// The only place the real platform secret store is named. Everything else
+	// that builds the command tree — every test — gets a nil custodian and
+	// stores nothing.
+	return execute(ctx, newRootCmd(withTokenCustody(tokencustody.New())))
 }
 
 // execute is Execute with the command injected, so the exit-code and
@@ -73,8 +103,8 @@ func execute(ctx context.Context, cmd *cobra.Command) int {
 	return 0
 }
 
-func newRootCmd() *cobra.Command {
-	g := &globals{}
+func newRootCmd(opts ...rootOption) *cobra.Command {
+	g := newGlobals(opts...)
 
 	cmd := &cobra.Command{
 		Use:   "tumika",
