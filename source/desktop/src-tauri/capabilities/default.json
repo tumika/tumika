@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities granted to the tray popover window",
+  "windows": ["popover"],
+  "permissions": ["core:default"]
+}

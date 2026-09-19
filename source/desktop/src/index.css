@@ -1,0 +1,153 @@
+/* The window is transparent and frameless, so the document paints no background
+   of its own: only `.popover` is visible, and its corners are the window's. */
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  /* A frameless window has no title bar to drag by, and a popover is not moved
+     by the user anyway. */
+  user-select: none;
+  cursor: default;
+}
+
+:root {
+  --surface: #ffffff;
+  --ink: #1c1c1e;
+  --ink-dim: #6e6e73;
+  --rule: rgba(0, 0, 0, 0.08);
+  --ok-bg: #e4f6e7;
+  --ok-ink: #1d7a32;
+  --attention-bg: #fdeede;
+  --attention-ink: #a4540d;
+  --stopped-bg: #f2f2f4;
+  --stopped-ink: #5a5a60;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #1b1d21;
+    --ink: #f5f5f7;
+    --ink-dim: #9b9ba1;
+    --rule: rgba(255, 255, 255, 0.1);
+    --ok-bg: #1d3a26;
+    --ok-ink: #7fe097;
+    --attention-bg: #3b2a18;
+    --attention-ink: #f4b874;
+    --stopped-bg: #2a2c31;
+    --stopped-ink: #c3c3c9;
+  }
+}
+
+.popover {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.name {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pill-ok {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+}
+
+.pill-attention {
+  background: var(--attention-bg);
+  color: var(--attention-ink);
+}
+
+.pill-stopped,
+.pill-checking {
+  background: var(--stopped-bg);
+  color: var(--stopped-ink);
+}
+
+.meta,
+.detail,
+.instruction {
+  margin: 0;
+  color: var(--ink-dim);
+}
+
+.meta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.instruction {
+  color: var(--ink);
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  /* The footer sits at the bottom whatever the states above it render. */
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--rule);
+}
+
+.polled {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.quit {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: default;
+}
+
+.quit:hover {
+  background: var(--stopped-bg);
+}

@@ -114,6 +114,90 @@ jobs:
             exit 1
           fi
 
+  # The macOS tray app. It lives here rather than in a gt-owned workflow
+  # because ci-orchestration.yml and dependabot.yml are rendered by
+  # `gt repo sync`: a job added there is reverted by the next sync, and the
+  # check disappears from ci-gate without anything failing.
+  #
+  # macos-latest is not a preference — Tauri links against WebKit and AppKit,
+  # and the app is macOS-only by design, so there is no other runner that can
+  # build it.
+  desktop:
+    name: desktop
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: source/desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # pnpm before setup-node: `cache: pnpm` asks node to locate the pnpm
+      # store, which only works once pnpm is on PATH.
+      #
+      # The pnpm version comes from the `packageManager` field of the app's
+      # package.json, which Dependabot's npm ecosystem also updates. `uses:`
+      # steps ignore `defaults.run.working-directory`, so the file is named.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: source/desktop/package.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.7.0"
+          cache: pnpm
+          cache-dependency-path: source/desktop/pnpm-lock.yaml
+
+      # --frozen-lockfile fails rather than resolving: a lockfile that
+      # disagrees with package.json means CI built something nobody committed.
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: eslint
+        run: pnpm eslint .
+
+      - name: tsc
+        run: pnpm tsc --noEmit
+
+      - name: vitest
+        run: pnpm vitest run
+
+      # No toolchain argument: rustup reads source/desktop/rust-toolchain.toml,
+      # which pins the channel and the clippy/rustfmt components. The version
+      # lives in that file alone, so a bump does not have to be mirrored here.
+      - name: install the pinned rust toolchain
+        run: rustup toolchain install
+
+      # The registry, the git checkouts and the build directory. Tauri pulls in
+      # a large dependency graph, and a cold build on a macOS runner is the
+      # slowest thing in this workflow by a wide margin.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/desktop/src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('source/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo fmt
+        working-directory: source/desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: source/desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: source/desktop/src-tauri
+        run: cargo test
+
+      # --debug skips the release optimisation pass and, more to the point,
+      # skips signing and notarization, which this repository does not do. It
+      # still runs the whole bundle path, which is where a missing icon or a
+      # malformed tauri.conf.json shows up.
+      - name: tauri build
+        run: pnpm tauri build --debug
+
   # The SHIPPED image (ADR: D9). The test-harness image is not built here: the
   # linux-install job below builds it from the same context and then actually
   # exercises it, so a second build could only fail in cases that one already

@@ -17,6 +17,13 @@ dist/
 *.db-shm
 master.key
 
+# Desktop tray app build output. source/desktop/ carries its own .gitignore
+# files as well; these are anchored from the root so a `git status` run here
+# is clean without relying on them.
+/source/desktop/node_modules/
+/source/desktop/src-tauri/target/
+/source/desktop/src-tauri/gen/
+
 # Agentic toolkit generated config — regenerated from .agentic-toolkit.yaml,
 # so the generated output is not what we track.
 /.claude/

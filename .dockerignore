@@ -11,6 +11,12 @@
 
 source/**/*_test.go
 source/**/testdata/
+
+# The macOS tray app. The image ships the daemon and nothing else, and
+# source/desktop/ carries node_modules and a Rust target directory — hundreds
+# of megabytes of context for files no build stage reads.
+source/desktop/
+
 **/*.db
 **/*.db-wal
 **/*.db-shm

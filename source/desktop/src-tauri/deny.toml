@@ -1,0 +1,49 @@
+# cargo-deny configuration for the desktop app, run by `bulwark scan`.
+#
+# `bulwark scan` checks licences and bans here; `bans` is left at cargo-deny's
+# defaults. Advisories are not part of that scan: cargo-audit covers them.
+
+[licenses]
+# Permissive licences only, and only those the graph actually resolves to. A
+# crate offering a choice (`MIT OR Apache-2.0`) is satisfied by whichever of its
+# options appears below, so this list is shorter than `cargo deny list`: the
+# LGPL arm of r-efi and the CC0/MIT-0 arms of dunce are never taken.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# tumika-desktop itself carries no `license` field and is `publish = false`; the
+# app is covered by the repository's own LICENSE.
+private = { ignore = true }
+
+# MPL-2.0 is weak copyleft, so it is granted per crate rather than added to
+# `allow`: its obligations attach to the MPL-licensed files themselves, and
+# naming each crate is what makes a *new* MPL dependency fail the scan instead
+# of arriving unnoticed. Every one of these is reached through tauri.
+[[licenses.exceptions]]
+name = "cssparser"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "cssparser-macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "dtoa-short"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "selectors"
+allow = ["MPL-2.0"]
