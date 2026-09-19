@@ -39,6 +39,12 @@ fn daemon_status(current: State<'_, CurrentStatus>) -> Option<DaemonStatus> {
     current.0.lock().expect("status lock").clone()
 }
 
+/// Lets the popover's Quit button end the app; the tray menu's item does the same.
+#[tauri::command]
+fn quit(app: AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -46,7 +52,7 @@ pub fn run() {
         // to resolve, even though only Rust calls `move_window`.
         .plugin(tauri_plugin_positioner::init())
         .manage(CurrentStatus::default())
-        .invoke_handler(tauri::generate_handler![daemon_status])
+        .invoke_handler(tauri::generate_handler![daemon_status, quit])
         .setup(|app| {
             set_accessory_activation_policy(app);
             build_tray(app)?;

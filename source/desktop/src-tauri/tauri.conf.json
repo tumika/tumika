@@ -16,7 +16,7 @@
         "label": "popover",
         "title": "Tumika",
         "width": 320,
-        "height": 240,
+        "height": 200,
         "resizable": false,
         "decorations": false,
         "transparent": true,
