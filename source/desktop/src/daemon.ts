@@ -39,16 +39,19 @@ export interface Pill {
   tone: "ok" | "attention" | "stopped";
 }
 
-const pills: Record<DaemonState, Pill> = {
-  running: { label: "Running", tone: "ok" },
-  degraded: { label: "Degraded", tone: "attention" },
-  stopped: { label: "Stopped", tone: "stopped" },
-  needs_setup: { label: "Needs setup", tone: "attention" },
-  token_rejected: { label: "Token rejected", tone: "attention" },
-};
-
 export function pillFor(state: DaemonState): Pill {
-  return pills[state];
+  switch (state) {
+    case "running":
+      return { label: "Running", tone: "ok" };
+    case "degraded":
+      return { label: "Degraded", tone: "attention" };
+    case "stopped":
+      return { label: "Stopped", tone: "stopped" };
+    case "needs_setup":
+      return { label: "Needs setup", tone: "attention" };
+    case "token_rejected":
+      return { label: "Token rejected", tone: "attention" };
+  }
 }
 
 /**
