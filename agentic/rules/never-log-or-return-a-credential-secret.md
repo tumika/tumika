@@ -5,11 +5,15 @@ description: "A credential secret never crosses the API boundary, never reaches 
 # A credential secret never crosses the API boundary, never reaches a log, and never rests unsealed
 
 A secret — an OAuth token, an API key, the auth code pasted during login — exists in plaintext
-in exactly three places, and nowhere else:
+in exactly the places below, and nowhere else. (Item 4 is tumika's own API token, not a
+provider credential; the first three concern provider credentials.)
 
 1. in memory, inside `domain.Credential.Secret`, between capture and sealing;
 2. in the environment of a spawned `claude` process (`CLAUDE_CODE_OAUTH_TOKEN`);
-3. as AES-256-GCM ciphertext in `provider_credentials`, which is not plaintext at all.
+3. as AES-256-GCM ciphertext in `provider_credentials`, which is not plaintext at all;
+4. on macOS, tumika's own API token as an item in the login Keychain (service `tumika`,
+   account `api-token`), written only through `platform/tokencustody`. `tmk_` tokens are
+   recognised by the log redactor like any other credential shape.
 
 Everywhere else it is `domain.CredentialMeta` — the non-secret half: hint, account email,
 status, issued/expires timestamps. `Credential` carries the secret and is **not** JSON-tagged
@@ -77,6 +81,7 @@ defaults the AAD to `nil` defeats the whole scheme, so there is not one.
 | `source/internal/domain` | `Credential` (secret, never serialised) vs `CredentialMeta` (safe, JSON-tagged) |
 | `source/internal/api/**` | encodes `CredentialMeta` only; the `sk-ant-` response assertion lives here |
 | `source/internal/platform/logging` | the redaction `slog.Handler` — the backstop |
+| `source/internal/platform/tokencustody` | the only writer of the API token's Keychain copy |
 | `source/internal/platform/secrets` | `Seal`/`Open`, AAD binding, key custody per backend |
 | `source/internal/platform/provider/claudecode/` | PTY transcript redaction at capture time |
 | `source/internal/service/` (`ProviderService`, `LoginService`) | the only layers that hold plaintext |

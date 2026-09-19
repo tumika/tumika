@@ -43,8 +43,8 @@ func newTokenRotateCmd(g *globals) *cobra.Command {
 		Use:   "rotate",
 		Short: "Mint a new API token, replacing any existing one",
 		Long: "Mint a new API token and print it once.\n\n" +
-			"Only its SHA-256 is stored, so this is the only time the token exists in a\n" +
-			"form anyone can read. Any client using the previous token stops working\n" +
+			"The daemon stores only its SHA-256. On macOS a copy is also stored in the\n" +
+			"login Keychain. Any client using the previous token stops working\n" +
 			"immediately.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -57,7 +57,7 @@ func newTokenRotateCmd(g *globals) *cobra.Command {
 				// The token goes to stdout and nowhere else. Not through the
 				// logger — which would put a live credential into the journal,
 				// exactly what the redaction rules exist to prevent — and not
-				// into a file, so the only copy is the one the operator keeps.
+				// into a file. On macOS a copy is also handed to the login Keychain.
 				if quiet {
 					printf(cmd, "%s\n", res.Token)
 					warnTokenCustody(cmd, res.CustodyErr)

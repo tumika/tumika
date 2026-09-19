@@ -29,19 +29,13 @@ const tokenBytes = 32
 // refuses to serve in that state rather than listening without authentication.
 var ErrNoToken = errors.New("no API token configured")
 
-// AuthService mints and verifies the API bearer token.
-//
-// Only the SHA-256 of the token is ever stored. The plaintext exists exactly
-// once, in the output of `tumika token rotate`, and is unrecoverable
-// afterwards — losing it means minting a new one, which is the correct
-// trade for a credential that grants full API access.
 // RotateResult is everything a rotation produces.
 //
 // The token and the custody outcome travel together because a caller has to act
 // on both: print the plaintext, then say whether tumika also managed to hand it
 // to the platform's secret store.
 type RotateResult struct {
-	// Token is the plaintext. This is the only time it exists.
+	// Token is the plaintext. The daemon returns it only from Rotate.
 	Token string
 	// CustodyErr reports that handing the token to the platform's secret store
 	// failed. It never carries the token itself, and it is never fatal — the
@@ -49,9 +43,16 @@ type RotateResult struct {
 	CustodyErr error
 }
 
+// AuthService mints and verifies the API bearer token.
+//
+// Only the SHA-256 of the token is stored in the database, so the daemon can
+// never recover a token. The plaintext is shown once when minted and, on macOS,
+// also handed to the login Keychain; losing both means minting a new one, which
+// is the correct trade for a credential that grants full API access.
 type AuthService interface {
 	// Rotate mints a new token, replacing any existing one, and returns the
-	// plaintext. This is the only time the plaintext exists.
+	// plaintext together with the outcome of handing it to the platform's
+	// secret store. A custody failure is reported in the result, not as an error.
 	Rotate(ctx context.Context) (RotateResult, error)
 	// Configured reports whether a token has been set.
 	Configured(ctx context.Context) (bool, error)

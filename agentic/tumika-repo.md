@@ -62,6 +62,7 @@ source/internal/domain/                 # shared types; imports nothing of ours
 source/internal/platform/provider/      # provider interfaces + registry
 source/internal/platform/provider/claudecode/
 source/internal/platform/provider/anthropicapi/
+source/internal/platform/tokencustody/  # stores the minted API token in the platform keychain (macOS)
 source/internal/platform/secrets/       # Sealer (AES-256-GCM) + env / keychain / file key custody
 source/internal/platform/servicemgr/    # ServiceManager + launchd / systemd drivers
 source/internal/platform/release/       # ReleaseSource (self-update)
@@ -207,9 +208,10 @@ the TUI it parses are never out of step.
 ## HTTP API
 
 Every route is behind a bearer token — there are no exemptions, including
-`/v1/health`. Only the token's SHA-256 is stored, so a lost token is replaced
-(`tumika token rotate`), never recovered, and the daemon refuses to start rather
-than listen unauthenticated.
+`/v1/health`. The daemon stores only the token's SHA-256, so it can never
+recover a lost token; one is replaced (`tumika token rotate`). On macOS the
+plaintext is also handed to the login Keychain at mint time (ADR-0005). The
+daemon refuses to start rather than listen unauthenticated.
 
 Middleware, outermost first:
 
