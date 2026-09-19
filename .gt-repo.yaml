@@ -17,6 +17,11 @@
 
 gt_version: 1.7.0
 dependabot:
+  - ecosystem: cargo
+    directory: /source/desktop/src-tauri
+    note: |
+      The desktop tray app's Rust crate. Its manifest sits one level below the
+      npm project, so it needs its own entry — Dependabot does not descend.
   - ecosystem: docker
     directory: /deploy/testharness
     note: |
@@ -27,6 +32,11 @@ dependabot:
     directory: /
   - ecosystem: gomod
     directory: /
+  - ecosystem: npm
+    directory: /source/desktop
+    note: |
+      The desktop tray app's JavaScript dependencies. pnpm is the package
+      manager; Dependabot reads pnpm-lock.yaml under the npm ecosystem.
 dependabot_auto_merge:
   github_app: true
 pipeline:

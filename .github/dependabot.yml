@@ -9,6 +9,23 @@
 # branch.
 version: 2
 updates:
+  # The desktop tray app's Rust crate. Its manifest sits one level below the
+  # npm project, so it needs its own entry — Dependabot does not descend.
+  - package-ecosystem: "cargo"
+    directory: "/source/desktop/src-tauri"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
   # The end-to-end test harness image. Only discovered because the file is
   # named Dockerfile — Dependabot's docker ecosystem does not find a file
   # named Containerfile.
@@ -44,6 +61,23 @@ updates:
 
   - package-ecosystem: "gomod"
     directory: "/"
+    schedule:
+      interval: "weekly"
+    # Dependabot's commit message is also its PR title, and PRs are
+    # squash-merged, so the prefix is what keeps dependency updates inside
+    # Conventional Commits. `include: scope` appends the dependency scope,
+    # producing e.g. `build(deps): bump …`.
+    commit-message:
+      prefix: "build"
+      include: scope
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 25
+
+  # The desktop tray app's JavaScript dependencies. pnpm is the package
+  # manager; Dependabot reads pnpm-lock.yaml under the npm ecosystem.
+  - package-ecosystem: "npm"
+    directory: "/source/desktop"
     schedule:
       interval: "weekly"
     # Dependabot's commit message is also its PR title, and PRs are
