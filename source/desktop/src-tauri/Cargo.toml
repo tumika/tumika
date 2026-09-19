@@ -22,7 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 thiserror = "2"
-tokio = { version = "1", features = ["time"] }
+# `process` for the Keychain read: it is spawned on the runtime so a Keychain
+# that does not answer occupies no worker, and dropping the timed-out read kills
+# the child with it.
+tokio = { version = "1", features = ["process", "time"] }
 
 # rustls rather than the platform TLS stack: it is pure Rust, so the app links
 # no system crypto library and cross-building stays free of one.

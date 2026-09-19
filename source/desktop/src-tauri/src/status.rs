@@ -1,6 +1,6 @@
 //! What the tray reports, and how a poll produces it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -63,6 +63,7 @@ pub struct Monitor {
     source: Box<dyn TokenSource>,
     client: HealthClient,
     address: String,
+    read_timeout: Duration,
 }
 
 impl Monitor {
@@ -70,6 +71,7 @@ impl Monitor {
         Ok(Self {
             source,
             client: HealthClient::new(base_url)?,
+            read_timeout: keychain::READ_TIMEOUT,
             // The popover shows where it is looking, which is the base URL
             // without the scheme it has no use for.
             address: base_url
@@ -79,12 +81,20 @@ impl Monitor {
         })
     }
 
+    /// Shortens the Keychain read's bound, so a test for what happens when it
+    /// expires runs in milliseconds.
+    #[cfg(test)]
+    fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
+    }
+
     /// Produces the current status.
     ///
     /// The token is re-read every time, so a rotation is picked up without
     /// restarting the app.
     pub async fn poll(&self) -> DaemonStatus {
-        let token = match keychain::load(self.source.as_ref()) {
+        let token = match keychain::load(self.source.as_ref(), self.read_timeout).await {
             Ok(Some(token)) => token,
             Ok(None) => {
                 return self.status(
@@ -93,8 +103,10 @@ impl Monitor {
                     Some("no API token in the login Keychain".to_string()),
                 )
             }
-            // A Keychain that cannot be read leaves the app exactly as unable to
-            // authenticate as an absent item does, and the detail says which.
+            // A Keychain that cannot be read — or that does not answer in time —
+            // leaves the app exactly as unable to authenticate as an absent item
+            // does, and the detail says which. Publishing it is what keeps the
+            // tray from showing a state nothing is checking any more.
             Err(err) => return self.status(DaemonState::NeedsSetup, None, Some(err.to_string())),
         };
 
@@ -154,7 +166,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::keychain::KeychainError;
+    use crate::keychain::{KeychainError, ReadFuture};
 
     const TOKEN: &str = "tk_a_test_token";
 
@@ -162,11 +174,26 @@ mod tests {
     struct FakeKeychain(Result<Option<String>, ()>);
 
     impl TokenSource for FakeKeychain {
-        fn read(&self) -> Result<Option<String>, KeychainError> {
-            match &self.0 {
+        fn read(&self) -> ReadFuture<'_> {
+            let answer = match &self.0 {
                 Ok(value) => Ok(value.clone()),
                 Err(()) => Err(KeychainError::Empty),
-            }
+            };
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// A Keychain that takes longer to answer than it is given, as a locked one
+    /// waiting on an unlock dialog does.
+    struct SlowKeychain(Duration);
+
+    impl TokenSource for SlowKeychain {
+        fn read(&self) -> ReadFuture<'_> {
+            let delay = self.0;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(None)
+            })
         }
     }
 
@@ -304,6 +331,22 @@ mod tests {
 
         assert_eq!(status.state, DaemonState::NeedsSetup);
         assert!(status.detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_keychain_that_does_not_answer_is_needs_setup() {
+        let status = Monitor::new(
+            Box::new(SlowKeychain(Duration::from_secs(60))),
+            "http://127.0.0.1:1",
+        )
+        .expect("monitor")
+        .with_read_timeout(Duration::from_millis(20))
+        .poll()
+        .await;
+
+        assert_eq!(status.state, DaemonState::NeedsSetup);
+        let detail = status.detail.expect("detail");
+        assert!(detail.contains("did not answer"), "{detail}");
     }
 
     #[test]
