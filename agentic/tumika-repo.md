@@ -62,6 +62,7 @@ source/daemon/internal/domain/                 # shared types; imports nothing o
 source/daemon/internal/platform/provider/      # provider interfaces + registry
 source/daemon/internal/platform/provider/claudecode/
 source/daemon/internal/platform/provider/anthropicapi/
+source/daemon/internal/platform/tokencustody/  # stores the minted API token in the platform keychain (macOS)
 source/daemon/internal/platform/secrets/       # Sealer (AES-256-GCM) + env / keychain / file key custody
 source/daemon/internal/platform/servicemgr/    # ServiceManager + launchd / systemd drivers
 source/daemon/internal/platform/release/       # ReleaseSource (self-update)
@@ -207,9 +208,10 @@ the TUI it parses are never out of step.
 ## HTTP API
 
 Every route is behind a bearer token — there are no exemptions, including
-`/v1/health`. Only the token's SHA-256 is stored, so a lost token is replaced
-(`tumika token rotate`), never recovered, and the daemon refuses to start rather
-than listen unauthenticated.
+`/v1/health`. The daemon stores only the token's SHA-256, so it can never
+recover a lost token; one is replaced (`tumika token rotate`). On macOS the
+plaintext is also handed to the login Keychain at mint time (ADR-0005). The
+daemon refuses to start rather than listen unauthenticated.
 
 Middleware, outermost first:
 
@@ -274,6 +276,11 @@ Two things that are easy to get wrong and are pinned by tests:
 the real login Keychain and writes a key into it, so `go test ./...` would mutate
 the Keychain of whoever ran it. Unit tests use the constructors; anything that
 builds a `daemon` sets `TUMIKA_MASTER_KEY` (see `useTestKeyCustody`).
+
+The API token's Keychain copy follows the same rule from the other direction:
+`daemon.Options.TokenCustody` nil means store nothing, and only `cli.Execute`
+supplies `tokencustody.New()`. A test that builds a daemon or a command tree
+gets the no-op without asking.
 
 **There is no fallback off the Keychain on macOS, deliberately.** A locked
 keychain or a denied prompt fails the daemon closed. Falling back to a file would

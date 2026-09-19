@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 
 	"github.com/tumika/tumika/source/daemon/internal/platform/paths"
 	"github.com/tumika/tumika/source/daemon/internal/platform/secrets"
@@ -755,5 +758,63 @@ func TestUninstallAndStopReportFailures(t *testing.T) {
 		if strings.Contains(out, "untouched") {
 			t.Errorf("%s printed a success message on failure: %s", command, out)
 		}
+	}
+}
+
+// The token is printed before any custody warning, and the warning never
+// repeats it. Only the hash is stored, so the printed copy is the only one the
+// operator will ever see — a warning about the backup copy that pushes it off
+// the screen loses the credential the warning is about.
+func TestTheTokenIsPrintedBeforeTheCustodyWarning(t *testing.T) {
+	var combined bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&combined)
+	cmd.SetErr(&combined)
+
+	printToken(cmd, "tmk_example")
+	warnTokenCustody(cmd, errors.New("keystore is locked"))
+
+	got := combined.String()
+	token := strings.Index(got, "tmk_example")
+	warning := strings.Index(got, "keystore is locked")
+	switch {
+	case token < 0:
+		t.Fatalf("the token was not printed:\n%s", got)
+	case warning < 0:
+		t.Fatalf("the custody failure was not reported:\n%s", got)
+	case warning < token:
+		t.Errorf("the custody warning precedes the token:\n%s", got)
+	}
+}
+
+// The warning goes to stderr, so `token rotate --quiet` stays pipeable, and it
+// carries the failure rather than the credential.
+func TestTheCustodyWarningGoesToStderrWithoutTheToken(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+
+	printToken(cmd, "tmk_example")
+	warnTokenCustody(cmd, errors.New("keystore is locked"))
+
+	if !strings.Contains(errOut.String(), "keystore is locked") {
+		t.Errorf("stderr = %q, want the custody failure", errOut.String())
+	}
+	if strings.Contains(errOut.String(), "tmk_example") {
+		t.Error("the custody warning carries the token")
+	}
+}
+
+// Nothing is printed when custody worked.
+func TestNoCustodyWarningOnSuccess(t *testing.T) {
+	var errOut bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&errOut)
+
+	warnTokenCustody(cmd, nil)
+
+	if errOut.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing", errOut.String())
 	}
 }

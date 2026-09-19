@@ -72,10 +72,11 @@ func TestHealthDegradesRatherThanFailing(t *testing.T) {
 // The report must never carry the token or its hash — only whether one exists.
 func TestHealthNeverCarriesTheToken(t *testing.T) {
 	auth, _ := newAuth(t)
-	token, err := auth.Rotate(t.Context())
+	minted, err := auth.Rotate(t.Context())
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	schema := func(context.Context) (int64, error) { return 1, nil }
 	h := service.NewHealthService("dev", time.Now(), schema, auth, "file").Snapshot(t.Context())

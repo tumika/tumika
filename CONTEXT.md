@@ -61,6 +61,21 @@ data to (a mailbox, a calendar). Connectors are the data plane; providers are th
 tumika fetches and filters through a connector itself and hands the model a curated payload —
 the model never gets direct access to the source. *Stage 2.*
 
+**desktop app** — The single per-user application that presents tumika on a person's own
+machine. It is a client of the daemon, exactly as the CLI is: it holds no state of its own and
+decides nothing the daemon does not. Its permanent surface is the **tray**; a fuller window
+opens from it. It is one application, not a tray utility plus a second app.
+
+**tray** — The desktop app's always-present icon in the system's status area, and the small
+popover it opens. Its icon reports one of a fixed set of states at a glance (all clear, needs
+you, daemon stopped). *macOS only:* other platforms' status areas do not deliver the click
+events the popover depends on.
+
+**token custody** — Where the plaintext API token rests on a machine so that a local client can
+use it. The daemon itself stores only the token's hash and can never return the token; custody
+is a separate, platform-provided copy, written when the token is minted and replaced when it is
+rotated.
+
 **approval** — A point where a workflow pauses and waits for a human decision before an action
 with external effect (sending a drafted reply). An approval is a first-class, persisted state,
 not a prompt on a terminal. *Stage 2.*

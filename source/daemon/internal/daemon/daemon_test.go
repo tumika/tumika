@@ -81,10 +81,11 @@ func startWith(t *testing.T, prepare func(paths.Paths)) (string, string, paths.P
 
 	// Every route is authenticated, so a usable daemon needs a token first —
 	// the same order an operator follows on a fresh install.
-	token, err := d.AuthService().Rotate(ctx)
+	minted, err := d.AuthService().Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -270,10 +271,11 @@ func TestSettingsSurviveARestart(t *testing.T) {
 			}
 		}()
 
-		token, err := d.AuthService().Rotate(ctx)
+		minted, err := d.AuthService().Rotate(ctx)
 		if err != nil {
 			t.Fatalf("Rotate: %v", err)
 		}
+		token := minted.Token
 
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -775,10 +777,11 @@ func TestApplyingAnUpdateOverHTTPRestartsTheDaemon(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 
-	token, err := d.AuthService().Rotate(ctx)
+	minted, err := d.AuthService().Rotate(ctx)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
+	token := minted.Token
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
