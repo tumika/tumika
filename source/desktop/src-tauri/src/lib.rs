@@ -3,7 +3,7 @@ mod keychain;
 mod status;
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -28,10 +28,20 @@ const STATUS_EVENT: &str = "daemon-status";
 /// worth glancing at, rare enough to cost nothing on a laptop.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long after a focus loss hid the popover a tray click still counts as the
+/// click that caused it. Long enough to cover the gap between the two events,
+/// short enough that a deliberate second click reopens the popover.
+const DISMISS_GRACE: Duration = Duration::from_millis(200);
+
 /// The most recent poll, or `None` before the first one has finished — which is
 /// what the popover renders as "Checking…".
 #[derive(Default)]
 struct CurrentStatus(Mutex<Option<DaemonStatus>>);
+
+/// When a focus loss last hid the popover, cleared as soon as a tray click has
+/// been judged against it.
+#[derive(Default)]
+struct LastDismissal(Mutex<Option<Instant>>);
 
 /// Answers the popover's first render, which happens before any event arrives.
 #[tauri::command]
@@ -52,6 +62,7 @@ pub fn run() {
         // to resolve, even though only Rust calls `move_window`.
         .plugin(tauri_plugin_positioner::init())
         .manage(CurrentStatus::default())
+        .manage(LastDismissal::default())
         .invoke_handler(tauri::generate_handler![daemon_status, quit])
         .setup(|app| {
             set_accessory_activation_policy(app);
@@ -63,6 +74,15 @@ pub fn run() {
             // A popover dismisses itself when the user clicks elsewhere.
             if window.label() == POPOVER && matches!(event, WindowEvent::Focused(false)) {
                 let _ = window.hide();
+                // The click that took the focus may be a click on the tray
+                // icon, whose own event arrives afterwards; the instant is what
+                // lets `toggle_popover` recognise it.
+                *window
+                    .app_handle()
+                    .state::<LastDismissal>()
+                    .0
+                    .lock()
+                    .expect("dismissal lock") = Some(Instant::now());
             }
         })
         .run(tauri::generate_context!())
@@ -164,7 +184,31 @@ fn toggle_popover<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.hide();
         return;
     }
-    show_popover(&window);
+
+    // Clicking the tray while the popover is open takes the focus away first, so
+    // the focus-loss handler has already hidden the window by the time this
+    // click's mouse-up arrives and the popover looks closed. Whether the hide or
+    // the click lands first is the window manager's business; the grace window
+    // is what absorbs that ordering.
+    let dismissal = app.state::<LastDismissal>();
+    let mut dismissed_at = dismissal.0.lock().expect("dismissal lock");
+    let open = should_open(*dismissed_at, Instant::now());
+    // Judged once: a click that is absorbed is the end of the gesture, and the
+    // next one opens the popover.
+    *dismissed_at = None;
+
+    if open {
+        show_popover(&window);
+    }
+}
+
+/// Whether a tray click landing on a hidden popover opens it.
+///
+/// A click within [`DISMISS_GRACE`] of a focus loss that hid the popover is the
+/// same gesture as that dismissal, so it closes the popover rather than
+/// reopening it.
+fn should_open(dismissed_at: Option<Instant>, now: Instant) -> bool {
+    dismissed_at.is_none_or(|at| now.saturating_duration_since(at) >= DISMISS_GRACE)
 }
 
 fn show_popover<R: Runtime>(window: &WebviewWindow<R>) {
@@ -173,4 +217,30 @@ fn show_popover<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.move_window(Position::TrayCenter);
     let _ = window.show();
     let _ = window.set_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_click_just_after_a_focus_loss_leaves_the_popover_closed() {
+        let dismissed_at = Instant::now();
+        let click = dismissed_at + DISMISS_GRACE / 2;
+
+        assert!(!should_open(Some(dismissed_at), click));
+    }
+
+    #[test]
+    fn a_click_long_after_a_focus_loss_opens_the_popover() {
+        let dismissed_at = Instant::now();
+        let click = dismissed_at + DISMISS_GRACE * 2;
+
+        assert!(should_open(Some(dismissed_at), click));
+    }
+
+    #[test]
+    fn a_click_on_a_popover_no_focus_loss_ever_hid_opens_it() {
+        assert!(should_open(None, Instant::now()));
+    }
 }
