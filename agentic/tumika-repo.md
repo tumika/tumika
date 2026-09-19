@@ -76,6 +76,7 @@ deploy/testharness/Dockerfile           # CI-only: debian + systemd, exercises `
 deploy/testharness/verify.sh            # the linux-install gate
 docs/adr/                               # architecture decision records
 agentic/rules/                          # one prescriptive rule per file
+agentic/references/                     # deep-dive notes, read on demand — see References
 source/daemon/.golangci.yml                           # lint config (v2 schema) — depguard enforces layering
 .github/workflows/{ci,release}.yml
 ```
@@ -128,257 +129,6 @@ package that may name a concrete implementation.
 This repo has prescriptive rules in `agentic/rules/`. **Read every file in that directory before making changes here, and follow each rule strictly.**
 Each file contains one rule. New rules go in that directory — one file per rule, kebab-case filename matching the rule's intent.
 
-## Provider model
-
-A provider is an LLM backend. Two ship in this branch:
-
-| ID | Kind | Auth methods | Installs a binary |
-|---|---|---|---|
-| `claude-code` | `cli` | `manual_token` | yes (vendored `claude`) |
-| `anthropic-api` | `http` | `api_key` | no |
-
-`claude-code` will also offer `interactive_cli` once the PTY login lands. It does **not**
-declare it today, and must not: the registry validates the descriptor against the interfaces
-actually implemented, so declaring a method ahead of its implementation stops the daemon at
-startup. The absence is discoverable by type assertion, which is what will let the login
-endpoint refuse with `400 interactive_auth_unsupported` when it lands. **There is no
-`POST /v1/providers/{id}/login` route yet** — that path answers 404 today, not 400.
-
-Providers **declare their capabilities by which interfaces they implement**, and the registry
-discovers them by type assertion. `Provider` and `HealthChecker` are mandatory;
-`StaticAuthenticator`, `InteractiveAuthenticator` and `Installer` are optional. Clients read
-`requires_interactive_auth` from the descriptor to decide whether to `PUT` a secret or drive
-the login-session endpoints.
-
-`anthropic-api` exists precisely so the abstraction is not silently Claude-CLI-shaped: it
-implements neither `Installer` nor `InteractiveAuthenticator`.
-
-**The registry validates the correspondence at construction**, so a driver whose descriptor
-disagrees with the interfaces it implements stops the daemon at startup rather than producing a
-client that offers a flow the daemon rejects. The compiler cannot check that, which is why the
-registry does. Every driver must also pass the shared suite in
-`platform/provider/providertest` — written once, run against every implementation, so a second
-driver cannot quietly diverge from the first.
-
-**Credentials are stored before they are verified, deliberately.** Sealing and insertion happen
-in one transaction; verification is a network call made holding *no* transaction; the verdict
-lands in a second. Verifying inside the transaction would hold SQLite's single write lock across
-a network call, so a hanging provider would block every other write in the daemon. This is why
-the schema has an `unverified` status at all.
-
-## Claude Code facts that are load-bearing
-
-tumika drives a **pinned** Claude Code build, never whatever is on `PATH`. The exact version is
-the compile-time constant `buildinfo.PinnedClaudeCodeVersion`, which is the single source of
-truth — no document restates the number. The pin moves on a regular cadence, and a version
-copied into prose is a version that goes stale.
-
-The facts below were probed against the real CLI, and several contradict the obvious
-implementation:
-
-- `claude setup-token` prints a ~1-year OAuth token to the terminal and **saves it nowhere**.
-  It is an Ink TUI with no flags, so capturing it requires a PTY and text parsing. This is the
-  only screen-scrape in the system.
-- `claude auth status --json` returns `loggedIn: true` **for a bogus token**. It is useful
-  only for reading `authMethod` / `apiKeySource`.
-- `claude -p` with a bad token returns `subtype: "success"` **and** `is_error: true,
-  api_error_status: 401`. Verification keys on `is_error`, **never** `subtype`.
-- Credential precedence puts `apiKeyHelper` — a *settings-file* key, not an env var — **above**
-  `CLAUDE_CODE_OAUTH_TOKEN`. Scrubbing the environment is not sufficient. See
-  `agentic/rules/every-spawned-claude-process-is-credential-isolated.md`.
-- Claude Code auto-updates itself; that must be disabled (`DISABLE_AUTOUPDATER=1`), because an
-  auto-update would silently break the login scrape.
-- `--bare` does not read `CLAUDE_CODE_OAUTH_TOKEN`. Never pass it.
-
-### Bumping the pin
-
-Moving to a newer Claude Code is **routine and expected** — it is part of the ordinary update
-cycle, not a rare event. What is not routine is doing it blind: the pin's whole purpose is that
-the login parser was written against a build we have actually observed. So a bump is one commit
-that changes `buildinfo.PinnedClaudeCodeVersion` **and** re-establishes that claim:
-
-1. Install the new version and re-capture the `setup-token` PTY transcript into `testdata/`.
-2. Re-run the transcript-driven parser tests against it. A changed auth-URL prefix or paste
-   prompt shows up here, which is the point.
-3. Re-run the two-stage `Verify` against a real credential.
-
-If the transcripts still match, the bump is boring — which is the intended outcome most of the
-time. If they do not, the parser changes in the same commit as the pin, so a released binary and
-the TUI it parses are never out of step.
-
-## HTTP API
-
-Every route is behind a bearer token — there are no exemptions, including
-`/v1/health`. The daemon stores only the token's SHA-256, so it can never
-recover a lost token; one is replaced (`tumika token rotate`). On macOS the
-plaintext is also handed to the login Keychain at mint time (ADR-0005). The
-daemon refuses to start rather than listen unauthenticated.
-
-Middleware, outermost first:
-
-| Order | Middleware | Why there |
-|---|---|---|
-| 1 | recovery | outermost, so a panic *anywhere* below becomes a 500 rather than a dropped connection |
-| 2 | logging | above the security checks, so refusals are logged — a burst of 401s is what a probe looks like from the inside |
-| 3 | Host allowlist | the DNS-rebinding defence; runs before auth because it exists to turn away unauthenticated probes. Literal IPs pass: they cannot be rebound |
-| 4 | Origin check | no `Origin` (curl, the CLI) passes; a browser origin must be allowed. No CORS headers are set anywhere |
-| 5 | bearer token | constant-time compare against the stored hash |
-
-Note this differs from the plan's literal ordering, which put recovery and
-logging innermost. Placed there, recovery would not cover a panic in the layers
-above it and logging would never see a rejected request — both of which defeat
-the point of having them.
-
-## Credential sealing
-
-Envelope encryption (ADR-0002): AES-256-GCM ciphertext stays in SQLite, and only
-the **key** leaves. That is what keeps "the database is the whole state" true —
-the file is still complete and backup-able, just not readable on its own.
-
-The cipher is fixed; only key custody varies, chosen at startup and reported by
-`/v1/health`:
-
-| Precedence | Backend | Notes |
-|---|---|---|
-| 1 | `TUMIKA_MASTER_KEY` | explicit beats implicit, or the override would not be trustworthy |
-| 2 | systemd handover | `$CREDENTIALS_DIRECTORY` — as deliberate as the override; systemd only sets it because the unit asked |
-| 3 | macOS Keychain | why the Mac install is a LaunchAgent, not a daemon — Keychain needs a session |
-| 4 | `0600` file | the honest fallback; a container has no keystore |
-
-**`systemd-creds` is split across two processes, and neither half makes sense
-alone.** `tumika install` runs as root and *seals* the key, because
-`systemd-creds encrypt` reads the root-only host key. The daemon runs
-unprivileged and never invokes `systemd-creds` at all: the unit declares
-`LoadCredentialEncrypted=`, so systemd decrypts during startup — while still
-privileged — and drops the plaintext into a tmpfs the service account can read.
-
-Decrypting at runtime is the obvious design and it does not work; the daemon
-cannot read the host key and silently fell back to reporting backend `file`.
-Install therefore also *proves* the handover with a transient probe unit before
-committing to it: a host can be able to seal a key and unable to receive one, and
-committing without checking leaves a daemon that can never start. Both were found
-by running the install under a real systemd (`deploy/testharness/verify.sh`), not
-by reasoning about it.
-
-**A sealed blob that cannot be opened is fatal**, exactly like the Keychain: a
-host with `master.cred` has credentials sealed under that key, and minting a
-fresh one in a file would start cleanly and read none of them.
-
-Two things that are easy to get wrong and are pinned by tests:
-
-- **Every seal draws a fresh nonce.** GCM does not degrade under nonce reuse, it
-  collapses. Never derive one from a counter or the plaintext.
-- **The AAD binds ciphertext to its row** (`provider_id|kind`). Without it a row
-  copied between providers decrypts cleanly, and tumika authenticates to one
-  provider with another's credential — which presents as a mysterious 401.
-
-`secrets.OpenKeyStore` *selects* a backend; `NewFileKeyStore` / `NewEnvKeyStore`
-*construct* one. **Tests must never reach the selector**: on a Mac it reaches for
-the real login Keychain and writes a key into it, so `go test ./...` would mutate
-the Keychain of whoever ran it. Unit tests use the constructors; anything that
-builds a `daemon` sets `TUMIKA_MASTER_KEY` (see `useTestKeyCustody`).
-
-The API token's Keychain copy follows the same rule from the other direction:
-`daemon.Options.TokenCustody` nil means store nothing, and only `cli.Execute`
-supplies `tokencustody.New()`. A test that builds a daemon or a command tree
-gets the no-op without asking.
-
-**There is no fallback off the Keychain on macOS, deliberately.** A locked
-keychain or a denied prompt fails the daemon closed. Falling back to a file would
-find no key, mint a fresh one, start cleanly — and be unable to open a single
-existing credential, while anything re-submitted during that run got sealed under
-the new key and orphaned on the next successful start.
-
-## Service management
-
-`tumika install` sets the daemon up under the platform's supervisor — a systemd
-system unit on Linux, a LaunchAgent on macOS — and `uninstall / start / stop /
-status` drive it from there. Neither driver is behind a build tag: both compile
-everywhere and only `servicemgr.New` consults `runtime.GOOS`, so the Linux unit
-rendering and command sequencing are testable on a Mac.
-
-Six things the Linux install must do, every one of which was a silent failure
-first — the install printed success and the service did not run:
-
-- **Use `paths.SystemHome`, not the XDG per-user default.** `sudo tumika install`
-  resolves *root's* `HOME`, so the unit named `/root/.local/state/tumika`, which
-  the unprivileged service account cannot traverse.
-- **Hand `TUMIKA_HOME` to the service account.** The layout is created `0700` by
-  root and the unit runs as `tumika`.
-- **Create the service account BEFORE probing key custody.** The handover probe
-  runs a transient unit *as* that account, so probing first made `systemd-run`
-  fail to resolve the user on every first install — the probe reported "no
-  handover", the freshly sealed key was deleted, and the host dropped to the file
-  key permanently.
-- **Mint an API token before starting**, and print it as soon as it exists. The
-  daemon refuses to serve without one; and the hash is stored the moment it is
-  minted, so an install that fails afterwards would otherwise leave a daemon with
-  a token nobody has ever seen.
-- **Prove the credential handover** before writing `LoadCredentialEncrypted=`.
-- **`systemctl enable` then `restart`, never `enable --now`.** `start` is a no-op
-  on an active unit, so the documented upgrade path left the daemon running the
-  old binary with the old unit settings.
-
-Two things `status` must never do:
-
-- **Report `activating` as running.** That is what a `Restart=always` crash loop
-  reports *forever* — it never reaches `failed`, because the supervisor keeps
-  trying. It maps to `starting`, and to `failed` once `NRestarts` is above zero.
-- **Assume a LaunchAgent is enabled because a plist exists.** `launchctl
-  print-disabled` is the answer.
-
-The whitespace/`%` rule lives in the systemd driver, not in `Config.Validate`:
-macOS's own default home is `~/Library/Application Support/tumika`, and refusing
-a space would break every Mac install to protect Linux.
-
-`deploy/testharness/verify.sh` runs the whole thing under a real systemd in a
-podman container: install, ownership, the unit systemd actually accepts,
-`/v1/health` through the supervised daemon, `Restart=always` recovery from
-`SIGKILL`, a second install that must land on a **new pid**, a system install
-with container detection **off**, a crash loop that must not report as running,
-and an uninstall that leaves the database. Unit tests check what is rendered and
-sequenced; only this checks whether systemd agrees.
-
-Note what the container itself hides: `InContainer()` forces the system home, so
-the per-user-home bug was invisible until the harness started running an install
-with `TUMIKA_CONTAINER=0`. A harness has blind spots of its own, and they are
-worth writing down when found.
-
-## Containers
-
-Two images, and they are not interchangeable (ADR: D9):
-
-- **`deploy/Dockerfile`** — what a user runs. One process, `tumika` as PID 1, logs
-  on stdout, restart policy left to the orchestrator. No service manager, no
-  `tumika install`. Runs as an unprivileged account with `/var/lib/tumika` as the
-  only volume.
-- **`deploy/testharness/Dockerfile`** — CI only. A real systemd, so `tumika
-  install` is *exercised* rather than asserted about.
-
-Both are exercised by a script rather than merely built, because a Dockerfile
-that parses proves nothing. `verify-image.sh` checks that the binary runs on that
-base, that an unprivileged account can write a fresh volume, that the documented
-two-step first run works (`token rotate`, then `serve` — the daemon refuses to
-serve without a token), that `/v1/health` answers through a published port, that
-the token never reaches the logs, and that state survives a restart.
-
-The API binds loopback by default, which inside a container means unreachable.
-That is deliberate — it carries a bearer token in clear text — so publishing a
-port also means passing `--listen`, and the daemon logs a warning when you do.
-
-## CI
-
-`cross-compile` builds all four release targets. Nothing else does: `build &
-test` compiles for whatever the runner is, and tumika is written for a Pi.
-
-Its `no cgo` step is the real enforcement of the no-cgo invariant. `source/daemon/.golangci.yml`
-has a `nocgo` depguard rule that **documents intent and enforces nothing** —
-depguard never sees `import "C"`, in either cgo mode. And
-`CGO_ENABLED=0 go build ./...` does not catch it either: build constraints
-exclude the file, the pattern match skips the package, and the build exits zero.
-Both were verified by adding a cgo package. `go list` reporting a non-empty
-`CgoFiles` is what actually fires.
-
 ## Desktop tray app
 
 `source/desktop/` is a macOS-only Tauri app and a client of the daemon exactly as the CLI is:
@@ -388,96 +138,27 @@ part of the Go module, the daemon image, or the release archives. Toolchain and 
 `source/desktop/README.md`; it has its own lint (`eslint`) and licence check (`cargo-deny`) and
 its own CI job.
 
-## Self-update
+## References
 
-A process cannot replace the binary it is executing and keep running, so an
-update is two halves either side of a restart (ADR-0003). The seam between them
-is a database row, which is exactly why `update_state` is in SQLite and not in
-memory.
+Each file below holds the detail for one area, and carries facts that are not restated here.
+**Read the matching reference before changing the area it describes.**
 
-```
-apply:  fetch+verify → PRE-FLIGHT → mark pending → keep .old → rename → exit 0
-boot:   ConfirmBoot → (serving) Confirm → confirmed
-                    → 3 failed boots → restore .old → rolled_back → exit 0
-```
-
-Four orderings carry the whole safety property, and each is mutation-checked:
-
-- **Pre-flight runs while the OLD binary is still in charge.** A checksum proves
-  the bytes are the published ones; it does not prove they execute. A build for
-  the wrong architecture hashes perfectly and exits 203 forever.
-- **`pending` is recorded BEFORE the replacement.** A crash between the two
-  leaves a record against a binary that was never swapped, which `ConfirmBoot`
-  resolves harmlessly. The reverse leaves a swapped binary with no record, and
-  nothing would ever roll it back.
-- **The old binary is kept, not overwritten.** It is the only thing a rollback
-  can restore from, and the boot after a failed update is precisely when the
-  network cannot be assumed to work.
-- **`Confirm` runs once the daemon is SERVING**, not merely constructed — and
-  only then deletes `.old`. A binary that starts and then fails every request has
-  proven nothing.
-
-The boot counter increments BEFORE the attempt is judged, so a binary that dies
-during startup still counts; counting after a successful start would loop
-forever without ever reaching the rollback.
-
-Disabled entirely for a development build (`buildinfo.IsDev()`) and in a
-container, where the image is the unit of deployment. The API says so rather
-than answering 404.
-
-`tumika update` is one of the few commands that does NOT go through the API: the
-case that matters most is a daemon that will not stay up, and an HTTP client
-cannot help an operator whose service is crash-looping.
-
-## Releasing
-
-Tag `vX.Y.Z` and push it. `release.yml` then: re-runs the full gate (including
-the systemd install harness) on that exact commit, runs `goreleaser release`,
-and publishes a multi-arch image to `ghcr.io/tumika/tumika`.
-
-The gate is a full re-run rather than a reference to the commit's CI result,
-because a tag can be pushed to any commit — including one whose PR checks never
-ran.
-
-**Two archives, and both are load-bearing.** The `.tar.gz` is what a person
-downloads; the RAW binary is what `tumika update` fetches and what
-`scripts/install.sh` downloads (ADR-0003), because the updater replaces the
-running binary with an atomic rename and needs one uncompressed file at a
-predictable URL. `scripts/verify-release-assets.sh` checks that contract on both
-the snapshot build in CI and the real release — dropping the raw archive,
-renaming a template, or losing a target are all one-line edits that leave the
-build perfectly green.
-
-It also runs the built binary and asserts it reports the release version.
-Reading `metadata.json` is NOT the same question: goreleaser fills that in from
-the tag whether or not the ldflags reached the compiler. Verified by dropping
-`-X main.version` — the metadata stayed correct and the binary reported `dev`,
-which `buildinfo.IsDev()` treats as "disable self-update entirely".
-
-**The release is published as a DRAFT and promoted only after verification.**
-A gate that runs after `release --clean` reports rather than prevents: the
-broken release would already be downloadable. The promote step is the last thing
-the job does.
-
-`prerelease: auto` matters for the same reason: the tag glob `v*.*.*` matches
-`v1.0.0-rc1`, and a full release at that tag would move `/releases/latest` — and
-therefore the documented `curl … /releases/latest/download/install.sh` — onto an
-RC. The ghcr `:latest` tag is guarded separately, because `type=raw` in
-`docker/metadata-action` is unconditional.
-
-**Releases are cut from `main` only.** The gate asserts the tagged commit is an
-ancestor of `main`: re-running the tests is not the same as knowing the commit
-was reviewed, and anyone who can push a tag could otherwise point it at a commit
-that merely compiles.
-
-**Before any public release:** sign `checksums.txt` with an ECDSA key from
-Actions secrets and verify it in the updater. A checksum fetched from the same
-host as the binary proves the download was not corrupted; it does not prove who
-produced it.
-
-**Reviewing a branch:** `cd` to that branch's worktree first. This session's
-working directory is often an older one, and a review run there silently reviews
-long-merged code — it has produced three rounds of stale findings.
+- `agentic/references/provider-model.md` — capability declaration and credential storage order;
+  read before touching `platform/provider/` or `ProviderService`.
+- `agentic/references/claude-code-pin.md` — the probed Claude Code CLI facts and the pin-bump
+  procedure; read before changing the claudecode driver or moving the pin.
+- `agentic/references/http-api.md` — bearer-token policy and middleware order; read before
+  adding a route or touching middleware.
+- `agentic/references/credential-sealing.md` — envelope encryption and key custody; read before
+  touching `platform/secrets` or `tokencustody`.
+- `agentic/references/service-management.md` — what install must do and what `status` must never
+  report; read before changing `platform/servicemgr` or the install command.
+- `agentic/references/containers-and-ci.md` — the two images and the no-cgo enforcement; read
+  before editing `deploy/` or a workflow.
+- `agentic/references/self-update.md` — the update's two halves and the four orderings that
+  carry its safety; read before touching `UpdateService` or `platform/release`.
+- `agentic/references/releasing.md` — the tag-driven release and the draft promote gate; read
+  before changing goreleaser config or the release workflow.
 
 ## Conventions
 
@@ -491,7 +172,8 @@ long-merged code — it has produced three rounds of stale findings.
   `gosimple` is part of `staticcheck` — do not add it as a separate linter (it will error).
 - Lint must pass with zero issues; `errcheck` is on, so check returned errors.
 - `CLAUDE.md` and `AGENTS.md` are **generated by the agentic toolkit** — do not author or edit
-  them. Edit this file (`agentic/tumika-repo.md`) and `agentic/rules/` instead, then `agtk sync`.
+  them. Edit this file (`agentic/tumika-repo.md`), `agentic/rules/` and `agentic/references/`
+  instead, then `agtk sync`.
 
 ## Boundaries
 
@@ -512,3 +194,7 @@ long-merged code — it has produced three rounds of stale findings.
 This repo uses a bare-repo + typed-worktree layout managed by the `gt` CLI — one session, one
 `gt wt add <type/name>` worktree; never use raw `git worktree` or edit inside `.bare/`. The
 root `.envrc` scopes `GH_TOKEN` to the GitHub user that `gh` commands must run as.
+
+**Reviewing a branch:** `cd` to that branch's worktree first. This session's
+working directory is often an older one, and a review run there silently reviews
+long-merged code — it has produced three rounds of stale findings.

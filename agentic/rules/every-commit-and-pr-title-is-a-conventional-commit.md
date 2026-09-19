@@ -23,7 +23,7 @@ are what this repo uses.
 |---|---|---|
 | `feat` | a new feature | MINOR |
 | `fix` | a bug fix | PATCH |
-| `docs` | documentation only — including `agentic/tumika-repo.md`, `agentic/rules/`, ADRs | — |
+| `docs` | documentation only — including `agentic/tumika-repo.md`, `agentic/rules/`, `agentic/references/`, ADRs | — |
 | `style` | formatting that does not change meaning — rare here, `gofmt` settles it | — |
 | `refactor` | a change that neither fixes a bug nor adds a feature | — |
 | `perf` | a change that improves performance | — |

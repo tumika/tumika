@@ -35,7 +35,8 @@ login flow parses that version's TUI output; a silent self-update is a silent br
 also why the binary is executed by **absolute path**, with no launcher symlink that could be
 repointed.
 
-Bumping the pin is routine and expected (see `agentic/tumika-repo.md`, "Bumping the pin"). What must never
+Bumping the pin is routine and expected (see `agentic/references/claude-code-pin.md`, "Bumping the
+pin"). What must never
 happen is the version moving **without** the transcripts and the parser moving with it.
 
 > This one is not hypothetical either, and it did not take long. The version pinned during the
