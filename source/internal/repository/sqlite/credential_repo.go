@@ -13,7 +13,7 @@ import (
 //
 // It stores ciphertext and never sees a plaintext secret: sealing happens in
 // the service layer, above this. See
-// .agents/rules/never-log-or-return-a-credential-secret.md.
+// agentic/rules/never-log-or-return-a-credential-secret.md.
 type CredentialRepo struct{ s *Store }
 
 func NewCredentialRepo(s *Store) *CredentialRepo { return &CredentialRepo{s: s} }

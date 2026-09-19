@@ -22,6 +22,9 @@ master.key
 /.claude/
 /CLAUDE.md
 /.mcp.json
+/.codex/
+/AGENTS.md
+/.agents/
 
 # goreleaser output
 /dist/

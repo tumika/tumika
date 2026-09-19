@@ -4,7 +4,7 @@
 # `staticcheck`, so enabling `staticcheck` covers the gosimple checks too.
 #
 # `depguard` is the load-bearing linter here. It is the mechanical enforcement
-# of the layering rules documented in .agents/rules/ and ADR-0004: a forbidden
+# of the layering rules documented in agentic/rules/ and ADR-0004: a forbidden
 # import is a red build rather than a review argument. When a layering rule
 # changes, this file and the corresponding rule file change in the same commit.
 version: "2"
@@ -22,7 +22,7 @@ linters:
       rules:
         # LAYER 1 — API is transport only: decode, call one service method,
         # encode. It never reaches the database.
-        # See .agents/rules/all-business-logic-lives-in-the-service-layer.md
+        # See agentic/rules/all-business-logic-lives-in-the-service-layer.md
         api:
           files:
             - "**/source/internal/api/**"
@@ -87,7 +87,7 @@ linters:
                 A repository must not know about its callers.
 
         # RUNNER — supervised long-lived processes depend on services only.
-        # See .agents/rules/runners-depend-on-services-never-repositories.md
+        # See agentic/rules/runners-depend-on-services-never-repositories.md
         runner:
           files:
             - "**/source/internal/runner/**"

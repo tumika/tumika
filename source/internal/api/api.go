@@ -3,7 +3,7 @@
 // A handler decodes the request, calls exactly one service method, and encodes
 // the result. It holds no business rules, opens no transactions and does not
 // import the repository layer — `depguard` fails the build if it tries. See
-// .agents/rules/all-business-logic-lives-in-the-service-layer.md.
+// agentic/rules/all-business-logic-lives-in-the-service-layer.md.
 package api
 
 import (

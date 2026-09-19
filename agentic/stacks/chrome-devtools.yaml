@@ -1,0 +1,3 @@
+description: The Chrome DevTools MCP server, which the shared stacks do not carry.
+mcp:
+  - github.com/pedromvgomes/agentic-toolkit.git/definitions/mcp/chrome-devtools.yaml@main

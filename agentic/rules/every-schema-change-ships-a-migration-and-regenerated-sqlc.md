@@ -1,3 +1,7 @@
+---
+description: "A schema change ships its goose migration and its regenerated sqlc output in the same commit"
+---
+
 # A schema change ships its goose migration and its regenerated sqlc output in the same commit
 
 The database schema has exactly one source of truth: the goose migrations in

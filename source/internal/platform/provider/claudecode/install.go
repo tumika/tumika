@@ -140,7 +140,7 @@ func usable(path string) bool {
 // Absolute, and executed as such: there is deliberately no launcher symlink to
 // repoint and no PATH lookup to win, so the binary tumika runs is the one it
 // verified. See
-// .agents/rules/every-spawned-claude-process-is-credential-isolated.md.
+// agentic/rules/every-spawned-claude-process-is-credential-isolated.md.
 func (i *Installer) Path(version string) string {
 	return filepath.Join(i.root, version, BinaryName)
 }

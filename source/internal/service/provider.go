@@ -19,7 +19,7 @@ import (
 // CredentialRepository, and CredentialMonitorRunner will call VerifyCredential.
 // The sealing AAD and the verify-before-active rule live here, and a second
 // writer would silently skip both. See
-// .agents/rules/a-repository-has-exactly-one-owning-service.md.
+// agentic/rules/a-repository-has-exactly-one-owning-service.md.
 type ProviderService interface {
 	// Seed writes the registry's providers into the database. Run at boot, and
 	// idempotent.

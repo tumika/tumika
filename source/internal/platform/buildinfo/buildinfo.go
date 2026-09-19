@@ -1,7 +1,7 @@
 // Package buildinfo carries the version, commit and build date stamped into the
 // binary at release time, plus the runtime facts that go with them.
 //
-// The values are injected via -ldflags into source/cmd/tumika (see AGENTS.md,
+// The values are injected via -ldflags into source/cmd/tumika (see agentic/tumika-repo.md,
 // "Version injection") and handed here by Set before anything else runs. The
 // zero state is a development build, which several subsystems short-circuit on:
 // self-update refuses to run when IsDev reports true, because a dev build has no

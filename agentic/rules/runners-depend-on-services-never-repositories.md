@@ -1,3 +1,7 @@
+---
+description: "A runner depends on services only, and never on a repository or a database handle"
+---
+
 # A runner depends on services only, and never on a repository or a database handle
 
 A **runner** is a supervised long-lived process:

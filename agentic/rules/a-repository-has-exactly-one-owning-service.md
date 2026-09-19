@@ -1,3 +1,7 @@
+---
+description: "A repository has exactly one owning service; every other caller goes through that service"
+---
+
 # A repository has exactly one owning service; every other caller goes through that service
 
 Each repository interface is constructed and held by **one** service. No repository is injected

@@ -35,7 +35,7 @@ const minimalPath = "/usr/local/bin:/usr/bin:/bin"
 // Claude Code can add a variable tomorrow, and this file would not know. The
 // guarantee comes from building the environment from a fixed list; this is the
 // backstop for when that stops being true. See
-// .agents/rules/every-spawned-claude-process-is-credential-isolated.md.
+// agentic/rules/every-spawned-claude-process-is-credential-isolated.md.
 var deniedEnv = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",

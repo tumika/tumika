@@ -16,7 +16,7 @@ import (
 // It exists so the token is recognisable by shape, which is what lets the log
 // redactor catch one that reaches a log line by accident — the same protection
 // the Anthropic prefixes get. See
-// .agents/rules/never-log-or-return-a-credential-secret.md.
+// agentic/rules/never-log-or-return-a-credential-secret.md.
 const TokenPrefix = "tmk_"
 
 // tokenBytes is the entropy behind the token. 32 bytes is well past anything
@@ -51,7 +51,7 @@ type authService struct{ cfg ConfigService }
 // store is owned by ConfigService and a second writer would bypass the rules
 // that live there. Same shape as LoginService reaching credentials through
 // ProviderService — see
-// .agents/rules/a-repository-has-exactly-one-owning-service.md.
+// agentic/rules/a-repository-has-exactly-one-owning-service.md.
 func NewAuthService(cfg ConfigService) AuthService { return &authService{cfg: cfg} }
 
 func (s *authService) Rotate(ctx context.Context) (string, error) {

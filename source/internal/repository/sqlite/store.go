@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	// Registers the "sqlite" driver. Pure Go, so CGO_ENABLED=0 holds and
-	// cross-compiling for linux/arm64 stays free — see AGENTS.md, Conventions.
+	// cross-compiling for linux/arm64 stays free — see agentic/tumika-repo.md, Conventions.
 	_ "modernc.org/sqlite"
 )
 

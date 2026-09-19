@@ -5,7 +5,7 @@
 #
 # The generated code and the queries move together, in one commit — CI runs
 # `sqlc diff` and fails when they disagree. See
-# .agents/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md.
+# agentic/rules/every-schema-change-ships-a-migration-and-regenerated-sqlc.md.
 #
 # Nothing here is hand-edited. The repository wrappers that turn these row
 # structs into domain types live beside the generated files and are.

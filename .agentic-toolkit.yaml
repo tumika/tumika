@@ -1,5 +1,14 @@
-root: agentic
-extends:
-  - github.com/wardnet/agentic-stacks/wardnet.yaml@main
-mcp:
-  - github.com/pedromvgomes/agentic-toolkit.git/definitions/mcp/chrome-devtools.yaml@main
+platforms: [claude, codex]
+memory:
+  root: .memory
+  agent: claudecode
+stacks:
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/default.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/plannotator.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/serena.yaml
+  - github.com/pedromvgomes/agentic-toolkit.git/stacks/rtk.yaml
+  - ./agentic/stacks/chrome-devtools.yaml
+
+# Repo definitions (we use default ./agentic root, so all definitions there
+# are picked automatically)
+context: ./agentic/tumika-repo.md

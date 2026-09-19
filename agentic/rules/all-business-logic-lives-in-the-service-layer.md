@@ -1,3 +1,7 @@
+---
+description: "An HTTP handler decodes, calls exactly one service method, and encodes — nothing else"
+---
+
 # An HTTP handler decodes, calls exactly one service method, and encodes — nothing else
 
 Every handler in `source/internal/api` is transport code. Its whole job is:

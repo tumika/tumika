@@ -5,7 +5,7 @@
 // goes to a journal or a log file and from there into backups, support bundles
 // and issue reports; a subscription OAuth token is valid for roughly a year and
 // cannot be scoped or revoked selectively. See
-// .agents/rules/never-log-or-return-a-credential-secret.md.
+// agentic/rules/never-log-or-return-a-credential-secret.md.
 package logging
 
 import (
