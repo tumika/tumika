@@ -1,7 +1,7 @@
 # cargo-deny configuration for the desktop app, run by `bulwark scan`.
 #
-# `advisories` and `bans` are left at cargo-deny's defaults: a security advisory
-# or an unmaintained crate fails the scan without anything being listed here.
+# `bulwark scan` checks licences and bans here; `bans` is left at cargo-deny's
+# defaults. Advisories are not part of that scan: cargo-audit covers them.
 
 [licenses]
 # Permissive licences only, and only those the graph actually resolves to. A
