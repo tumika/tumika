@@ -31,7 +31,9 @@ type Release struct {
 	// release, edge-<run number> for an edge build.
 	Tag string
 	// Draft is true while the release is still being assembled. A draft is not
-	// downloadable, so nothing may point at its assets.
+	// downloadable, so nothing may point at its assets, and it is left out of
+	// the result without being reported as a Skip: it is not published yet,
+	// which is not a failure.
 	Draft bool
 	// Prerelease is the flag the release carries on GitHub. The release
 	// workflow sets it from the label, so it must agree with the tag.
@@ -68,7 +70,8 @@ type Document struct {
 	Bytes []byte
 }
 
-// Skip records a release that was not published and why.
+// Skip records a release that was not published and why. A draft is not a
+// skip: it is ignored, so an unfinished release never fails a publish run.
 //
 // A release is skipped whole: an incomplete one is never published half-built,
 // because a BOM missing an asset is a daemon that cannot update.
@@ -240,7 +243,6 @@ func classify(releases []Release) ([]candidate, []indexedSkip) {
 		}
 
 		if rel.Draft {
-			skip("draft")
 			continue
 		}
 		label, channel, err := ParseTag(rel.Tag)

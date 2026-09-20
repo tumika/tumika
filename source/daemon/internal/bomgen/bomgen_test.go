@@ -192,7 +192,8 @@ func TestHeadIsTheMostRecentlyPublished(t *testing.T) {
 	}
 }
 
-// A draft is not downloadable, so nothing may point at its assets.
+// A draft is not downloadable, so nothing may point at its assets, and it is
+// ignored rather than reported as a skip.
 func TestADraftIsNeverPublished(t *testing.T) {
 	draft := stable("2026.09.02", at(9, 9), "0.0.3")
 	draft.Draft = true
@@ -205,8 +206,8 @@ func TestADraftIsNeverPublished(t *testing.T) {
 	if got := parse(t, channelDoc(t, result, release.ChannelStable)).Release; got != "2026.09.01" {
 		t.Errorf("stable head is %s; the draft became the head", got)
 	}
-	if len(result.Skipped) != 1 || result.Skipped[0].Reason != "draft" {
-		t.Fatalf("skip report is %+v, want the draft reported", result.Skipped)
+	if len(result.Skipped) != 0 {
+		t.Fatalf("skip report is %+v, want the draft absent: it is not a failure", result.Skipped)
 	}
 }
 

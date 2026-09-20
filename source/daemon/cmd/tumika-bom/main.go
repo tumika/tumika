@@ -400,7 +400,7 @@ func (s *gitHubSource) Releases(ctx context.Context) ([]bomgen.Release, error) {
 // convert resolves one API entry into what bomgen consumes.
 //
 // A draft's assets are not downloadable, so nothing is fetched for one: bomgen
-// skips it on the draft flag alone, and asking for its files would fail the
+// ignores it on the draft flag alone, and asking for its files would fail the
 // whole run over a release nobody can publish.
 func (s *gitHubSource) convert(ctx context.Context, rel apiRelease) (bomgen.Release, error) {
 	converted := bomgen.Release{

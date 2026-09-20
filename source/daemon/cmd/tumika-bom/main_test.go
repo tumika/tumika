@@ -177,6 +177,26 @@ func TestRunFailsOnASkippedReleaseUnlessSkipsAreAllowed(t *testing.T) {
 	}
 }
 
+func TestRunIgnoresADraftWithoutFailing(t *testing.T) {
+	good := publishedRelease(t, "2026.09.00", "v2026.09.00", false, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	draft := bomgen.Release{Tag: "v2026.09.01", Draft: true, PublishedAt: time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)}
+
+	var stderr bytes.Buffer
+	opts := newOptions(t, newKey(t), stubSource{releases: []bomgen.Release{good, draft}}, &stderr)
+
+	if err := run(context.Background(), opts); err != nil {
+		t.Fatalf("a draft failed the run: %v", err)
+	}
+	for _, path := range []string{"releases/2026.09.00.json", "channels/stable.json"} {
+		if _, err := os.Stat(filepath.Join(opts.outDir, filepath.FromSlash(path))); err != nil {
+			t.Fatalf("%s was not written: %v", path, err)
+		}
+	}
+	if strings.Contains(stderr.String(), "skipped") || strings.Contains(stderr.String(), draft.Tag) {
+		t.Fatalf("the draft was reported:\n%s", stderr.String())
+	}
+}
+
 func TestSigningKeyReadsBothPEMSpellings(t *testing.T) {
 	key := newKey(t)
 	sec1, err := x509.MarshalECPrivateKey(key)
