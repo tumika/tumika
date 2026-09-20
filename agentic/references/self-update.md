@@ -6,7 +6,7 @@ is a database row, which is exactly why `update_state` is in SQLite and not in
 memory.
 
 ```
-apply:  fetch+verify → PRE-FLIGHT → mark pending → keep .old → rename → exit 0
+apply:  head+rule → fetch+verify → PRE-FLIGHT → mark pending → keep .old → rename → exit 0
 boot:   ConfirmBoot → (serving) Confirm → confirmed
                     → 3 failed boots → restore .old → rolled_back → exit 0
 ```
@@ -15,7 +15,11 @@ Four orderings carry the whole safety property, and each is mutation-checked:
 
 - **Pre-flight runs while the OLD binary is still in charge.** A checksum proves
   the bytes are the published ones; it does not prove they execute. A build for
-  the wrong architecture hashes perfectly and exits 203 forever.
+  the wrong architecture hashes perfectly and exits 203 forever. The staged binary
+  runs `version`, whose reported component version must equal the one requested,
+  then `version --json`, whose `schema_version` must not be lower than the
+  database's. Both refusals happen before the `pending` row and before any
+  rename, so the running binary is untouched.
 - **`pending` is recorded BEFORE the replacement.** A crash between the two
   leaves a record against a binary that was never swapped, which `ConfirmBoot`
   resolves harmlessly. The reverse leaves a swapped binary with no record, and
@@ -26,6 +30,47 @@ Four orderings carry the whole safety property, and each is mutation-checked:
 - **`Confirm` runs once the daemon is SERVING**, not merely constructed — and
   only then deletes `.old`. A binary that starts and then fails every request has
   proven nothing.
+
+## Channels and the update rule
+
+The daemon follows the channel in `update.channel` (`stable`, `beta`, `edge`).
+Channels are cumulative and the head is the most recently published release the
+channel receives (ADR-0007). A head replaces the running build when:
+
+- **stable, beta:** it was published later AND its component version is
+  semver-greater. Never an automatic downgrade.
+- **edge:** it was published later. Semver is not consulted.
+
+`supersedes` in `service/update.go` is the one rule; `Check` and `Apply` both
+call it, so an edge downgrade that `Check` offers is not refused by `Apply`. In
+the apply ordering it runs first, after the head is re-read: the requested
+component version must equal the head's, or `Apply` refuses with a conflict.
+
+The running build's publication time comes from its own
+`/releases/<label>.json`. A development build (release `dev`) counts as older.
+A release whose document is not published (404, as with a pruned edge release)
+counts as older. Any other failure, an unverifiable signature or an unreachable
+host, stops the check, because reading it as "older" could downgrade an edge
+daemon on the strength of a document nobody verified.
+
+## Trust chain
+
+The daemon reads `<base>/channels/<channel>.json`, which names the head release
+and its assets, and `<base>/releases/<label>.json` for its own release's
+publication time. Each has a detached signature beside it (`<document>.sig`):
+
+- The signature is ECDSA P-256 over the SHA-256 of the exact bytes. The body is
+  parsed only after it verifies.
+- Verification is against a compiled-in LIST of public keys
+  (`platform/release/keys.go`); any listed key may verify, which is what makes
+  rotation possible.
+- It fails closed. A 404 on a document means no release (`ErrNoRelease`); a 404
+  on its signature means it is refused as unsigned. Tampered, unknown-signer and
+  malformed documents are refused.
+- The asset's `sha256` comes from the signed BOM and is enforced on the download;
+  the file is written only if it matches.
+- The release label from the daemon's own build stamp is validated against a
+  strict pattern before it is placed in a URL.
 
 The boot counter increments BEFORE the attempt is judged, so a binary that dies
 during startup still counts; counting after a successful start would loop
