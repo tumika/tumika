@@ -150,14 +150,58 @@ so goreleaser must keep uploading both. A skipped release fails the run unless
 (`componentBinaries` in `internal/bomgen`) is a skipped release too, so adding a
 component adds a row there.
 
-**An edge build is cut by running the `edge` workflow** (`workflow_dispatch`,
-choosing any branch). It tags the commit `edge-<run number>`, labels it
-`edge.<n>`, suffixes every component version with `-edge.<n>`, publishes a
-prerelease without the gate or an image, keeps the newest five edge releases
-(`scripts/edge-prune.sh`, which only touches tags spelled `edge-<digits>`), and
-dispatches `publish-pages.yml` on `main` rather than calling it, so the signing
-key is never in reach of the branch that was built. A cancelled run can leave a draft and a tag behind;
-the draft is never published and can be deleted by hand.
+**An edge build is cut by dispatching the `edge` workflow on `main`, naming the
+thing to build:**
+
+```sh
+gh workflow run edge.yml --ref main -f ref=<branch, tag or commit>
+```
+
+Dispatching a workflow runs the workflow FILE from the dispatched ref, so
+choosing a branch in the UI would run that branch's definition of every job —
+including the permissions the jobs ask for. The ref is an input instead, and a
+first `guard` job everything else needs fails the run when `github.ref` is not
+`refs/heads/main`. The input is handed to `actions/checkout` and to `env:`, never
+spliced into a `run:` script, where a ref named `$(…)` would execute.
+
+The work splits in two, and the split is the point:
+
+- `build` checks out `ref` with `persist-credentials: false` and holds
+  `contents: read`. It runs the branch's `scripts/edge-version.sh` (labelling the
+  build `edge.<n>` and suffixing every component version with `-edge.<n>`), tags
+  the commit `edge-<run number>` **locally**, runs goreleaser with
+  `--skip=validate,publish` and no token, runs
+  `scripts/verify-release-assets.sh` — which executes the native binary, so it
+  belongs in the job that has one — stages the release's assets into one
+  directory and uploads them as an artifact.
+- `publish` runs `main`'s checkout with `contents: write` and `actions: write`.
+  It treats the artifact strictly as data: it executes nothing out of it, runs no
+  script from the built ref, and checks every downloaded file name against
+  `scripts/edge-check-artifact.sh` before `gh release create` sees it. The tag is
+  created by `--target <built commit>`, so no git credential and no branch code
+  tags anything. Then it promotes the draft as a prerelease, prunes to the newest
+  five edge releases (`scripts/edge-prune.sh`, which only touches tags spelled
+  `edge-<digits>`), and dispatches `publish-pages.yml` on `main` rather than
+  calling it.
+
+Without that split, the branch's own scripts and goreleaser config run beside a
+token that could `gh release upload --clobber` a published release's binary and
+`checksums.txt` — which `publish-pages.yml` then signs.
+
+`scripts/edge-check-artifact.sh <dir> <run-number>` is a closed allow-list, not
+a filter: every entry must be a regular file directly in the directory (no
+subdirectory, no symlink — `gh release create` would upload what a symlink points
+at) and must be one of the four targets' raw binary and `.tar.gz`,
+`checksums.txt`, or `release.yaml`, with all four targets present under one
+component version. The run number comes from `github.run_number`, so a build
+cannot upload assets belonging to another run under this one's tag.
+`goreleaser --skip=publish` leaves the raw binary in a per-target directory under
+the name `tumika`, so the staging step reads the asset name it would have been
+uploaded under out of `dist/artifacts.json`, and copies `release.yaml` explicitly
+because `release.extra_files` is only read by the publish step that was skipped.
+
+A cancelled run can leave a draft behind; the draft is never published and can be
+deleted by hand. It leaves no tag: the tag comes with the release.
 
 **What makes a published release trustworthy is the signature on its BOM.** The
 BOM carries each asset's SHA-256, and the signature covers the exact bytes

@@ -8,13 +8,20 @@ saw:
   - source/daemon/.goreleaser.yml
   - scripts/install-daemon.sh
   - scripts/edge-prune.sh
+  - scripts/edge-check-artifact.sh
   - scripts/check-release-monotonic.sh
   - .github/workflows/publish-pages.yml
   - .github/workflows/edge.yml
   - .github/workflows/release.yml
 ---
 - The bytes signed are the bytes published. tumika-bom signs the serialised document, writes it, and reads the file back to verify; anything that re-serialises, reformats or rewrites a document between that and the deploy (assemble step, a static file overwriting a BOM path) leaves a signature no daemon accepts.
-- The signing key must stay unreachable from any branch but `main`, and from `v*.*.*` tags except those a tag ruleset lets the maintainer create (a job inside the workflow cannot enforce ancestry, since the tagged commit supplies the workflow): it lives in the `release-signing` environment, publish-pages.yml's build job selects it, and edge.yml (which runs from any branch) dispatches publish-pages.yml on main instead of calling it. Calling it, or passing `secrets: inherit`, hands a branch's own tumika-bom source the key.
+- The signing key must stay unreachable from any branch but `main`, and from `v*.*.*` tags except those a tag ruleset lets the maintainer create (a job inside the workflow cannot enforce ancestry, since the tagged commit supplies the workflow): it lives in the `release-signing` environment, publish-pages.yml's build job selects it, and edge.yml dispatches publish-pages.yml on main instead of calling it. Calling it, or passing `secrets: inherit`, hands the built ref's own tumika-bom source the key.
+- edge.yml is dispatched on `main` and takes the thing to build as its `ref` input, because dispatching a workflow runs the workflow FILE from the dispatched ref — choosing a branch in the UI would run that branch's own job definitions and permissions. The `guard` job everything needs refuses a run whose `github.ref` is not `refs/heads/main`.
+- `inputs.ref` and the build job's outputs are branch-chosen values: they go to `actions/checkout` and to `env:` only, never interpolated into a `run:` script, where a ref named `$(…)` executes on the runner.
+- edge.yml's `build` job holds `contents: read` and runs the built ref's code; only `publish` holds `contents: write`, and it runs main's checkout. The publish job must execute NOTHING from the artifact and no script from the built ref — a write token beside branch code can `gh release upload --clobber` a stable release's binary and checksums.txt, which publish-pages.yml then signs.
+- verify-release-assets.sh stays in the read-only build job: it executes the native binary to read back the ldflags stamp, which is exactly what the publish job must not do.
+- scripts/edge-check-artifact.sh is a closed allow-list over the downloaded artifact's file names (four targets' raw binary and .tar.gz at one component version, checksums.txt, release.yaml; no subdirectory, no symlink), anchored on `github.run_number` rather than on anything from the artifact. Widening it widens what a branch can publish under an edge tag.
+- `goreleaser --skip=publish` does not stage the release's assets: the raw binary stays in a per-target directory named `tumika` (its upload name is in dist/artifacts.json) and `release.extra_files` is only read by the skipped publish step, so release.yaml is copied explicitly.
 - The public key embedded in scripts/install-daemon.sh and the first entry of `releaseKeyPEMs` in keys.go must agree. installer_key_test.go guards it; a rotation touches both.
 - Edge tags are `edge-<n>` and must never match release.yml's `v*.*.*` glob or the calendar-tag filter in check-release-monotonic.sh and bomgen's ParseTag; an edge tag that did would start a calendar release or be read as the previous release.
 - edge-prune.sh must only ever consider tags spelled `edge-<digits>`; a widened pattern deletes `v*` releases and their tags.

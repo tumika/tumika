@@ -60,9 +60,11 @@ Two workflows beyond `release.yml` publish the release host (ADR-0009):
   level is `contents: read`; only the `deploy` job holds `pages: write` and
   `id-token: write`, and it checks nothing out. Concurrency group `pages` is
   never cancelled, so one deploy runs at a time.
-- **`edge.yml`** cuts an edge build on dispatch from any branch. Its top level is
-  `contents: read`, the `build` job adds `contents: write`, and its concurrency
-  group is per ref, never cancelled.
+- **`edge.yml`** is dispatched on `main` and builds whatever its `ref` input
+  names. Its top level is `contents: read`; the `build` job that runs the named
+  ref's code stays at `contents: read`, and only the `publish` job — which runs
+  `main`'s checkout — holds `contents: write` and `actions: write`. Concurrency
+  group `edge`, never cancelled.
 
 `release.yml` ends in a `pages` job that calls `publish-pages.yml` (`uses:`,
 passing no secrets). The promote step publishes with `GITHUB_TOKEN`, which raises
@@ -70,14 +72,20 @@ no workflow event, so the trigger would not fire on its own. A called workflow
 cannot hold more permission than its caller, so the job grants `contents: read`,
 `pages: write` and `id-token: write`.
 
-`edge.yml` does not call it. It runs from any branch, and a called workflow runs
-at the caller's commit, which would put that branch's `tumika-bom` source in front
-of the signing key. Its build job (`actions: write`) instead dispatches
-`publish-pages.yml` on `main`. The signing key is a secret of the `release-signing`
-environment, whose deployment-branch policy admits only `main` and `v*.*.*` tags,
-so a run from any other branch cannot resolve it. The environment cannot tell
-whether a `v*.*.*` tag was cut from `main`, so a tag ruleset restricting who may
-create those tags is what closes the tag path.
+`edge.yml` does not call it. A called workflow runs at the caller's commit, and
+the day this workflow is dispatched anywhere but `main` that is the built
+branch's own `tumika-bom` source standing in front of the signing key. Its
+`publish` job (`actions: write`) dispatches `publish-pages.yml` on `main`
+instead. The signing key is a secret of the `release-signing` environment, whose
+deployment-branch policy admits only `main` and `v*.*.*` tags, so a run from any
+other branch cannot resolve it. The environment cannot tell whether a `v*.*.*`
+tag was cut from `main`, so a tag ruleset restricting who may create those tags
+is what closes the tag path.
+
+The branch being built never runs beside a write token: `edge.yml`'s `build` job
+holds `contents: read` and no credentials, and hands its output to the `publish`
+job as an artifact whose file names `scripts/edge-check-artifact.sh` validates
+against a closed allow-list before anything is uploaded.
 
 The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in
 `.github/` invokes them.

@@ -40,13 +40,30 @@ without a release.
   `platform/release/keys.go` holds the list of public keys a daemon trusts. Rotation ships the
   new public key in a release signed by the old key; a daemon that applies it then accepts both.
 
-- **Edge is cut from any branch by `workflow_dispatch`.** `edge.yml` tags the commit
-  `edge-<run number>`, a namespace that never matches `v*.*.*`, so it cannot start the calendar
-  release workflow. The release label is `edge.<n>` and each component version carries an
-  `-edge.<n>` suffix. The workflow keeps the newest five edge releases and deletes the rest with
-  their tags; the prune considers only tags spelled `edge-<digits>` and never a `v*` tag. The
-  edge workflow runs from any branch, so it does not call `publish-pages.yml`, which would run
-  at the branch's commit with the signing key: it dispatches that workflow on `main`.
+- **Edge is dispatched on `main` and builds any ref.** `edge.yml` takes the branch, tag or
+  commit to build as a `workflow_dispatch` input rather than being dispatched on it, because
+  dispatching a workflow runs the workflow FILE from the chosen ref — so a run started on a
+  branch would be that branch's definition of every job, including the permissions each one
+  asks for. A first `guard` job everything else needs refuses a run whose `github.ref` is not
+  `refs/heads/main`. The release is tagged `edge-<run number>`, a namespace that never matches
+  `v*.*.*`, so it cannot start the calendar release workflow; the release label is `edge.<n>`
+  and each component version carries an `-edge.<n>` suffix. The workflow keeps the newest five
+  edge releases and deletes the rest with their tags; the prune considers only tags spelled
+  `edge-<digits>` and never a `v*` tag. It dispatches `publish-pages.yml` on `main` rather than
+  calling it, so a called workflow can never run the built ref's `tumika-bom` source with the
+  signing key.
+
+- **No branch-controlled code runs in a job holding a write token.** `edge.yml` splits in two.
+  `build` checks out the named ref with `persist-credentials: false`, holds `contents: read`,
+  runs that ref's scripts, goreleaser (`--skip=publish`, no token) and
+  `verify-release-assets.sh`, tags only locally, and uploads the release's assets as an
+  artifact. `publish` runs `main`'s checkout with `contents: write` and `actions: write`, treats
+  the artifact strictly as data — it executes nothing out of it and runs no script from the
+  built ref — validates every downloaded file name against `scripts/edge-check-artifact.sh`, and
+  creates the release with `gh release create --target <built commit>`, which is what writes the
+  tag. Undivided, the built branch's own `edge-version.sh` and `.goreleaser.yml` would run
+  beside a token able to `gh release upload --clobber` over a published release's binary and
+  `checksums.txt`, which `publish-pages.yml` then signs.
 
 - **The installer verifies before it trusts.** `scripts/install-daemon.sh` is served from the
   site, not attached to a release. It verifies the BOM's signature with `openssl` against a
@@ -76,8 +93,16 @@ without a release.
   because nothing can tell which of the two is wrong.
 - A release with no `release.yaml` or `checksums.txt` asset is skipped. goreleaser must keep
   uploading both.
-- A cancelled edge run can leave a draft release and a pushed tag behind. The draft is inert:
-  the generator ignores drafts, and the prune ignores them too.
+- A cancelled edge run can leave a draft release behind. The draft is inert: the generator
+  ignores drafts, and the prune ignores them too. It leaves no tag, because the tag is created
+  with the release.
+- The split bounds what an edge build can publish; it does not bound what a maintainer can.
+  Anyone with repository write access can edit or replace the assets of any release directly,
+  and can dispatch their own copy of `edge.yml` — a branch's workflow file is a workflow
+  definition no check written in this one runs inside of. What is not done is attesting the
+  provenance of a stable or beta release's assets before their digests are signed: the BOM
+  generator reads whatever assets the release carries at the moment it runs. Closing that means
+  signing at build time, or comparing against a build attestation, and neither is in place.
 - Every deploy replaces the whole site, so a run that publishes a broken tree takes the
   channels down until the next successful run; `scripts/assemble-site.sh` refuses the tree
   shapes it can recognise as broken.
