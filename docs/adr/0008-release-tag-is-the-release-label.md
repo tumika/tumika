@@ -53,7 +53,8 @@ the workflow builds has to be addressed by the other.
   disagrees with the file is refused by the gate.
 - A release whose component version does not advance is refused rather than published, because
   the update rules never move a stable or beta daemon to a lower or equal component version
-  (ADR-0007).
+  (ADR-0007). Every component listed in `release.yaml` must advance in each release; an
+  unchanged component cannot be listed with its old version.
 - `release.yaml` must ship with every release: the next release's gate and `install.sh` both
   download it.
 - `metadata.json` from goreleaser reports the tag on a release, so it says nothing about the

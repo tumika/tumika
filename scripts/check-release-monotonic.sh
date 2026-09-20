@@ -9,6 +9,9 @@
 # daemon silently stays where it is. Nothing downstream can detect that, so the
 # comparison happens here, before anything is built.
 #
+# Every component listed in release.yaml must advance in each release: an
+# unchanged component cannot be listed with its old version.
+#
 # The previous release is found through the Releases API rather than through git
 # tags: a tag exists the moment it is pushed, while what clients can reach is
 # what has been published. The in-flight release is still a draft at this point,
