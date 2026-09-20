@@ -29,19 +29,28 @@ name: edge
 # workflow runs the workflow FILE from the dispatched ref, so a run dispatched on
 # a branch would be that branch's definition of every job below — including the
 # permissions they ask for. This file is therefore dispatched on main, and takes
-# the thing to build as an input instead. The work splits in two:
+# the thing to build as an input instead. The work splits in four:
 #
 #   - `build` checks out `ref` and runs its scripts, its goreleaser config and
 #     its Go code, holding `contents: read` and no credentials. It publishes
 #     nothing; it uploads an artifact.
-#   - `publish` runs main's checkout with `contents: write`, treats that artifact
-#     strictly as data — it executes nothing out of it — and checks every file
-#     name against scripts/edge-check-artifact.sh before `gh release create`
-#     sees it.
+#   - `desktop` does the same for the macOS app, running the branch's pnpm
+#     scripts, its build.rs and its beforeBuildCommand under `contents: read`.
+#     It builds with the updater artifacts OFF and packs the bundle itself, so
+#     the job that runs branch code holds no key of any kind.
+#   - `sign` runs main's checkout, main's pinned Tauri CLI and the updater
+#     signing key over the archives that job produced. It downloads them as data
+#     and runs `tauri signer sign`, nothing else: the signature a daemon verifies
+#     an app against is written by a job that executes no branch code.
+#   - `publish` runs main's checkout with `contents: write`, treats both
+#     artifacts strictly as data — it executes nothing out of them — and checks
+#     every file name against scripts/edge-check-artifact.sh before
+#     `gh release create` sees it.
 #
 # Without that split, a branch's `scripts/edge-version.sh` runs beside a token
 # that may `gh release upload --clobber` over a published release's binary and
-# checksums.txt, which publish-pages.yml then signs.
+# checksums.txt, which publish-pages.yml then signs — and its `pnpm build` runs
+# beside the one key every desktop update is verified against.
 on:
   workflow_dispatch:
     inputs:
@@ -211,9 +220,238 @@ jobs:
           # outputs do not accumulate. The release is the durable copy.
           retention-days: 7
 
+  # The macOS tray app, built from the ref for the same reason the daemon is: an
+  # edge build that carried the app over would offer a daemon the app version
+  # pairs with and no app to pair it to.
+  #
+  # `contents: read`, no credentials, and — unlike release.yml's desktop job — no
+  # secret at all. This job runs the branch's pnpm scripts, its build.rs and its
+  # beforeBuildCommand, so the updater artifacts are switched OFF and the archive
+  # is packed here as plain data; the `sign` job below is what signs it.
+  #
+  # macos-latest is not a preference: Tauri links against WebKit and AppKit, and
+  # both architectures are cross-compiled with `--target` on that one runner. No
+  # APPLE_* variable is set either, so an edge app is ad-hoc signed exactly as a
+  # release one is today.
+  desktop:
+    name: desktop (${{ matrix.target.platform }})
+    needs: guard
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      # Neither leg is a preview of the other: the pair is what the build
+      # publishes, and seeing both failures is worth more than stopping early.
+      fail-fast: false
+      matrix:
+        target:
+          - { triple: aarch64-apple-darwin, platform: darwin_arm64 }
+          - { triple: x86_64-apple-darwin, platform: darwin_amd64 }
+    env:
+      TRIPLE: ${{ matrix.target.triple }}
+      PLATFORM: ${{ matrix.target.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The input is only ever handed to actions, never spliced into a
+          # `run:` script, where a ref named `$(…)` would execute on the runner.
+          ref: ${{ inputs.ref }}
+          # This job runs the checked-out branch's own code. It has no business
+          # holding a token it could push with.
+          persist-credentials: false
+
+      # pnpm before setup-node: `cache: pnpm` asks node to locate the pnpm store,
+      # which only works once pnpm is on PATH. The pnpm version comes from the
+      # `packageManager` field of the app's package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: source/desktop/package.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.7.0"
+          cache: pnpm
+          cache-dependency-path: source/desktop/pnpm-lock.yaml
+
+      # `--write release.yaml` suffixes every component version in the working
+      # copy, and the desktop component's is then read back out of it — the same
+      # file, through the same script, that the daemon's build job derives its
+      # asset names from and that the BOM generator reads. The two KEY=VALUE lines
+      # the script prints are the daemon's, which this job has no use for; the
+      # redirect is to /dev/null rather than to $GITHUB_ENV, and it keeps the
+      # script's exit status either way.
+      #
+      # Stamped, where release.yml's desktop job only checks: the four files that
+      # each carry a copy of the version are committed carrying the CALENDAR one,
+      # and an edge build's is that value plus the run number, which no commit can
+      # hold. The app reports what the asset name says because of this step.
+      - name: the edge desktop component version
+        run: |
+          scripts/edge-version.sh --write release.yaml "$GITHUB_RUN_NUMBER" >/dev/null
+          version=$(scripts/release-component-version.sh desktop)
+          echo "TUMIKA_DESKTOP_VERSION=$version" >> "$GITHUB_ENV"
+          scripts/desktop-version.sh "$version"
+
+      # --frozen-lockfile fails rather than resolving: a lockfile that disagrees
+      # with package.json means the build is of something nobody committed.
+      - name: pnpm install
+        working-directory: source/desktop
+        run: pnpm install --frozen-lockfile
+
+      # No toolchain argument: rustup reads source/desktop/rust-toolchain.toml,
+      # which pins the channel.
+      - name: install the pinned rust toolchain
+        working-directory: source/desktop
+        run: |
+          rustup toolchain install
+          rustup target add "$TRIPLE"
+
+      # A key prefix of its own, never one release.yml restores. This job builds
+      # whatever branch it was handed, so the cache it writes is branch-controlled
+      # input to every later build that reads it — and a release build must take
+      # no input from a branch that never reached main.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/desktop/src-tauri/target
+          key: cargo-edge-${{ runner.os }}-${{ matrix.target.triple }}-${{ hashFiles('source/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-edge-${{ runner.os }}-${{ matrix.target.triple }}-
+
+      # createUpdaterArtifacts is committed ON, and is turned off here: producing
+      # the updater archive is what makes Tauri want TAURI_SIGNING_PRIVATE_KEY,
+      # and this job must not hold it. The bundle is packed by the step below and
+      # signed by the job after it.
+      - name: tauri build (ad-hoc signed, unsigned archive)
+        working-directory: source/desktop
+        run: |
+          pnpm tauri build --target "$TRIPLE" \
+            -c '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # The same archive Tauri's updater bundler would have written: a gzip tar
+      # whose single top-level entry is the .app, under the asset name the bill of
+      # materials resolves the desktop component by. The updater replaces a bundle
+      # with what this archive holds, so the layout is the contract and
+      # scripts/verify-desktop-assets.sh is what asserts it.
+      #
+      # The bundle is located by glob and required to be the only one, so a
+      # productName change is a failure here rather than an asset packed under a
+      # name taken from a stale expectation. COPYFILE_DISABLE keeps macOS tar from
+      # storing extended attributes as the `._` members Tauri's own archive
+      # carries none of.
+      - name: pack the app bundle under its asset name
+        run: |
+          bundle="source/desktop/src-tauri/target/$TRIPLE/release/bundle/macos"
+          apps=("$bundle"/*.app)
+          if [ "${#apps[@]}" -ne 1 ] || [ ! -d "${apps[0]}" ]; then
+            echo "expected exactly one *.app under $bundle, found: ${apps[*]}" >&2
+            exit 1
+          fi
+          app="${apps[0]##*/}"
+
+          mkdir dist-desktop
+          name="tumika-desktop_${TUMIKA_DESKTOP_VERSION}_${PLATFORM}.app.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "dist-desktop/$name" -C "$bundle" "$app"
+          tar -tzf "dist-desktop/$name"
+          ls -l dist-desktop
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-unsigned-${{ matrix.target.platform }}
+          path: dist-desktop
+          if-no-files-found: error
+          # Long enough to look at a failed publish, short enough that build
+          # outputs do not accumulate. The release is the durable copy.
+          retention-days: 7
+
+  # The updater signature over both archives, and the only job in this workflow
+  # holding a key.
+  #
+  # It runs MAIN's checkout — the workflow's own ref, which `guard` has already
+  # established is main — and main's pinned Tauri CLI, because the archives it
+  # opens were produced by branch code. The two artifacts are downloaded strictly
+  # as DATA: nothing in them is executed, unpacked or read as configuration, and
+  # the only command run over them is `tauri signer sign`.
+  #
+  # `contents: read` and no token: a signature is not something this job
+  # publishes. It hands the signed pair on as another artifact.
+  sign:
+    name: sign
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: source/desktop/package.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.7.0"
+          cache: pnpm
+          cache-dependency-path: source/desktop/pnpm-lock.yaml
+
+      # The signer reads bytes and writes a signature, so this job needs no macOS
+      # toolchain and no cargo: the pinned @tauri-apps/cli is the whole of it, and
+      # the lockfile carries its Linux binary alongside the Darwin ones.
+      - name: pnpm install
+        working-directory: source/desktop
+        run: pnpm install --frozen-lockfile
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-unsigned-*
+          merge-multiple: true
+          path: desktop-assets
+
+      # TAURI_SIGNING_PRIVATE_KEY is the updater keypair's private half — the key
+      # CONTENTS, not a path — and its public half is committed in
+      # tauri.conf.json, which is what an installed app verifies a download
+      # against. The CLI reads both variables from the environment, so neither
+      # value reaches a command line.
+      #
+      # The PASSWORD variable is declared whether or not the key has one: with it
+      # unset the CLI prompts, and a runner has no terminal to prompt at, so the
+      # signing fails with a message about a password it was never going to be
+      # given. An absent secret renders as the empty string, which is what a key
+      # without a password wants.
+      #
+      # `tauri signer sign <file>` writes `<file>.sig` beside it — the base64 of
+      # the minisign document, byte for byte what `tauri build` would have written
+      # with createUpdaterArtifacts on, and what bomgen copies into the BOM's
+      # `signature` field.
+      - name: sign each archive with the updater key
+        working-directory: source/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          archives=("$GITHUB_WORKSPACE"/desktop-assets/*.app.tar.gz)
+          if [ "${#archives[@]}" -ne 2 ]; then
+            echo "expected both legs' archives, found: ${archives[*]}" >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            pnpm tauri signer sign "$archive"
+          done
+          ls -l "$GITHUB_WORKSPACE/desktop-assets"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-signed
+          path: desktop-assets
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: publish
-    needs: build
+    needs: [build, sign]
     runs-on: ubuntu-latest
     # The only elevated job. It runs main's checkout and main's scripts, and
     # nothing from the ref that was built.
@@ -241,8 +479,39 @@ jobs:
           name: edge-assets
           path: edge-assets
 
-      # The artifact is DATA. Nothing in it is executed, sourced or read as
-      # configuration by this job; the only thing taken from it is a set of file
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-signed
+          path: desktop-assets
+
+      # From the release.yaml the build job staged, through main's own script: it
+      # is the file the BOM generator resolves the desktop component's assets by,
+      # so reading the name from anywhere else would verify names nothing else
+      # looks for. The value is data — the script fails on anything that is not a
+      # component version — and the check below anchors it to this run's number.
+      - name: the desktop component version the built ref declares
+        run: |
+          version=$(scripts/release-component-version.sh desktop edge-assets/release.yaml)
+          echo "TUMIKA_DESKTOP_VERSION=$version" >> "$GITHUB_ENV"
+
+      # The digests, computed here from the very bytes about to be uploaded: the
+      # BOM generator reads each asset's SHA-256 out of checksums.txt, which
+      # goreleaser writes for the daemon's assets alone. A digest carried over from
+      # the job that built the app would be a digest that job chose.
+      #
+      # The check reads the app's own Info.plist out of the archive, which is the
+      # only thing that can say the component version reached tauri.conf.json. It
+      # reads and never extracts onto the filesystem, which is what makes it safe
+      # to run here on bytes a branch produced.
+      - name: the desktop assets are what the bill of materials reads
+        run: |
+          scripts/verify-desktop-assets.sh --checksums \
+            desktop-assets "$TUMIKA_DESKTOP_VERSION" > desktop-checksums.txt
+          cat desktop-checksums.txt >> edge-assets/checksums.txt
+          mv desktop-assets/* edge-assets/
+
+      # Both artifacts are DATA. Nothing in them is executed, sourced or read as
+      # configuration by this job; the only thing taken from them is a set of file
       # names, and that set is closed rather than filtered. The run number comes
       # from github.run_number, not from the artifact, so assets belonging to
       # another run cannot be published under this one's tag.
@@ -263,8 +532,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           # shellcheck disable=SC2016 # the backticks are markdown in the release notes
-          notes=$(printf 'Edge build of `%s` at `%s`.\n\nDaemon %s. Not a release: cut without the gate, from a commit that need never have reached main.\n' \
-            "$BUILT_REF" "$BUILT_SHA" "$DAEMON_VERSION")
+          notes=$(printf 'Edge build of `%s` at `%s`.\n\nDaemon %s, desktop %s. Not a release: cut without the gate, from a commit that need never have reached main.\n' \
+            "$BUILT_REF" "$BUILT_SHA" "$DAEMON_VERSION" "$TUMIKA_DESKTOP_VERSION")
           gh release create "edge-$GITHUB_RUN_NUMBER" \
             --draft \
             --prerelease \
@@ -298,11 +567,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: gh release edit "edge-$GITHUB_RUN_NUMBER" --draft=false --prerelease=true
 
-      # Edge builds accumulate without limit otherwise, five raw binaries and
-      # archives at a time. Pruned after the promote, so this run's own build is
-      # among the ones kept. A pruned build's BOM disappears with it, which a
-      # daemon still running it reads as "older than the head" rather than as an
-      # error.
+      # Edge builds accumulate without limit otherwise, a build's worth of raw
+      # binaries, archives and app bundles at a time. Pruned after the promote, so
+      # this run's own build is among the ones kept. A pruned build's BOM
+      # disappears with it, which a daemon still running it reads as "older than
+      # the head" rather than as an error.
       - name: keep the newest five edge builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -344,4 +613,5 @@ jobs:
             echo "| ref | \`$BUILT_REF\` |"
             echo "| commit | \`$BUILT_SHA\` |"
             echo "| daemon | \`$DAEMON_VERSION\` |"
+            echo "| desktop | \`$TUMIKA_DESKTOP_VERSION\` |"
           } >> "$GITHUB_STEP_SUMMARY"

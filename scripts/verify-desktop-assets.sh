@@ -137,7 +137,12 @@ check_archive() {
   [[ -n "$member" ]] \
     || fail "'$name' contains no Tumika.app/Contents/Info.plist; the updater replaces an app bundle with what this archive holds"
 
-  plist=$(tar -xzOf "$path" "$member") || fail "could not read $member out of '$name'"
+  # To stdout, and with the member name behind `--`: the archive is built by the
+  # job that runs the branch's own code, and tar reads an operand beginning with
+  # a dash as an option — `--to-command` among them — wherever it appears. Nothing
+  # here is extracted onto the filesystem, so a member path reaching outside the
+  # directory or through a symlink has nowhere to land.
+  plist=$(tar -xzOf "$path" -- "$member") || fail "could not read $member out of '$name'"
   got=$(plist_version "$plist")
   if [[ -z "$got" ]]; then
     ok "$name — gzip tar carrying $member, whose CFBundleShortVersionString no tool here could read and which is therefore not asserted"
