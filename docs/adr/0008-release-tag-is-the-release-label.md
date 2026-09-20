@@ -37,9 +37,11 @@ the workflow builds has to be addressed by the other.
   `prerelease: auto` reads the tag and cannot be templated, so it is not the value the release
   ends up with; a label carrying `-beta.` is promoted as a prerelease.
 
-- **`install.sh` reads the component version from the release's `release.yaml`.**
-  `TUMIKA_VERSION` names a release tag, and the script downloads that release's `release.yaml`
-  to learn which asset name to fetch.
+- **A client is told the asset name; it never derives one.** `scripts/install-daemon.sh` and
+  the updater both read the asset's URL and SHA-256 out of a signed bill of materials, which
+  the generator builds by matching a release's assets against the component version
+  `release.yaml` names. No client ever has to know that the tag and the asset name carry
+  different versions.
 
 ## Considered alternatives
 
@@ -55,7 +57,7 @@ the workflow builds has to be addressed by the other.
   the update rules never move a stable or beta daemon to a lower or equal component version
   (ADR-0007). Every component listed in `release.yaml` must advance in each release; an
   unchanged component cannot be listed with its old version.
-- `release.yaml` must ship with every release: the next release's gate and `install.sh` both
-  download it.
+- `release.yaml` must ship with every release: the next release's gate downloads it to compare
+  component versions.
 - `metadata.json` from goreleaser reports the tag on a release, so it says nothing about the
   component version.

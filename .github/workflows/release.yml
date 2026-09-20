@@ -169,21 +169,22 @@ jobs:
       - name: the release ships what the updater and installer expect
         run: scripts/verify-release-assets.sh
 
-      # install.sh and release.yaml are delivered by `release.extra_files`, so
-      # they never appear under dist/ and the script above cannot see them.
-      # install.sh downloads release.yaml to resolve the asset name, so deleting
-      # either line from .goreleaser.yml would leave every check green and break
-      # the install command in this release's own notes — so the draft's asset
-      # list is what gets asked.
-      - name: the documented install command will work
+      # release.yaml is delivered by `release.extra_files`, so it never appears
+      # under dist/ and the script above cannot see it; checksums.txt is
+      # uploaded by goreleaser itself. The next release's gate downloads this
+      # release's release.yaml to enforce that every component version advances,
+      # so losing the extra_files line would leave every check here green and
+      # disarm that gate one release later — the draft's asset list is what gets
+      # asked instead.
+      - name: the release carries the assets the next one depends on
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
           echo "$assets"
-          for want in install.sh release.yaml checksums.txt; do
+          for want in release.yaml checksums.txt; do
             grep -qx "$want" <<<"$assets" \
-              || { echo "the release has no $want; the documented install command would 404" >&2; exit 1; }
+              || { echo "the release has no $want" >&2; exit 1; }
           done
 
       # Promoted only now. This is the step that makes the release public and
@@ -193,9 +194,10 @@ jobs:
       # `prerelease: auto` cannot be templated — it can only read the tag — and
       # this flag is the value the release ends up with whatever goreleaser
       # inferred. It comes from the release label, the same source as everything
-      # else this job publishes: a beta label carries `-beta.`, and promoting one
-      # as a full release would move /releases/latest, and therefore the
-      # documented releases/latest/download/install.sh URL, onto a beta.
+      # else this job publishes: a beta label carries `-beta.`, and the BOM
+      # generator refuses a release whose GitHub prerelease flag disagrees with
+      # the channel its tag names — so a beta promoted as a full release is one
+      # the site never carries.
       - name: publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -301,3 +303,27 @@ jobs:
             RELEASE=${{ steps.buildmeta.outputs.release }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.buildmeta.outputs.date }}
+
+  # Called, not left to publish-pages.yml's own `release: published` trigger.
+  # The promote step above publishes the release with the default GITHUB_TOKEN,
+  # and GitHub does not raise workflow events for anything that token did — so
+  # that trigger never fires after a real release, and the site would keep
+  # serving the previous channel heads until the weekly schedule caught up.
+  #
+  # It runs last: the BOM generator reads PUBLISHED releases, so it has nothing
+  # to publish until the promote step has run, and the release notes point at an
+  # image the job above pushes.
+  #
+  # A called workflow cannot hold more permission than the job that calls it,
+  # so the two the deploy job in publish-pages.yml needs are granted here; the
+  # top of this file stays read-only. `secrets: inherit` satisfies the signing
+  # key that workflow declares as required.
+  pages:
+    name: pages
+    needs: [goreleaser, image]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-pages.yml
+    secrets: inherit

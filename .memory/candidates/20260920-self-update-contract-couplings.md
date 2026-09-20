@@ -1,5 +1,5 @@
 ---
-about: the self-update contract is coupled to the component semver on the version line, the ConfirmBoot-before-Migrate boot order, the bearer-token policy and install.sh's /releases/latest; what changing it breaks
+about: the self-update contract is coupled to the component semver on the version line, the ConfirmBoot-before-Migrate boot order, the bearer-token policy and the installer's signed-BOM discovery; what changing it breaks
 saw:
   - source/daemon/internal/service/update.go
   - source/daemon/internal/daemon/daemon.go
@@ -7,7 +7,7 @@ saw:
   - source/daemon/internal/domain/state.go
   - source/daemon/internal/api/middleware.go
   - scripts/verify-release-assets.sh
-  - scripts/install.sh
+  - scripts/install-daemon.sh
   - agentic/references/http-api.md
 ---
 Couplings that hold as of 2026-09-20:
@@ -16,4 +16,4 @@ Couplings that hold as of 2026-09-20:
 - daemon.go runs `ConfirmBoot` BEFORE `sqlite.Migrate`. `ErrSchemaTooNew` (migrate.go) is therefore a failed boot that has ALREADY been counted: a schema-refusing binary reaches `MaxBootAttempts` (3, domain/state.go) and rolls back. That is why the pre-flight refuses a staged binary whose embedded schema is lower than the database's before the pending row is written, while the old binary is still in charge.
 - The pre-flight execs `<bin> version` and `<bin> version --json` with a minimal environment and never opens the database, so the schema comparison has to use the number the staged binary reports, not a database read by it.
 - Auth: http-api.md "no exemptions, including /v1/health"; middleware.go says the same. An unauthenticated version route contradicts documented policy, and `/v1/version` (which carries the release, channel and schema version) stays behind the token.
-- scripts/install.sh resolves the release tag through the GitHub /releases/latest redirect and then reads the daemon component version from that release's release.yaml asset; the redirect is separate from the daemon's own signed-BOM discovery and is not covered by the BOM trust chain.
+- scripts/install-daemon.sh discovers a release the same way the daemon does: it fetches a channel head (or a pinned label's document) from get.tumika.org, verifies the detached signature against a release public key embedded in the script, and only then reads the asset URL and SHA-256 out of it. The embedded key is the first entry of releaseKeyPEMs in platform/release/keys.go and TestInstallerKeyMatchesReleaseKey fails when the two drift, so a first install and a self-update sit on one trust chain rather than two.

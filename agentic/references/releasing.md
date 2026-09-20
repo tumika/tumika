@@ -11,10 +11,12 @@ because a tag can be pushed to any commit — including one whose PR checks neve
 ran.
 
 **Two archives, and both are load-bearing.** The `.tar.gz` is what a person
-downloads; the RAW binary is what `tumika update` fetches and what
-`scripts/install.sh` downloads (ADR-0003), because the updater replaces the
-running binary with an atomic rename and needs one uncompressed file at a
-predictable URL. `scripts/verify-release-assets.sh` checks that contract on both
+downloads; the RAW binary is the one the bill of materials names, so it is what
+`tumika update` and `scripts/install-daemon.sh` both fetch (ADR-0003), because
+the updater replaces the running binary with an atomic rename and needs one
+uncompressed file at a predictable URL. The BOM generator finds it by the prefix
+`tumika_<daemon component version>_`, which is why the name template is part of
+the contract. `scripts/verify-release-assets.sh` checks that contract on both
 the snapshot build in CI and the real release — dropping the raw archive,
 renaming a template, or losing a target are all one-line edits that leave the
 build perfectly green.
@@ -73,18 +75,35 @@ the job does.
 
 The promote step passes `--prerelease` explicitly, derived from the label
 (`-beta.` means prerelease). goreleaser's `prerelease: auto` cannot be templated
-and reads the tag, so it is not the value the release ends up with; a beta
-promoted as a full release would move `/releases/latest` — and therefore the
-documented `curl … /releases/latest/download/install.sh` — onto a beta. The
-ghcr `:latest` tag is guarded separately, because `type=raw` in
-`docker/metadata-action` is unconditional; it is enabled only for a stable
+and reads the tag, so it is not the value the release ends up with; and the BOM
+generator refuses a release whose GitHub prerelease flag disagrees with the
+channel its tag names, so a beta promoted as a full release is one the site
+never carries. The ghcr `:latest` tag is guarded separately, because `type=raw`
+in `docker/metadata-action` is unconditional; it is enabled only for a stable
 label.
 
-**`install.sh` is addressed by release tag.** `TUMIKA_VERSION` names a release
-tag (`v2026.09.01`, with or without the `v`), not a component version. The script
-downloads that release's `release.yaml` asset to learn the daemon component
-version and so the asset name, which is why the workflow's install-command step
-requires `install.sh`, `release.yaml` and `checksums.txt` in the draft.
+**The site is published by a job of this workflow, not by its own trigger.**
+`publish-pages.yml` listens for `release: published`, but the promote step
+publishes with the default `GITHUB_TOKEN` and GitHub raises no workflow event
+for anything that token does — so after a real release that trigger never fires.
+The `pages` job calls the workflow directly (`uses:` plus `secrets: inherit`),
+after both the promote step and the image push. A called workflow cannot hold
+more permission than the job calling it, so that job grants the `pages: write`
+and `id-token: write` its deploy job needs while the top of `release.yml` stays
+read-only. The weekly schedule and `workflow_dispatch` on `publish-pages.yml`
+remain the recovery paths.
+
+**A first install and a self-update share one trust chain.**
+`scripts/install-daemon.sh` is served from `https://get.tumika.org`, never
+attached to a release — a first-time user has no release to download it from. It
+fetches a channel's signed bill of materials, verifies it against the release
+public key embedded in the script, and reads the asset URL and SHA-256 out of
+the verified document. `TUMIKA_CHANNEL` selects the channel (`stable`, the
+default, `beta` or `edge`); `TUMIKA_VERSION` pins a release LABEL
+(`2026.09.01`, `2026.09.01-beta.1`, `edge.417`; a leading `v` is accepted and
+dropped) and replaces the channel lookup entirely. Neither names a component
+version: the document does that. The workflow's asset check therefore asks only
+for `release.yaml` and `checksums.txt` in the draft.
 
 **Releases are cut from `main` only.** The gate asserts the tagged commit is an
 ancestor of `main`: re-running the tests is not the same as knowing the commit
