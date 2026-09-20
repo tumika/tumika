@@ -72,16 +72,21 @@ var (
 // signature — rather than reporting both as the same transport failure.
 var errNotFound = errors.New("not found")
 
-// Source is what UpdateService consumes: the daemon component version at the
-// head of the stable channel, and a download of that release's binary.
+// Source is what UpdateService consumes: what a channel currently offers, when
+// a given release was published, and a download of an asset one of those
+// documents names.
+//
+// Everything here comes from a verified bill of materials, so an implementation
+// hands the updater a decision it can act on without checking the bytes again.
 type Source interface {
-	// Latest is the daemon component version at the head of the stable
-	// channel, without a leading "v".
-	Latest(ctx context.Context) (string, error)
-	// Fetch downloads that version's binary for this platform to dest,
-	// verifying it against the digest the bill of materials publishes before
-	// returning.
-	Fetch(ctx context.Context, version, dest string) error
+	// Head is what the channel currently offers for this platform.
+	Head(ctx context.Context, channel Channel) (Head, error)
+	// ReleaseBOM is one release's own bill of materials, looked up by label.
+	// It is how a daemon learns when its own release was published.
+	ReleaseBOM(ctx context.Context, label string) (*BOM, error)
+	// FetchAsset downloads an asset to dest, verifying it against the digest
+	// the bill of materials publishes before returning.
+	FetchAsset(ctx context.Context, asset Asset, dest string) error
 }
 
 // Head is what a channel currently offers, read from a verified bill of
@@ -217,34 +222,6 @@ func (g *GitHub) ReleaseBOM(ctx context.Context, label string) (*BOM, error) {
 		return nil, fmt.Errorf("%w: %s describes release %q", ErrMalformedBOM, docURL, bom.Release)
 	}
 	return bom, nil
-}
-
-// Latest is the daemon component version the stable channel offers.
-func (g *GitHub) Latest(ctx context.Context) (string, error) {
-	head, err := g.Head(ctx, ChannelStable)
-	if err != nil {
-		return "", err
-	}
-	return head.Version, nil
-}
-
-// Fetch downloads the stable head's binary, provided it is the version asked
-// for.
-//
-// Refusing a mismatch is what keeps the caller's decision and the bytes it gets
-// the same release: the head can move between a check and an apply, and
-// installing whatever the channel now offers would install a version nothing
-// approved.
-func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
-	head, err := g.Head(ctx, ChannelStable)
-	if err != nil {
-		return err
-	}
-	if head.Version != strings.TrimPrefix(version, "v") {
-		return fmt.Errorf("%w: the stable head %s ships %s %s, not %s",
-			ErrNoAsset, head.Release, DaemonComponent, head.Version, version)
-	}
-	return g.FetchAsset(ctx, head.Asset, dest)
 }
 
 // FetchAsset downloads an asset a bill of materials names and verifies it

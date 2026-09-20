@@ -391,30 +391,25 @@ func TestAReleaseKeyedDaemonRefusesATestSignature(t *testing.T) {
 	}
 }
 
-func TestLatestIsTheStableHead(t *testing.T) {
-	h := newHost(t)
-	asset := h.serveBinary("tumika", "the new binary")
-	h.serveChannel(daemonBOM("2026.09.00", ChannelStable, published, "0.0.1", asset))
-	h.serveChannel(daemonBOM("edge.147", ChannelEdge, published.Add(time.Hour), "0.0.2-edge.147", asset))
-	src := h.source()
-
-	got, err := src.Latest(context.Background())
+// fetchStableHead resolves the stable head and downloads its daemon asset,
+// which is the pair of calls the updater makes once a check has decided to
+// apply.
+func fetchStableHead(ctx context.Context, src *GitHub, dest string) error {
+	head, err := src.Head(ctx, ChannelStable)
 	if err != nil {
-		t.Fatalf("Latest: %v", err)
+		return err
 	}
-	if got != "0.0.1" {
-		t.Errorf("Latest = %q, want the stable head 0.0.1 without a leading v", got)
-	}
+	return src.FetchAsset(ctx, head.Asset, dest)
 }
 
-func TestFetchVerifiesAndInstalls(t *testing.T) {
+func TestFetchAssetVerifiesAndInstalls(t *testing.T) {
 	h := newHost(t)
 	asset := h.serveBinary("tumika", "the new binary")
 	h.serveChannel(daemonBOM("2026.09.00", ChannelStable, published, "0.0.1", asset))
 	src := h.source()
 
 	dest := filepath.Join(t.TempDir(), "tumika")
-	if err := src.Fetch(context.Background(), "0.0.1", dest); err != nil {
+	if err := fetchStableHead(context.Background(), src, dest); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 
@@ -436,27 +431,10 @@ func TestFetchVerifiesAndInstalls(t *testing.T) {
 	}
 }
 
-// The head can move between a check and an apply, and installing whatever the
-// channel now offers would install a version nothing approved.
-func TestFetchRefusesAVersionTheHeadDoesNotShip(t *testing.T) {
-	h := newHost(t)
-	asset := h.serveBinary("tumika", "the new binary")
-	h.serveChannel(daemonBOM("2026.09.00", ChannelStable, published, "0.0.1", asset))
-	src := h.source()
-
-	dest := filepath.Join(t.TempDir(), "tumika")
-	if err := src.Fetch(context.Background(), "0.0.2", dest); err == nil {
-		t.Fatal("a version the head does not ship was installed")
-	}
-	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
-		t.Error("something was written for a version the head does not ship")
-	}
-}
-
 // THE property. A substituted or corrupted download must never reach the binary
 // path — this is the only thing standing between a compromised mirror and a
 // binary the daemon will execute as a service account.
-func TestFetchRefusesASHA256Mismatch(t *testing.T) {
+func TestFetchAssetRefusesASHA256Mismatch(t *testing.T) {
 	h := newHost(t)
 	asset := h.serveBinary("tumika", "a binary nobody published")
 	asset.SHA256 = strings.Repeat("0", 64)
@@ -464,7 +442,7 @@ func TestFetchRefusesASHA256Mismatch(t *testing.T) {
 	src := h.source()
 
 	dest := filepath.Join(t.TempDir(), "tumika")
-	if err := src.Fetch(context.Background(), "0.0.1", dest); !errors.Is(err, ErrChecksumMismatch) {
+	if err := fetchStableHead(context.Background(), src, dest); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("= %v, want ErrChecksumMismatch", err)
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
@@ -474,7 +452,7 @@ func TestFetchRefusesASHA256Mismatch(t *testing.T) {
 
 // A truncated download hashes differently, so the digest catches it — but the
 // point is what is left behind, because the caller is about to exec this path.
-func TestFetchLeavesNothingAfterATruncatedDownload(t *testing.T) {
+func TestFetchAssetLeavesNothingAfterATruncatedDownload(t *testing.T) {
 	h := newHost(t)
 	full := "the new binary, in full"
 	sum := sha256.Sum256([]byte(full))
@@ -485,7 +463,7 @@ func TestFetchLeavesNothingAfterATruncatedDownload(t *testing.T) {
 
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "tumika")
-	if err := src.Fetch(context.Background(), "0.0.1", dest); !errors.Is(err, ErrChecksumMismatch) {
+	if err := fetchStableHead(context.Background(), src, dest); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("= %v, want ErrChecksumMismatch", err)
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
@@ -505,7 +483,7 @@ func TestFetchLeavesNothingAfterATruncatedDownload(t *testing.T) {
 
 // A 5xx on the binary itself, with a valid bill of materials — a CDN failing
 // mid-release. Nothing must be installed.
-func TestFetchWithAServerErrorOnTheBinary(t *testing.T) {
+func TestFetchAssetWithAServerErrorOnTheBinary(t *testing.T) {
 	h := newHost(t)
 	h.mux.HandleFunc("/download/tumika", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
@@ -515,7 +493,7 @@ func TestFetchWithAServerErrorOnTheBinary(t *testing.T) {
 	src := h.source()
 
 	dest := filepath.Join(t.TempDir(), "tumika")
-	if err := src.Fetch(context.Background(), "0.0.1", dest); err == nil {
+	if err := fetchStableHead(context.Background(), src, dest); err == nil {
 		t.Fatal("a 502 on the binary was accepted")
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
@@ -524,7 +502,7 @@ func TestFetchWithAServerErrorOnTheBinary(t *testing.T) {
 }
 
 // An unwritable destination directory is an error, not a silent no-op.
-func TestFetchIntoAnUnwritableDirectory(t *testing.T) {
+func TestFetchAssetIntoAnUnwritableDirectory(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores the permission bits this relies on")
 	}
@@ -540,13 +518,13 @@ func TestFetchIntoAnUnwritableDirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	if err := src.Fetch(context.Background(), "0.0.1", filepath.Join(dir, "tumika")); err == nil {
+	if err := fetchStableHead(context.Background(), src, filepath.Join(dir, "tumika")); err == nil {
 		t.Fatal("staging into an unwritable directory reported success")
 	}
 }
 
 // A cancelled context stops the download rather than running to completion.
-func TestFetchRespectsCancellation(t *testing.T) {
+func TestFetchAssetRespectsCancellation(t *testing.T) {
 	h := newHost(t)
 	asset := h.serveBinary("tumika", "the new binary")
 	h.serveChannel(daemonBOM("2026.09.00", ChannelStable, published, "0.0.1", asset))
@@ -556,7 +534,7 @@ func TestFetchRespectsCancellation(t *testing.T) {
 	cancel()
 
 	dest := filepath.Join(t.TempDir(), "tumika")
-	if err := src.Fetch(ctx, "0.0.1", dest); err == nil {
+	if err := fetchStableHead(ctx, src, dest); err == nil {
 		t.Fatal("a cancelled fetch reported success")
 	}
 }
@@ -565,7 +543,7 @@ func TestFetchRespectsCancellation(t *testing.T) {
 // directory, and the deferred cleanup only covers the call that made it. On the
 // Pi + SD card this targets, repeated failed updates accumulate ~20 MB each
 // until the card is full.
-func TestFetchSweepsLeftoversFromInterruptedDownloads(t *testing.T) {
+func TestFetchAssetSweepsLeftoversFromInterruptedDownloads(t *testing.T) {
 	h := newHost(t)
 	asset := h.serveBinary("tumika", "the new binary")
 	h.serveChannel(daemonBOM("2026.09.00", ChannelStable, published, "0.0.1", asset))
@@ -587,7 +565,7 @@ func TestFetchSweepsLeftoversFromInterruptedDownloads(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := src.Fetch(context.Background(), "0.0.1", filepath.Join(dir, "tumika")); err != nil {
+	if err := fetchStableHead(context.Background(), src, filepath.Join(dir, "tumika")); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 

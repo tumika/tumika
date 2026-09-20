@@ -28,8 +28,9 @@ func newUpdateCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Update tumika to the newest release",
-		Long: "Downloads the newest published release, verifies it against the release's\n" +
-			"checksums, runs it once to confirm it works, and replaces this binary.\n\n" +
+		Long: "Downloads what the update.channel setting's channel currently offers, verifies\n" +
+			"it against the signed bill of materials, runs it once to confirm it works, and\n" +
+			"replaces this binary.\n\n" +
 			"The previous binary is kept as tumika.old until the new one has booted and\n" +
 			"served successfully. If it fails to start three times, the old one is\n" +
 			"restored automatically.\n\n" +
@@ -56,7 +57,7 @@ func newUpdateCmd(g *globals) *cobra.Command {
 
 	cmd.Flags().BoolVar(&check, "check", false, "report what is available without installing it")
 	cmd.Flags().StringVar(&version, "to", "",
-		"install a specific version instead of the newest (must still be newer than the running one)")
+		"install a specific component version (it must be the one the channel's head ships)")
 
 	return cmd
 }

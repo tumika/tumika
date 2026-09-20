@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tumika/tumika/source/daemon/internal/domain"
+	"github.com/tumika/tumika/source/daemon/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/daemon/internal/platform/release"
 	"github.com/tumika/tumika/source/daemon/internal/repository"
 )
@@ -44,13 +46,17 @@ type UpdateService interface {
 	// State is what the API reports.
 	State(ctx context.Context) (domain.UpdateState, error)
 
-	// Check reports the newest published version, and whether it is newer than
-	// this binary. It touches nothing.
+	// Check reports the daemon component version at the head of the channel
+	// this daemon follows, and whether the update rules allow moving to it. It
+	// touches nothing.
 	Check(ctx context.Context) (available string, newer bool, err error)
 
 	// Apply downloads, verifies, pre-flights and installs a version, then
-	// returns. It does NOT exit the process — the caller decides when, because
-	// only the caller knows whether a request is still in flight.
+	// returns. The version must be the one the channel's head ships, and the
+	// same rules Check applies decide whether it may be installed.
+	//
+	// It does NOT exit the process — the caller decides when, because only the
+	// caller knows whether a request is still in flight.
 	Apply(ctx context.Context, version string) error
 
 	// ConfirmBoot runs at startup, before serving.
@@ -67,6 +73,30 @@ type UpdateService interface {
 	Confirm(ctx context.Context) error
 }
 
+// UpdateDeps is what the updater is assembled from.
+type UpdateDeps struct {
+	Repo   repository.UpdateStateRepository
+	Source release.Source
+	Tx     repository.Txer
+	// Settings is narrowed to reading: update.channel is owned by
+	// ConfigService, and an updater has no business holding the interface that
+	// can also write a setting or read a secret one.
+	Settings SettingGetter
+	// Schema reports the migration version the database is at. The pre-flight
+	// compares it with what the staged binary embeds, so a binary that could
+	// not run against this database is refused while the old one is still in
+	// charge.
+	Schema SchemaVersionFunc
+	// Version is the running component's semver; Release is the label of the
+	// release that shipped it, which is what its publication time is looked up
+	// by.
+	Version string
+	Release string
+	// Binary is the path this daemon's executable lives at, and the path an
+	// update replaces.
+	Binary string
+}
+
 type updateService struct {
 	// mu serialises the whole state machine.
 	//
@@ -74,17 +104,12 @@ type updateService struct {
 	// and write the row back. Two Applies interleaving is not a theoretical
 	// race: the scheduled runner and POST /v1/update/apply can both fire, and
 	// each is a multi-second download followed by two renames.
-	mu      sync.Mutex
-	repo    repository.UpdateStateRepository
-	source  release.Source
-	tx      repository.Txer
-	version string
-	// binary is the path this daemon's executable lives at, and the path an
-	// update replaces.
-	binary string
-	// exec runs the pre-flight. Injected so the check itself is testable
-	// without building a second binary.
-	exec func(ctx context.Context, path string) (string, error)
+	mu   sync.Mutex
+	deps UpdateDeps
+	// exec runs a pre-flight command on the staged binary and returns its
+	// output. Injected so the checks themselves are testable without building a
+	// second binary.
+	exec func(ctx context.Context, path string, args ...string) (string, error)
 	now  func() time.Time
 }
 
@@ -92,7 +117,7 @@ type updateService struct {
 type UpdateOption func(*updateService)
 
 // WithUpdateExec replaces the pre-flight exec.
-func WithUpdateExec(f func(ctx context.Context, path string) (string, error)) UpdateOption {
+func WithUpdateExec(f func(ctx context.Context, path string, args ...string) (string, error)) UpdateOption {
 	return func(s *updateService) { s.exec = f }
 }
 
@@ -102,21 +127,21 @@ func WithUpdateClock(f func() time.Time) UpdateOption {
 }
 
 // NewUpdateService builds the service.
-func NewUpdateService(
-	repo repository.UpdateStateRepository,
-	source release.Source,
-	tx repository.Txer,
-	version, binary string,
-	opts ...UpdateOption,
-) UpdateService {
+//
+// A nil Schema refuses every update rather than skipping the schema
+// pre-flight: an updater that cannot learn what the database is at cannot tell
+// whether the binary it is about to install can run against it, and a swap made
+// in that ignorance is the one that leaves a daemon unable to start.
+func NewUpdateService(deps UpdateDeps, opts ...UpdateOption) UpdateService {
+	if deps.Schema == nil {
+		deps.Schema = func(context.Context) (int64, error) {
+			return 0, errors.New("the database schema version is unavailable")
+		}
+	}
 	s := &updateService{
-		repo:    repo,
-		source:  source,
-		tx:      tx,
-		version: version,
-		binary:  binary,
-		exec:    execVersion,
-		now:     func() time.Time { return time.Now().UTC() },
+		deps: deps,
+		exec: execVersion,
+		now:  func() time.Time { return time.Now().UTC() },
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -125,15 +150,82 @@ func NewUpdateService(
 }
 
 func (s *updateService) State(ctx context.Context) (domain.UpdateState, error) {
-	return s.repo.Get(ctx)
+	return s.deps.Repo.Get(ctx)
 }
 
 func (s *updateService) Check(ctx context.Context) (string, bool, error) {
-	latest, err := s.source.Latest(ctx)
+	channel, head, err := s.head(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	return latest, release.Newer(latest, s.version), nil
+	publishedAt, err := s.publishedAt(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	return head.Version, supersedes(channel, head, s.deps.Version, publishedAt), nil
+}
+
+// head reads the channel this daemon follows and what that channel offers.
+func (s *updateService) head(ctx context.Context) (release.Channel, release.Head, error) {
+	name, err := String(ctx, s.deps.Settings, KeyUpdateChannel)
+	if err != nil {
+		return "", release.Head{}, fmt.Errorf("read the update channel: %w", err)
+	}
+	channel := release.Channel(name)
+	if err := release.ValidateChannel(channel); err != nil {
+		return "", release.Head{}, err
+	}
+	head, err := s.deps.Source.Head(ctx, channel)
+	if err != nil {
+		return "", release.Head{}, err
+	}
+	return channel, head, nil
+}
+
+// supersedes reports whether a channel's head should replace the running build.
+//
+// Publication order decides in every channel, because a release label is never
+// compared: the head is whatever was published most recently. Stable and beta
+// additionally require a greater component version, so a daemon there is never
+// walked backwards by a republished older release. Edge asks for recency alone,
+// which is what lets it hand out 0.0.2-edge.147 after 0.0.2 — semver ranks a
+// prerelease BELOW the version it was cut from, so requiring a greater version
+// would strand every edge daemon on the first non-prerelease it saw.
+//
+// Check and Apply both decide here. Two copies of this comparison is how an
+// edge downgrade becomes an update the daemon offers and then refuses to
+// install.
+func supersedes(channel release.Channel, head release.Head, version string, publishedAt time.Time) bool {
+	if !release.Later(head.PublishedAt, publishedAt) {
+		return false
+	}
+	if channel == release.ChannelEdge {
+		return true
+	}
+	return release.Newer(head.Version, version)
+}
+
+// publishedAt is when the release this binary was shipped in was published.
+//
+// A development build, and a build whose bill of materials is no longer
+// published (edge releases are pruned), is dated at the zero time — older than
+// anything a channel offers, so such a daemon is offered the head rather than
+// pinned to nothing. Any other failure is returned instead: a signature that
+// does not verify, or a host that is down, says nothing about recency, and
+// reading it as "older" would hand an edge daemon a DOWNGRADE on the strength
+// of a document nobody could verify.
+func (s *updateService) publishedAt(ctx context.Context) (time.Time, error) {
+	if s.deps.Release == "" || s.deps.Release == buildinfo.DevRelease {
+		return time.Time{}, nil
+	}
+	bom, err := s.deps.Source.ReleaseBOM(ctx, s.deps.Release)
+	if err != nil {
+		if errors.Is(err, release.ErrNoRelease) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, fmt.Errorf("read the bill of materials of release %s: %w", s.deps.Release, err)
+	}
+	return bom.PublishedAt, nil
 }
 
 // Apply installs a version, leaving the process running on the old one.
@@ -154,16 +246,35 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 
 	version = strings.TrimPrefix(version, "v")
 
-	if !release.Newer(version, s.version) {
-		return fmt.Errorf("%w: %s is not newer than the running %s",
-			domain.ErrConflict, version, s.version)
+	// The bytes come from the channel's head and nowhere else, so the version
+	// asked for has to be the one it ships.
+	//
+	// The head can move between a check and an apply. Installing whatever the
+	// channel now offers would install a release nothing approved, and refusing
+	// leaves the next check to offer the new head on its own terms.
+	channel, head, err := s.head(ctx)
+	if err != nil {
+		return err
+	}
+	if head.Version != version {
+		return fmt.Errorf("%w: the %s head %s ships %s, not %s",
+			domain.ErrConflict, channel, head.Release, head.Version, version)
+	}
+
+	publishedAt, err := s.publishedAt(ctx)
+	if err != nil {
+		return err
+	}
+	if !supersedes(channel, head, s.deps.Version, publishedAt) {
+		return fmt.Errorf("%w: %s from release %s does not supersede the running %s on the %s channel",
+			domain.ErrConflict, head.Version, head.Release, s.deps.Version, channel)
 	}
 
 	// REFUSE when an update is already installed and waiting for its restart.
 	//
 	// This process still reports the OLD version — it is still executing the old
-	// binary — so release.Newer above stays true after a successful apply, and a
-	// second Apply would sail straight through. It would then move the NEW
+	// binary — so the head comparison above stays true after a successful apply,
+	// and a second Apply would sail straight through. It would then move the NEW
 	// binary to .old and install the new one again, so .old would hold the
 	// broken version and a rollback would "restore" it. The daemon would
 	// crash-loop with no way back.
@@ -171,7 +282,7 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// Reachable from an operator running `tumika update` twice, from two
 	// concurrent POSTs, and from the runner racing the API — all of which end at
 	// the same destroyed fallback.
-	current, err := s.repo.Get(ctx)
+	current, err := s.deps.Repo.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("read the update state: %w", err)
 	}
@@ -184,19 +295,19 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// and the deferred cleanup only ever removes this call's file.
 	//
 	// The file is removed immediately: only the name is wanted. Leaving the
-	// 0600 file CreateTemp makes would have Fetch write into it and the
+	// 0600 file CreateTemp makes would have the download write into it and the
 	// pre-flight then fail to execute it — the mode of an existing file is not
 	// changed by a write.
-	stagedFile, err := os.CreateTemp(filepath.Dir(s.binary), ".tumika-staged-*")
+	stagedFile, err := os.CreateTemp(filepath.Dir(s.deps.Binary), ".tumika-staged-*")
 	if err != nil {
-		return fmt.Errorf("stage an update next to %s: %w", s.binary, err)
+		return fmt.Errorf("stage an update next to %s: %w", s.deps.Binary, err)
 	}
 	staged := stagedFile.Name()
 	_ = stagedFile.Close()
 	_ = os.Remove(staged)
 	defer func() { _ = os.Remove(staged) }()
 
-	if err := s.source.Fetch(ctx, version, staged); err != nil {
+	if err := s.deps.Source.FetchAsset(ctx, head.Asset, staged); err != nil {
 		return err
 	}
 
@@ -206,13 +317,8 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// they run: a build for the wrong architecture, or one linked against a libc
 	// this host does not have, hashes perfectly and cannot execute. Finding that
 	// out AFTER the replacement means a daemon that exits 203 forever.
-	reported, err := s.preflight(ctx, staged)
-	if err != nil {
+	if err := s.preflight(ctx, staged, version); err != nil {
 		return err
-	}
-	if reported != version {
-		return fmt.Errorf("%w: the downloaded binary reports version %q, not %q",
-			domain.ErrConflict, reported, version)
 	}
 
 	// Recorded BEFORE the replacement. A crash between this write and the
@@ -222,14 +328,14 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	started := s.now()
 	state := domain.UpdateState{
 		Status:       domain.UpdatePending,
-		FromVersion:  s.version,
+		FromVersion:  s.deps.Version,
 		ToVersion:    version,
 		BootAttempts: 0,
 		StartedAt:    &started,
 		UpdatedAt:    started,
 	}
-	if err := s.tx.InTx(ctx, func(ctx context.Context) error {
-		return s.repo.Put(ctx, state)
+	if err := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
+		return s.deps.Repo.Put(ctx, state)
 	}); err != nil {
 		return fmt.Errorf("record the pending update: %w", err)
 	}
@@ -244,48 +350,87 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// gets destroyed. The pending guard above should make this unreachable, so
 	// reaching it means the state row and the filesystem disagree — which is
 	// worth refusing rather than papering over.
-	if _, statErr := os.Stat(s.binary + oldSuffix); statErr == nil {
+	if _, statErr := os.Stat(s.deps.Binary + oldSuffix); statErr == nil {
 		return fmt.Errorf("%w: %s already exists but no update is pending; "+
 			"remove it once you are satisfied the running version is good",
-			domain.ErrConflict, s.binary+oldSuffix)
+			domain.ErrConflict, s.deps.Binary+oldSuffix)
 	}
-	if err := os.Rename(s.binary, s.binary+oldSuffix); err != nil {
-		return fmt.Errorf("keep the current binary as %s: %w", s.binary+oldSuffix, err)
+	if err := os.Rename(s.deps.Binary, s.deps.Binary+oldSuffix); err != nil {
+		return fmt.Errorf("keep the current binary as %s: %w", s.deps.Binary+oldSuffix, err)
 	}
-	if err := os.Rename(staged, s.binary); err != nil {
+	if err := os.Rename(staged, s.deps.Binary); err != nil {
 		// Put it back. Failing here with neither binary in place would leave
 		// nothing for the supervisor to start.
-		if restoreErr := os.Rename(s.binary+oldSuffix, s.binary); restoreErr != nil {
+		if restoreErr := os.Rename(s.deps.Binary+oldSuffix, s.deps.Binary); restoreErr != nil {
 			return fmt.Errorf("install %s: %w (and restoring the previous binary failed: %v)",
-				s.binary, err, restoreErr)
+				s.deps.Binary, err, restoreErr)
 		}
-		return fmt.Errorf("install %s: %w", s.binary, err)
+		return fmt.Errorf("install %s: %w", s.deps.Binary, err)
 	}
 	return nil
 }
 
-// preflight execs the staged binary and reads the version it reports.
-func (s *updateService) preflight(ctx context.Context, path string) (string, error) {
+// preflight runs the staged binary twice and judges what it says about itself.
+//
+// Both answers are refusals the old binary is still in a position to act on:
+//
+//   - a binary that reports a different version is not the release that was
+//     asked for, so the daemon would go on claiming a version it is not and the
+//     next comparison would be made against a lie;
+//   - a binary embedding FEWER migrations than the database has applied cannot
+//     run against this database at all. ConfirmBoot runs before Migrate, so
+//     finding that out afterwards is three failed boots and a rollback instead
+//     of one refusal here.
+func (s *updateService) preflight(ctx context.Context, path, version string) error {
 	ctx, cancel := context.WithTimeout(ctx, preflightTimeout)
 	defer cancel()
 
-	out, err := s.exec(ctx, path)
+	out, err := s.exec(ctx, path, "version")
 	if err != nil {
-		return "", fmt.Errorf("%w: the downloaded binary could not be run: %w",
+		return fmt.Errorf("%w: the downloaded binary could not be run: %w",
 			domain.ErrConflict, err)
 	}
-	return parseVersion(out)
+	reported, err := parseVersion(out)
+	if err != nil {
+		return err
+	}
+	if reported != version {
+		return fmt.Errorf("%w: the downloaded binary reports version %q, not %q",
+			domain.ErrConflict, reported, version)
+	}
+
+	applied, err := s.deps.Schema(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: the database schema version could not be read: %w",
+			domain.ErrConflict, err)
+	}
+	jsonOut, err := s.exec(ctx, path, "version", "--json")
+	if err != nil {
+		return fmt.Errorf("%w: the downloaded binary could not report its build information: %w",
+			domain.ErrConflict, err)
+	}
+	embedded, err := parseSchemaVersion(jsonOut)
+	if err != nil {
+		return err
+	}
+	if embedded < applied {
+		return fmt.Errorf("%w: %s embeds database schema %d and this database is at %d, "+
+			"so it cannot run against it",
+			domain.ErrConflict, version, embedded, applied)
+	}
+	return nil
 }
 
-// execVersion runs `<path> version` and returns its output.
-func execVersion(ctx context.Context, path string) (string, error) {
+// execVersion runs `<path> version` with the arguments the pre-flight asks for
+// and returns its output.
+func execVersion(ctx context.Context, path string, args ...string) (string, error) {
 	// Both scanners flag the variable command. The audit: path is always the
 	// staged file Apply just created next to tumika's own binary — it is not
-	// caller-supplied, and the single argument is a literal. Running it is the
-	// entire point of a pre-flight.
+	// caller-supplied, and every argument is a literal from the pre-flight.
+	// Running it is the entire point of a pre-flight.
 	//
 	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-	cmd := exec.CommandContext(ctx, path, "version") // #nosec G204 -- see the audit above: path is the file Apply staged beside our own binary
+	cmd := exec.CommandContext(ctx, path, args...) // #nosec G204 -- see the audit above: path is the file Apply staged beside our own binary
 	// A minimal environment: `version` must not depend on the daemon's own, and
 	// the updater execs it precisely to learn whether it works in isolation.
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
@@ -310,6 +455,20 @@ func parseVersion(out string) (string, error) {
 	return fields[1], nil
 }
 
+// parseSchemaVersion reads the embedded migration version out of
+// `tumika version --json`.
+//
+// The document is the binary's own build identity, so it is decoded into the
+// type that produced it rather than a local struct that could drift from it.
+func parseSchemaVersion(out string) (int64, error) {
+	var info buildinfo.Info
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		return 0, fmt.Errorf("%w: unreadable `tumika version --json` output: %w",
+			domain.ErrConflict, err)
+	}
+	return info.SchemaVersion, nil
+}
+
 // ConfirmBoot resolves whatever the previous process left behind.
 //
 // Called at startup, BEFORE serving. The counter is incremented first and read
@@ -319,7 +478,7 @@ func (s *updateService) ConfirmBoot(ctx context.Context) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	state, err := s.repo.Get(ctx)
+	state, err := s.deps.Repo.Get(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -327,7 +486,7 @@ func (s *updateService) ConfirmBoot(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	state, err = s.repo.IncrementBootAttempts(ctx)
+	state, err = s.deps.Repo.IncrementBootAttempts(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -347,15 +506,15 @@ func (s *updateService) ConfirmBoot(ctx context.Context) (bool, error) {
 }
 
 func (s *updateService) rollBack(ctx context.Context, state domain.UpdateState) error {
-	old := s.binary + oldSuffix
+	old := s.deps.Binary + oldSuffix
 	if _, err := os.Stat(old); err != nil {
 		// Nothing to restore. Recorded as rolled_back anyway, so the daemon
 		// stops trying and an operator can see why — looping on a pending update
 		// with no fallback is the worst of both.
 		state.Status = domain.UpdateRolledBack
 		state.UpdatedAt = s.now()
-		if putErr := s.tx.InTx(ctx, func(ctx context.Context) error {
-			return s.repo.Put(ctx, state)
+		if putErr := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
+			return s.deps.Repo.Put(ctx, state)
 		}); putErr != nil {
 			return putErr
 		}
@@ -373,14 +532,14 @@ func (s *updateService) rollBack(ctx context.Context, state domain.UpdateState) 
 	// happen, which the next boot retries.
 	state.Status = domain.UpdateRolledBack
 	state.UpdatedAt = s.now()
-	if err := s.tx.InTx(ctx, func(ctx context.Context) error {
-		return s.repo.Put(ctx, state)
+	if err := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
+		return s.deps.Repo.Put(ctx, state)
 	}); err != nil {
 		return fmt.Errorf("record the rollback of %s: %w", state.ToVersion, err)
 	}
 
-	if err := os.Rename(old, s.binary); err != nil {
-		return fmt.Errorf("restore %s: %w", s.binary, err)
+	if err := os.Rename(old, s.deps.Binary); err != nil {
+		return fmt.Errorf("restore %s: %w", s.deps.Binary, err)
 	}
 	return nil
 }
@@ -394,7 +553,7 @@ func (s *updateService) Confirm(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	state, err := s.repo.Get(ctx)
+	state, err := s.deps.Repo.Get(ctx)
 	if err != nil {
 		return err
 	}
@@ -404,8 +563,8 @@ func (s *updateService) Confirm(ctx context.Context) error {
 
 	state.Status = domain.UpdateConfirmed
 	state.UpdatedAt = s.now()
-	if err := s.tx.InTx(ctx, func(ctx context.Context) error {
-		return s.repo.Put(ctx, state)
+	if err := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
+		return s.deps.Repo.Put(ctx, state)
 	}); err != nil {
 		return err
 	}
@@ -417,9 +576,9 @@ func (s *updateService) Confirm(ctx context.Context) error {
 	//
 	// Both arms of this used to return nil, which made the failure
 	// indistinguishable from success and the branch impossible to test.
-	if err := os.Remove(s.binary + oldSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(s.deps.Binary + oldSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %s could not be removed: %w",
-			ErrFallbackNotRemoved, s.binary+oldSuffix, err)
+			ErrFallbackNotRemoved, s.deps.Binary+oldSuffix, err)
 	}
 	return nil
 }

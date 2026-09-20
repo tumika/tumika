@@ -2,49 +2,145 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tumika/tumika/source/daemon/internal/domain"
+	"github.com/tumika/tumika/source/daemon/internal/platform/buildinfo"
+	"github.com/tumika/tumika/source/daemon/internal/platform/release"
 	"github.com/tumika/tumika/source/daemon/internal/service"
 )
 
-// fakeSource is a release feed the test controls.
+// published is the instant the running build's own release is dated at. Heads
+// that are meant to supersede it are offset forward.
+var published = time.Date(2026, 9, 20, 7, 28, 0, 0, time.UTC)
+
+// runningRelease is the label the harness's daemon was shipped in, and the
+// label it looks itself up under.
+const runningRelease = "2026.09.00"
+
+// fakeSource is a release host the test controls: one head per channel, the
+// bills of materials of the releases it has published, and the bytes each
+// asset downloads as.
 type fakeSource struct {
-	latest    string
-	latestErr error
-	// contents is what Fetch writes, keyed by version.
-	contents map[string]string
+	heads   map[release.Channel]release.Head
+	headErr error
+	// boms answers ReleaseBOM. A label that is absent is a release nobody
+	// published, or one that has been pruned: ErrNoRelease.
+	boms   map[string]*release.BOM
+	bomErr error
+	// bodies is what FetchAsset writes, keyed by asset URL.
+	bodies   map[string]string
 	fetchErr error
 	fetched  []string
 }
 
-func (f *fakeSource) Latest(context.Context) (string, error) {
-	return f.latest, f.latestErr
+func newFakeSource() *fakeSource {
+	return &fakeSource{
+		heads:  map[release.Channel]release.Head{},
+		boms:   map[string]*release.BOM{},
+		bodies: map[string]string{},
+	}
 }
 
-func (f *fakeSource) Fetch(_ context.Context, version, dest string) error {
-	f.fetched = append(f.fetched, version)
+// offer publishes a release: it becomes the channel's head, it can be looked
+// up by label, and its asset downloads as a binary reporting that version.
+func (f *fakeSource) offer(channel release.Channel, label string, at time.Time, version string) {
+	url := "https://releases.test/" + label + "/tumika"
+	f.heads[channel] = release.Head{
+		Release:     label,
+		Channel:     channel,
+		PublishedAt: at,
+		Version:     version,
+		Asset:       release.Asset{URL: url, SHA256: strings.Repeat("0", 64)},
+	}
+	f.bodies[url] = "binary " + version
+	f.publish(label, channel, at, version)
+}
+
+// publish records a release's own bill of materials without making it a head.
+func (f *fakeSource) publish(label string, channel release.Channel, at time.Time, version string) {
+	f.boms[label] = &release.BOM{
+		Release:     label,
+		Channel:     channel,
+		PublishedAt: at,
+		Components: map[string]release.Component{
+			release.DaemonComponent: {Version: version},
+		},
+	}
+}
+
+// serve replaces the bytes a channel head's asset downloads as.
+func (f *fakeSource) serve(channel release.Channel, body string) {
+	f.bodies[f.heads[channel].Asset.URL] = body
+}
+
+func (f *fakeSource) Head(_ context.Context, channel release.Channel) (release.Head, error) {
+	if f.headErr != nil {
+		return release.Head{}, f.headErr
+	}
+	head, ok := f.heads[channel]
+	if !ok {
+		return release.Head{}, release.ErrNoRelease
+	}
+	return head, nil
+}
+
+func (f *fakeSource) ReleaseBOM(_ context.Context, label string) (*release.BOM, error) {
+	if f.bomErr != nil {
+		return nil, f.bomErr
+	}
+	bom, ok := f.boms[label]
+	if !ok {
+		return nil, release.ErrNoRelease
+	}
+	return bom, nil
+}
+
+func (f *fakeSource) FetchAsset(_ context.Context, asset release.Asset, dest string) error {
+	f.fetched = append(f.fetched, asset.URL)
 	if f.fetchErr != nil {
 		return f.fetchErr
 	}
-	body, ok := f.contents[version]
+	body, ok := f.bodies[asset.URL]
 	if !ok {
-		body = "binary " + version
+		body = "binary"
 	}
 	if err := os.WriteFile(dest, []byte(body), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
 		return err
 	}
 	// Chmod explicitly, because WriteFile does NOT apply its mode to a file that
-	// already exists — and the real Fetch guarantees an executable file at dest.
-	// Without this the fake is more permissive than production in one direction
-	// and less in another, which is how a fake stops testing anything.
+	// already exists — and the real FetchAsset guarantees an executable file at
+	// dest. Without this the fake is more permissive than production in one
+	// direction and less in another, which is how a fake stops testing anything.
 	return os.Chmod(dest, 0o755) //nolint:gosec // a stand-in for an executable
+}
+
+var _ release.Source = (*fakeSource)(nil)
+
+// fakeSettings answers the one setting the updater reads.
+type fakeSettings struct {
+	channel release.Channel
+	err     error
+}
+
+func (f fakeSettings) Get(_ context.Context, key string) (domain.SettingView, error) {
+	if f.err != nil {
+		return domain.SettingView{}, f.err
+	}
+	channel := f.channel
+	if channel == "" {
+		channel = release.ChannelStable
+	}
+	return domain.SettingView{Key: key, Value: json.RawMessage(`"` + string(channel) + `"`)}, nil
 }
 
 // fakeUpdateRepo is the single-row state table, in memory.
@@ -81,14 +177,20 @@ func (f *fakeUpdateRepo) IncrementBootAttempts(context.Context) (domain.UpdateSt
 // harness builds a service over a real binary path in a temp directory, so the
 // rename dance is exercised against a filesystem rather than mocked away.
 type harness struct {
-	svc    service.UpdateService
-	repo   *fakeUpdateRepo
-	source *fakeSource
-	binary string
-	// preflight is what the injected exec reports. Empty means "match whatever
-	// was asked for", which is the healthy case.
+	svc      service.UpdateService
+	repo     *fakeUpdateRepo
+	source   *fakeSource
+	settings *fakeSettings
+	binary   string
+	// preflight is what the injected exec reports as the staged binary's
+	// version. Empty means "match whatever was staged", which is the healthy
+	// case.
 	preflight    string
 	preflightErr error
+	// dbSchema is the migration version the database is at, and stagedSchema
+	// what the staged binary reports embedding.
+	dbSchema     int64
+	stagedSchema int64
 }
 
 func newHarness(t *testing.T, current string, opts ...service.UpdateOption) *harness {
@@ -101,13 +203,20 @@ func newHarness(t *testing.T, current string, opts ...service.UpdateOption) *har
 	}
 
 	h := &harness{
-		repo:   newUpdateRepo(),
-		source: &fakeSource{contents: map[string]string{}},
-		binary: binary,
+		repo:         newUpdateRepo(),
+		source:       newFakeSource(),
+		settings:     &fakeSettings{},
+		binary:       binary,
+		dbSchema:     7,
+		stagedSchema: 7,
 	}
+	// The running build's own release, and a later stable head offering 0.2.0 —
+	// the ordinary state a check finds.
+	h.source.publish(runningRelease, release.ChannelStable, published, current)
+	h.source.offer(release.ChannelStable, "2026.09.01", published.Add(24*time.Hour), "0.2.0")
 
 	base := []service.UpdateOption{
-		service.WithUpdateExec(func(_ context.Context, path string) (string, error) {
+		service.WithUpdateExec(func(_ context.Context, path string, args ...string) (string, error) {
 			if h.preflightErr != nil {
 				return "", h.preflightErr
 			}
@@ -121,11 +230,44 @@ func newHarness(t *testing.T, current string, opts ...service.UpdateOption) *har
 				// what a healthy build would say about itself.
 				reported = strings.TrimPrefix(string(body), "binary ")
 			}
-			return "tumika " + reported + " (commit abc, built now, go1.26.6, linux/arm64)\n", nil
+			if slices.Contains(args, "--json") {
+				return fmt.Sprintf(`{"version":%q,"release":%q,"schema_version":%d}`,
+					reported, "2026.09.01", h.stagedSchema), nil
+			}
+			return "tumika " + reported +
+				" (release 2026.09.01, commit abc, built now, go1.26.6, linux/arm64)\n", nil
 		}),
 	}
-	h.svc = service.NewUpdateService(h.repo, h.source, &fakeTxer{}, current, binary, append(base, opts...)...)
+	h.svc = service.NewUpdateService(service.UpdateDeps{
+		Repo:     h.repo,
+		Source:   h.source,
+		Tx:       &fakeTxer{},
+		Settings: h.settings,
+		Schema:   func(context.Context) (int64, error) { return h.dbSchema, nil },
+		Version:  current,
+		Release:  runningRelease,
+		Binary:   binary,
+	}, append(base, opts...)...)
 	return h
+}
+
+// directDeps is the updater's dependencies for the tests that build a service
+// themselves rather than through the harness, over a stable channel offering
+// 0.2.0 in a release published after the running build's own.
+func directDeps(repo *fakeUpdateRepo, current, binary string) service.UpdateDeps {
+	source := newFakeSource()
+	source.publish(runningRelease, release.ChannelStable, published, current)
+	source.offer(release.ChannelStable, "2026.09.01", published.Add(24*time.Hour), "0.2.0")
+	return service.UpdateDeps{
+		Repo:     repo,
+		Source:   source,
+		Tx:       &fakeTxer{},
+		Settings: &fakeSettings{},
+		Schema:   func(context.Context) (int64, error) { return 1, nil },
+		Version:  current,
+		Release:  runningRelease,
+		Binary:   binary,
+	}
 }
 
 func (h *harness) read(t *testing.T, path string) string {
@@ -141,7 +283,6 @@ func (h *harness) read(t *testing.T, path string) string {
 // the daemon ends up on a binary it cannot run with no record of why.
 func TestApplyReplacesTheBinaryAndKeepsTheOldOne(t *testing.T) {
 	h := newHarness(t, "0.1.0")
-	h.source.latest = "0.2.0"
 
 	if err := h.svc.Apply(t.Context(), "0.2.0"); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -211,12 +352,121 @@ func TestApplyRefusesAVersionMismatch(t *testing.T) {
 	}
 }
 
-// Strictly greater. A daemon must never "update" onto the version it is already
-// running, and must never downgrade because someone deleted a release.
-func TestApplyRefusesAnythingNotNewer(t *testing.T) {
-	h := newHarness(t, "0.2.0")
+// A binary embedding fewer migrations than the database has applied cannot run
+// against this database. The refusal happens in the pre-flight, while the old
+// binary is still in charge: ConfirmBoot runs BEFORE Migrate, so a schema
+// refusal afterwards is a failed boot, and three of those roll back.
+func TestApplyRefusesABinaryEmbeddingAnOlderSchemaThanTheDatabase(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	h.dbSchema = 9
+	h.stagedSchema = 8
 
-	for _, version := range []string{"0.2.0", "0.1.0", "0.1.9"} {
+	err := h.svc.Apply(t.Context(), "0.2.0")
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("= %v, want ErrConflict", err)
+	}
+	if !strings.Contains(err.Error(), "8") || !strings.Contains(err.Error(), "9") {
+		t.Errorf("the error does not say which schema is which: %v", err)
+	}
+
+	// Nothing was replaced, nothing was set aside, and nothing was recorded.
+	if got := h.read(t, h.binary); got != "binary 0.1.0" {
+		t.Errorf("the running binary is %q; it was replaced", got)
+	}
+	if _, statErr := os.Stat(h.binary + ".old"); statErr == nil {
+		t.Error("a rollback copy was made for an update that was refused")
+	}
+	if h.repo.state.Status != domain.UpdateIdle {
+		t.Errorf("status = %q, want idle — nothing was installed", h.repo.state.Status)
+	}
+}
+
+// The build information is the only evidence of what the staged binary embeds,
+// so output that cannot be read is refused rather than read optimistically —
+// an unreadable document must never pass for "schema 0, which is fine".
+func TestApplyRefusesUnreadableBuildInformation(t *testing.T) {
+	for _, output := range []string{"", "Segmentation fault", "{"} {
+		h := newHarness(t, "0.1.0", service.WithUpdateExec(
+			func(_ context.Context, _ string, args ...string) (string, error) {
+				if slices.Contains(args, "--json") {
+					return output, nil
+				}
+				return "tumika 0.2.0 (release 2026.09.01, commit abc, built now, go1.26.6, linux/arm64)\n", nil
+			}))
+		h.dbSchema = 9
+
+		if err := h.svc.Apply(t.Context(), "0.2.0"); !errors.Is(err, domain.ErrConflict) {
+			t.Errorf("--json output %q = %v, want ErrConflict", output, err)
+		}
+		if got := h.read(t, h.binary); got != "binary 0.1.0" {
+			t.Errorf("--json output %q: the running binary was replaced", output)
+		}
+	}
+}
+
+// A binary embedding MORE migrations is the ordinary update: it migrates the
+// database forward once it boots.
+func TestApplyAcceptsABinaryEmbeddingANewerSchema(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	h.dbSchema = 9
+	h.stagedSchema = 10
+
+	if err := h.svc.Apply(t.Context(), "0.2.0"); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := h.read(t, h.binary); got != "binary 0.2.0" {
+		t.Errorf("the binary is %q, want the new one", got)
+	}
+}
+
+// An updater that cannot learn what the database is at cannot tell whether the
+// binary it is about to install can run against it, so it refuses rather than
+// swapping in ignorance.
+func TestApplyRefusesWhenTheDatabaseSchemaCannotBeRead(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "tumika")
+	if err := os.WriteFile(binary, []byte("binary 0.1.0"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+
+	for name, deps := range map[string]service.UpdateDeps{
+		"unreadable": func() service.UpdateDeps {
+			d := directDeps(newUpdateRepo(), "0.1.0", binary)
+			d.Schema = func(context.Context) (int64, error) {
+				return 0, errors.New("database is locked")
+			}
+			return d
+		}(),
+		"absent": func() service.UpdateDeps {
+			d := directDeps(newUpdateRepo(), "0.1.0", binary)
+			d.Schema = nil
+			return d
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := service.NewUpdateService(deps)
+			if err := svc.Apply(t.Context(), "0.2.0"); !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("= %v, want ErrConflict", err)
+			}
+			body, readErr := os.ReadFile(binary) //nolint:gosec // a path this test created
+			if readErr != nil {
+				t.Fatalf("read: %v", readErr)
+			}
+			if string(body) != "binary 0.1.0" {
+				t.Errorf("the running binary is %q; it was replaced", body)
+			}
+		})
+	}
+}
+
+// The bytes come from the channel's head, so a version the head does not ship
+// cannot be installed. The head moves between a check and an apply, and
+// installing whatever the channel now offers would install a release nothing
+// approved.
+func TestApplyRefusesAVersionTheHeadDoesNotShip(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+
+	for _, version := range []string{"0.1.0", "0.1.9", "0.3.0"} {
 		if err := h.svc.Apply(t.Context(), version); !errors.Is(err, domain.ErrConflict) {
 			t.Errorf("Apply(%s) = %v, want ErrConflict", version, err)
 		}
@@ -353,10 +603,9 @@ func TestConfirmIsInertWhenNothingIsPending(t *testing.T) {
 	}
 }
 
-func TestCheckReportsWhatIsNewer(t *testing.T) {
+func TestCheckReportsWhatTheHeadOffers(t *testing.T) {
 	h := newHarness(t, "0.1.0")
 
-	h.source.latest = "0.2.0"
 	available, newer, err := h.svc.Check(t.Context())
 	if err != nil {
 		t.Fatalf("Check: %v", err)
@@ -365,9 +614,180 @@ func TestCheckReportsWhatIsNewer(t *testing.T) {
 		t.Errorf("Check = %q/%v, want 0.2.0/true", available, newer)
 	}
 
-	h.source.latest = "0.1.0"
-	if _, newer, _ = h.svc.Check(t.Context()); newer {
-		t.Error("the running version was reported as out of date")
+	// The head is the release this daemon is already running: nothing to do,
+	// and the version is still reported so a caller can show it.
+	h.source.offer(release.ChannelStable, runningRelease, published, "0.1.0")
+	available, newer, err = h.svc.Check(t.Context())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if available != "0.1.0" || newer {
+		t.Errorf("Check = %q/%v, want 0.1.0/false", available, newer)
+	}
+}
+
+// The rule, for every channel and every way a head can relate to the running
+// build. Check offers exactly what Apply will install: a second copy of this
+// comparison is how an edge downgrade becomes an update the daemon offers and
+// then refuses.
+func TestTheUpdateRulePerChannel(t *testing.T) {
+	const running = "0.2.0"
+
+	for _, tc := range []struct {
+		name    string
+		channel release.Channel
+		// later says the head was published after the running build's release;
+		// version is what the head ships.
+		later   bool
+		version string
+		want    bool
+	}{
+		{"stable later and greater", release.ChannelStable, true, "0.3.0", true},
+		{"stable later but lower", release.ChannelStable, true, "0.1.0", false},
+		{"stable earlier and greater", release.ChannelStable, false, "0.3.0", false},
+		{"stable earlier and lower", release.ChannelStable, false, "0.1.0", false},
+
+		{"beta later and greater", release.ChannelBeta, true, "0.3.0", true},
+		{"beta later but lower", release.ChannelBeta, true, "0.1.0", false},
+		{"beta earlier and greater", release.ChannelBeta, false, "0.3.0", false},
+		{"beta earlier and lower", release.ChannelBeta, false, "0.1.0", false},
+
+		// Edge compares recency alone. Semver ranks 0.0.2-edge.147 below the
+		// 0.0.2 it was cut from, so requiring a greater version would strand
+		// every edge daemon on the first non-prerelease it saw.
+		{"edge later and greater", release.ChannelEdge, true, "0.3.0", true},
+		{"edge later but lower", release.ChannelEdge, true, "0.1.0", true},
+		{"edge earlier and greater", release.ChannelEdge, false, "0.3.0", false},
+		{"edge earlier and lower", release.ChannelEdge, false, "0.1.0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, running)
+			h.settings.channel = tc.channel
+
+			at := published.Add(-24 * time.Hour)
+			if tc.later {
+				at = published.Add(24 * time.Hour)
+			}
+			label := "2026.09.02"
+			if tc.channel == release.ChannelEdge {
+				label = "edge.147"
+			}
+			h.source.offer(tc.channel, label, at, tc.version)
+
+			available, newer, err := h.svc.Check(t.Context())
+			if err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			if available != tc.version {
+				t.Errorf("Check offered %q, want %q", available, tc.version)
+			}
+			if newer != tc.want {
+				t.Errorf("Check newer = %v, want %v", newer, tc.want)
+			}
+
+			// Apply decides by the same rule, so it accepts exactly what Check
+			// offered.
+			err = h.svc.Apply(t.Context(), tc.version)
+			switch {
+			case tc.want && err != nil:
+				t.Errorf("Apply refused what Check offered: %v", err)
+			case !tc.want && !errors.Is(err, domain.ErrConflict):
+				t.Errorf("Apply = %v, want ErrConflict for a head Check did not offer", err)
+			}
+		})
+	}
+}
+
+// A daemon whose own release has been pruned — every edge release is, in time —
+// is dated at the zero time, so the head is offered rather than the daemon
+// being pinned to nothing.
+func TestAPrunedOwnReleaseCountsAsOlderThanTheHead(t *testing.T) {
+	h := newHarness(t, "0.0.2-edge.140")
+	h.settings.channel = release.ChannelEdge
+	delete(h.source.boms, runningRelease)
+	h.source.offer(release.ChannelEdge, "edge.147", published.Add(-365*24*time.Hour), "0.0.2-edge.147")
+
+	if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
+		t.Errorf("Check = %v/%v, want an offer: a pruned release dates the daemon at nothing", newer, err)
+	}
+}
+
+// A bill of materials that will not verify, or a host that is down, says
+// NOTHING about when the running build was published. Reading that silence as
+// "older" hands an edge daemon a downgrade on the strength of a document nobody
+// could verify, so the check fails loudly instead.
+func TestAnUnreadableOwnBOMStopsTheCheckRatherThanDowngrading(t *testing.T) {
+	h := newHarness(t, "0.2.0")
+	h.settings.channel = release.ChannelEdge
+	h.source.offer(release.ChannelEdge, "edge.147", published.Add(24*time.Hour), "0.1.0")
+	h.source.bomErr = release.ErrBadSignature
+
+	if _, newer, err := h.svc.Check(t.Context()); err == nil {
+		t.Fatal("an unverifiable own bill of materials was treated as an answer")
+	} else if newer {
+		t.Error("a failed lookup offered a downgrade")
+	}
+
+	if err := h.svc.Apply(t.Context(), "0.1.0"); err == nil {
+		t.Fatal("Apply installed a downgrade it could not date the running build against")
+	}
+	if got := h.read(t, h.binary); got != "binary 0.2.0" {
+		t.Errorf("the running binary is %q; it was replaced", got)
+	}
+}
+
+// A development build has no bill of materials to look itself up in, and asking
+// for one would put "dev" in a URL path.
+func TestADevReleaseIsNeverLookedUp(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "tumika")
+	if err := os.WriteFile(binary, []byte("binary 0.1.0"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+
+	source := newFakeSource()
+	source.offer(release.ChannelStable, "2026.09.01", published, "0.2.0")
+	// Anything that reaches ReleaseBOM fails the test by failing the check.
+	source.bomErr = errors.New("a development build asked for its own release")
+
+	svc := service.NewUpdateService(service.UpdateDeps{
+		Repo:     newUpdateRepo(),
+		Source:   source,
+		Tx:       &fakeTxer{},
+		Settings: &fakeSettings{},
+		Schema:   func(context.Context) (int64, error) { return 0, nil },
+		Version:  "0.1.0",
+		Release:  buildinfo.DevRelease,
+		Binary:   binary,
+	})
+
+	if _, newer, err := svc.Check(t.Context()); err != nil || !newer {
+		t.Errorf("Check = %v/%v, want the head offered without a lookup", newer, err)
+	}
+}
+
+// An unknown channel is refused rather than placed in a URL: the value comes
+// from the settings table, which an operator writes.
+func TestCheckRefusesAChannelThatIsNotOne(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	h.settings.channel = "nightly"
+
+	if _, _, err := h.svc.Check(t.Context()); !errors.Is(err, release.ErrInvalidChannel) {
+		t.Fatalf("= %v, want ErrInvalidChannel", err)
+	}
+}
+
+// A settings table that cannot be read is a failure, not a silent fallback to
+// stable: a daemon an operator moved to beta must not quietly follow another
+// channel.
+func TestCheckReportsAnUnreadableChannelSetting(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	h.settings.err = errors.New("database is locked")
+
+	if _, newer, err := h.svc.Check(t.Context()); err == nil {
+		t.Fatal("an unreadable channel setting reported success")
+	} else if newer {
+		t.Error("an unreadable channel setting offered an update")
 	}
 }
 
@@ -444,7 +864,7 @@ func TestStateReportsTheRow(t *testing.T) {
 // stop a fleet from ever updating.
 func TestCheckReportsItsFailure(t *testing.T) {
 	h := newHarness(t, "0.1.0")
-	h.source.latestErr = errors.New("connection reset")
+	h.source.headErr = errors.New("connection reset")
 
 	if _, newer, err := h.svc.Check(t.Context()); err == nil {
 		t.Fatal("a failed check reported success")
@@ -484,7 +904,7 @@ func TestPreflightRefusesUnexpectedVersionOutput(t *testing.T) {
 		"Segmentation fault",
 	} {
 		h := newHarness(t, "0.1.0", service.WithUpdateExec(
-			func(context.Context, string) (string, error) { return output, nil }))
+			func(context.Context, string, ...string) (string, error) { return output, nil }))
 
 		if err := h.svc.Apply(t.Context(), "0.2.0"); err == nil {
 			t.Errorf("output %q was accepted as a working binary", output)
@@ -514,11 +934,13 @@ func TestApplyStopsIfTheOldBinaryCannotBeSetAside(t *testing.T) {
 	repo := newUpdateRepo()
 	// The pre-flight runs between the fetch and the renames, so it is where the
 	// binary can be made to disappear.
-	svc := service.NewUpdateService(repo, &fakeSource{contents: map[string]string{}},
-		&fakeTxer{}, "0.1.0", binary,
-		service.WithUpdateExec(func(context.Context, string) (string, error) {
+	svc := service.NewUpdateService(directDeps(repo, "0.1.0", binary),
+		service.WithUpdateExec(func(_ context.Context, _ string, args ...string) (string, error) {
 			_ = os.Remove(binary)
-			return "tumika 0.2.0 (commit abc, built now, go1.26.6, linux/arm64)\n", nil
+			if slices.Contains(args, "--json") {
+				return `{"version":"0.2.0","schema_version":9}`, nil
+			}
+			return "tumika 0.2.0 (release 2026.09.01, commit abc, built now, go1.26.6, linux/arm64)\n", nil
 		}))
 
 	if err := svc.Apply(t.Context(), "0.2.0"); err == nil {
@@ -579,13 +1001,17 @@ func TestApplyWithTheRealPreflightExec(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// What the "downloaded" binary will be: a script that reports 0.2.0, which
-	// is exactly what the pre-flight has to read back.
-	script := "#!/bin/sh\necho 'tumika 0.2.0 (commit abc, built now, go1.26.6, linux/arm64)'\n"
+	// What the "downloaded" binary will be: a script answering both pre-flight
+	// questions — the version it reports, and the schema it embeds.
+	script := "#!/bin/sh\n" +
+		"case \"$2\" in\n" +
+		"  --json) echo '{\"version\":\"0.2.0\",\"schema_version\":9}' ;;\n" +
+		"  *) echo 'tumika 0.2.0 (release 2026.09.01, commit abc, built now, go1.26.6, linux/arm64)' ;;\n" +
+		"esac\n"
 
-	svc := service.NewUpdateService(newUpdateRepo(),
-		&fakeSource{contents: map[string]string{"0.2.0": script}},
-		&fakeTxer{}, "0.1.0", binary)
+	deps := directDeps(newUpdateRepo(), "0.1.0", binary)
+	deps.Source.(*fakeSource).serve(release.ChannelStable, script)
+	svc := service.NewUpdateService(deps)
 
 	if err := svc.Apply(t.Context(), "0.2.0"); err != nil {
 		t.Fatalf("Apply with the real exec: %v", err)
@@ -608,9 +1034,9 @@ func TestApplyWithARealExecThatCannotRun(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	svc := service.NewUpdateService(newUpdateRepo(),
-		&fakeSource{contents: map[string]string{"0.2.0": "not a program at all"}},
-		&fakeTxer{}, "0.1.0", binary)
+	deps := directDeps(newUpdateRepo(), "0.1.0", binary)
+	deps.Source.(*fakeSource).serve(release.ChannelStable, "not a program at all")
+	svc := service.NewUpdateService(deps)
 
 	if err := svc.Apply(t.Context(), "0.2.0"); err == nil {
 		t.Fatal("a file that is not a program was installed")
@@ -764,8 +1190,7 @@ func TestConfirmReportsAFallbackItCannotRemove(t *testing.T) {
 
 	repo := newUpdateRepo()
 	repo.state = domain.UpdateState{Status: domain.UpdatePending, ToVersion: "0.2.0"}
-	svc := service.NewUpdateService(repo, &fakeSource{contents: map[string]string{}},
-		&fakeTxer{}, "0.2.0", binary)
+	svc := service.NewUpdateService(directDeps(repo, "0.2.0", binary))
 
 	err := svc.Confirm(t.Context())
 	if !errors.Is(err, service.ErrFallbackNotRemoved) {
