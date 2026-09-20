@@ -1,12 +1,18 @@
 // Package release finds and fetches tumika's own releases.
 //
-// The seam exists so UpdateService can be tested without GitHub: the whole
-// update path — download, verify, pre-flight, replace, roll back — is exactly
-// the code that must not be exercised for the first time in production.
+// Discovery is a signed bill of materials served as static JSON: a channel
+// document names the release that channel currently offers, and the release's
+// own document names every component's version and asset. Nothing is trusted
+// before its detached signature verifies against a compiled-in release key.
+//
+// The seam exists so UpdateService can be tested without a release host: the
+// whole update path — download, verify, pre-flight, replace, roll back — is
+// exactly the code that must not be exercised for the first time in production.
 package release
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -22,40 +28,87 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-// DefaultBaseURL is tumika's repository.
-const DefaultBaseURL = "https://github.com/tumika/tumika"
+// DefaultBaseURL is the host serving the channel and release documents.
+const DefaultBaseURL = "https://get.tumika.org"
+
+// DaemonComponent is the component name the daemon reads out of a bill of
+// materials.
+const DaemonComponent = "daemon"
+
+// signatureSuffix names the detached signature beside a document: the channel
+// head is `<base>/channels/<channel>.json` and its signature is that same path
+// with this appended.
+const signatureSuffix = ".sig"
 
 // maxBinaryBytes bounds a download. The binary is ~20 MB; anything serving
 // orders of magnitude more is not a release.
 const maxBinaryBytes = 512 << 20
 
-// maxChecksumBytes bounds checksums.txt, which is a handful of lines.
-const maxChecksumBytes = 1 << 20
+// maxBOMBytes bounds a bill of materials, which is a few dozen lines of JSON.
+// The document is read whole in order to verify a signature over its exact
+// bytes, so the cap is what keeps an unauthenticated host from choosing how
+// much memory the daemon allocates.
+const maxBOMBytes = 1 << 20
+
+// maxSignatureBytes bounds a detached signature: base64 of an ASN.1 P-256
+// signature is under a hundred bytes.
+const maxSignatureBytes = 4 << 10
 
 // Errors callers distinguish.
 var (
-	// ErrNoRelease means the repository has no published release yet.
+	// ErrNoRelease means the channel offers nothing: no document is published
+	// at that path. It is a NORMAL state for a project before its first
+	// release, not a failure worth waking anyone about.
 	ErrNoRelease = errors.New("no release found")
-	// ErrChecksumMismatch means the download is not what checksums.txt
+	// ErrChecksumMismatch means the download is not what the bill of materials
 	// describes. Never recoverable by retrying the same asset.
 	ErrChecksumMismatch = errors.New("downloaded binary does not match the published checksum")
 	// ErrNoAsset means the release has nothing built for this platform.
 	ErrNoAsset = errors.New("no release asset for this platform")
 )
 
-// Source finds and fetches releases.
+// errNotFound marks a 404 so each caller can say what a missing document
+// means — a channel with nothing published, or a document served without its
+// signature — rather than reporting both as the same transport failure.
+var errNotFound = errors.New("not found")
+
+// Source is what UpdateService consumes: the daemon component version at the
+// head of the stable channel, and a download of that release's binary.
 type Source interface {
-	// Latest is the newest published version, without a leading "v".
+	// Latest is the daemon component version at the head of the stable
+	// channel, without a leading "v".
 	Latest(ctx context.Context) (string, error)
 	// Fetch downloads that version's binary for this platform to dest,
-	// verifying it against the release's checksums.txt before returning.
+	// verifying it against the digest the bill of materials publishes before
+	// returning.
 	Fetch(ctx context.Context, version, dest string) error
 }
 
-// GitHub fetches releases from a GitHub repository.
+// Head is what a channel currently offers, read from a verified bill of
+// materials.
+type Head struct {
+	// Release is the label people read and no client compares.
+	Release string
+	// Channel is the channel this head was read from.
+	Channel Channel
+	// PublishedAt orders releases: recency, not the label, decides which
+	// release a channel offers.
+	PublishedAt time.Time
+	// Version is the daemon component's semver in this release, without a
+	// leading "v".
+	Version string
+	// Asset is the daemon binary published for the platform this source
+	// targets.
+	Asset Asset
+}
+
+// GitHub fetches releases published under a base URL.
 type GitHub struct {
 	baseURL string
 	client  *http.Client
+	// keys verifies a bill of materials. Nil means the keys compiled into this
+	// binary, which is what a daemon uses; a test signs with its own.
+	keys []*ecdsa.PublicKey
 	// goos and goarch name the asset. Fields rather than runtime constants so a
 	// test can ask for a platform it is not running on.
 	goos, goarch string
@@ -64,7 +117,7 @@ type GitHub struct {
 // Option configures the source.
 type Option func(*GitHub)
 
-// WithBaseURL points at a different repository, for tests.
+// WithBaseURL points at a different release host, for tests.
 func WithBaseURL(url string) Option {
 	return func(g *GitHub) { g.baseURL = strings.TrimSuffix(url, "/") }
 }
@@ -77,6 +130,15 @@ func WithHTTPClient(c *http.Client) Option {
 // WithPlatform overrides the asset platform.
 func WithPlatform(goos, goarch string) Option {
 	return func(g *GitHub) { g.goos, g.goarch = goos, goarch }
+}
+
+// WithKeys replaces the keys a bill of materials is verified against.
+//
+// A daemon verifies against the keys compiled into it. A test signs its
+// fixtures with a key it generates, because the private half of a release key
+// does not exist in this repository. An empty list verifies nothing.
+func WithKeys(keys []*ecdsa.PublicKey) Option {
+	return func(g *GitHub) { g.keys = keys }
 }
 
 // NewGitHub builds the source.
@@ -94,84 +156,111 @@ func NewGitHub(opts ...Option) *GitHub {
 	return g
 }
 
-// AssetName is the raw binary published for a platform.
+// Head reads the channel's current offer.
 //
-// It matches .goreleaser.yml's raw archive template exactly, and
-// scripts/verify-release-assets.sh checks that the release actually ships this
-// name — so a template change breaks CI rather than every installed daemon's
-// next update.
-func (g *GitHub) AssetName(version string) string {
-	return fmt.Sprintf("tumika_%s_%s_%s", version, g.goos, g.goarch)
+// The channel name is validated before it reaches a URL, and the verified
+// document must agree about which channel it is the head of — a stable
+// document served from the edge path is refused rather than followed.
+func (g *GitHub) Head(ctx context.Context, channel Channel) (Head, error) {
+	if err := ValidateChannel(channel); err != nil {
+		return Head{}, err
+	}
+
+	docURL := g.baseURL + "/channels/" + string(channel) + ".json"
+	bom, err := g.bom(ctx, docURL)
+	if err != nil {
+		return Head{}, err
+	}
+	if bom.Channel != channel {
+		return Head{}, fmt.Errorf("%w: %s is the head of channel %q", ErrMalformedBOM, docURL, bom.Channel)
+	}
+
+	component, ok := bom.Components[DaemonComponent]
+	if !ok {
+		return Head{}, fmt.Errorf("%w: release %s ships no %s", ErrNoAsset, bom.Release, DaemonComponent)
+	}
+	asset, ok := bom.Asset(DaemonComponent, g.goos, g.goarch)
+	if !ok {
+		// The release exists but has nothing for this machine — a dropped build
+		// target, or a platform that was never published.
+		return Head{}, fmt.Errorf("%w: release %s publishes no %s for %s",
+			ErrNoAsset, bom.Release, DaemonComponent, PlatformKey(g.goos, g.goarch))
+	}
+
+	return Head{
+		Release:     bom.Release,
+		Channel:     bom.Channel,
+		PublishedAt: bom.PublishedAt,
+		Version:     strings.TrimPrefix(component.Version, "v"),
+		Asset:       asset,
+	}, nil
 }
 
-func (g *GitHub) assetURL(version, asset string) string {
-	return fmt.Sprintf("%s/releases/download/v%s/%s", g.baseURL, version, asset)
+// ReleaseBOM reads one release's own bill of materials.
+//
+// It is how a daemon learns when its own release was published, and how a
+// component version is resolved to the version of another component that
+// belongs with it. The label is validated BEFORE it is placed in the URL: it
+// comes from a build stamp or from another process, so a label that could
+// escape a path segment must never reach the host at all.
+func (g *GitHub) ReleaseBOM(ctx context.Context, label string) (*BOM, error) {
+	if err := ValidateReleaseLabel(label); err != nil {
+		return nil, err
+	}
+
+	docURL := g.baseURL + "/releases/" + label + ".json"
+	bom, err := g.bom(ctx, docURL)
+	if err != nil {
+		return nil, err
+	}
+	if bom.Release != label {
+		return nil, fmt.Errorf("%w: %s describes release %q", ErrMalformedBOM, docURL, bom.Release)
+	}
+	return bom, nil
 }
 
-// Latest follows the /releases/latest redirect.
-//
-// The redirect rather than the API: it needs no token, no rate limit applies,
-// and it is the same URL install.sh uses — so both agree on what "latest" means.
-// GitHub resolves it to the newest non-prerelease, which is why .goreleaser.yml
-// sets `prerelease: auto`.
+// Latest is the daemon component version the stable channel offers.
 func (g *GitHub) Latest(ctx context.Context) (string, error) {
-	// A client that does NOT follow the redirect: the Location header is the
-	// answer, and following it would fetch an HTML page to parse instead.
-	noRedirect := *g.client
-	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/releases/latest", nil)
+	head, err := g.Head(ctx, ChannelStable)
 	if err != nil {
-		return "", fmt.Errorf("build the latest-release request: %w", err)
+		return "", err
 	}
-
-	resp, err := noRedirect.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("reach %s: %w", g.baseURL, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-		// 404 is the honest answer for a repository with no releases yet, and
-		// it is a NORMAL state for a project before its first tag — not a
-		// failure worth waking anyone about.
-		if resp.StatusCode == http.StatusNotFound {
-			return "", fmt.Errorf("%w at %s", ErrNoRelease, g.baseURL)
-		}
-		return "", fmt.Errorf("expected a redirect from %s, got %s", req.URL, resp.Status)
-	}
-
-	location := resp.Header.Get("Location")
-	tag := location[strings.LastIndex(location, "/")+1:]
-	if !strings.HasPrefix(tag, "v") || !semver.IsValid(tag) {
-		return "", fmt.Errorf("cannot read a version from the redirect to %q", location)
-	}
-	return strings.TrimPrefix(tag, "v"), nil
+	return head.Version, nil
 }
 
-// Fetch downloads the binary and verifies it before returning.
+// Fetch downloads the stable head's binary, provided it is the version asked
+// for.
 //
-// dest is written only if the checksum matches: the caller gets a file that is
+// Refusing a mismatch is what keeps the caller's decision and the bytes it gets
+// the same release: the head can move between a check and an apply, and
+// installing whatever the channel now offers would install a version nothing
+// approved.
+func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
+	head, err := g.Head(ctx, ChannelStable)
+	if err != nil {
+		return err
+	}
+	if head.Version != strings.TrimPrefix(version, "v") {
+		return fmt.Errorf("%w: the stable head %s ships %s %s, not %s",
+			ErrNoAsset, head.Release, DaemonComponent, head.Version, version)
+	}
+	return g.FetchAsset(ctx, head.Asset, dest)
+}
+
+// FetchAsset downloads an asset a bill of materials names and verifies it
+// before returning.
+//
+// dest is written only if the digest matches: the caller gets a file that is
 // either correct or absent, never a partially-written binary it might go on to
 // execute.
-func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
-	asset := g.AssetName(version)
-
+func (g *GitHub) FetchAsset(ctx context.Context, asset Asset, dest string) error {
 	// Sweep anything a previous attempt left behind.
 	//
 	// The deferred cleanup below only covers THIS call: a kill or a power cut
 	// mid-download leaves a partial file in the live binary's directory, and
 	// nothing else ever removes it. On the Pi + SD card this is written for,
 	// repeated failed updates accumulate ~20 MB each until the card is full.
-
 	sweepStagingFiles(filepath.Dir(dest))
-
-	want, err := g.checksum(ctx, version, asset)
-	if err != nil {
-		return err
-	}
 
 	// Staged beside dest so the publishing rename cannot cross a filesystem —
 	// a rename is atomic, and a cross-device move degrades to copy-then-truncate,
@@ -186,13 +275,13 @@ func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
 		_ = os.Remove(tmpPath)
 	}()
 
-	got, err := g.download(ctx, g.assetURL(version, asset), tmp)
+	got, err := g.download(ctx, asset.URL, tmp)
 	if err != nil {
 		return err
 	}
-	if !strings.EqualFold(got, want) {
-		return fmt.Errorf("%w: %s hashes to %s, the release says %s",
-			ErrChecksumMismatch, asset, got, want)
+	if !strings.EqualFold(got, asset.SHA256) {
+		return fmt.Errorf("%w: %s hashes to %s, the bill of materials says %s",
+			ErrChecksumMismatch, asset.URL, got, asset.SHA256)
 	}
 
 	// Flushed before the rename publishes it. On the Pi + SD card this is
@@ -215,38 +304,64 @@ func (g *GitHub) Fetch(ctx context.Context, version, dest string) error {
 	return nil
 }
 
-// checksum reads the release's checksums.txt and returns the asset's digest.
-func (g *GitHub) checksum(ctx context.Context, version, asset string) (string, error) {
-	url := g.assetURL(version, "checksums.txt")
+// bom reads a document and its detached signature, and returns it only if the
+// signature verifies.
+//
+// A document with no signature beside it is refused exactly as a tampered one
+// is: the bill of materials names the bytes the daemon will execute, so an
+// unsigned document is not a weaker answer, it is no answer.
+func (g *GitHub) bom(ctx context.Context, docURL string) (*BOM, error) {
+	body, err := g.document(ctx, docURL, maxBOMBytes)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			return nil, fmt.Errorf("%w at %s", ErrNoRelease, docURL)
+		}
+		return nil, err
+	}
 
+	signature, err := g.document(ctx, docURL+signatureSuffix, maxSignatureBytes)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			return nil, fmt.Errorf("%w: nothing is published at %s%s", ErrUnsignedBOM, docURL, signatureSuffix)
+		}
+		return nil, err
+	}
+
+	if g.keys != nil {
+		return VerifyBOM(body, signature, g.keys)
+	}
+	return OpenBOM(body, signature)
+}
+
+// document reads a whole document, refusing one larger than max.
+func (g *GitHub) document(ctx context.Context, url string, max int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("build the checksum request: %w", err)
+		return nil, fmt.Errorf("build the request for %s: %w", url, err)
 	}
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch %s: %w", url, err)
+		return nil, fmt.Errorf("fetch %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%s: %w", url, errNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch %s: %s", url, resp.Status)
+		return nil, fmt.Errorf("fetch %s: %s", url, resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumBytes))
+	// One byte past the cap, so an oversized document is refused rather than
+	// silently truncated into a body whose signature could never verify.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", url, err)
+		return nil, fmt.Errorf("read %s: %w", url, err)
 	}
-
-	for line := range strings.SplitSeq(string(body), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == asset {
-			return fields[0], nil
-		}
+	if int64(len(body)) > max {
+		return nil, fmt.Errorf("read %s: larger than the %d byte cap", url, max)
 	}
-	// The release exists but has nothing for this machine — a dropped build
-	// target, or a platform that was never published.
-	return "", fmt.Errorf("%w: %s is not in %s", ErrNoAsset, asset, url)
+	return body, nil
 }
 
 // download streams the asset into w and returns its SHA-256.
@@ -299,4 +414,19 @@ func Newer(candidate, current string) bool {
 		return false
 	}
 	return semver.Compare(c, cur) > 0
+}
+
+// Later reports whether candidate was published strictly after current.
+//
+// This is the comparison that orders releases, because a release label is never
+// compared. A zero current is older than anything published: a daemon that
+// cannot learn when its own release was published — its bill of materials is
+// pruned, or it is a development build — is offered the head rather than pinned
+// to nothing. A zero candidate is never later, because an undated document
+// orders nothing.
+func Later(candidate, current time.Time) bool {
+	if candidate.IsZero() {
+		return false
+	}
+	return candidate.After(current)
 }
