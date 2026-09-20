@@ -3,7 +3,7 @@ name: publish-pages
 # Publishes get.tumika.org: the signed bills of materials every daemon reads to
 # find an update, the daemon installer, and the static pages beside them.
 #
-# The repository must provide three things this workflow cannot create:
+# The repository must provide four things this workflow cannot create:
 #
 #   - Settings → Pages → Source = GitHub Actions. Any other source ignores the
 #     artifact this workflow uploads and keeps serving whatever is there.

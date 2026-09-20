@@ -110,7 +110,7 @@ ancestor of `main`: re-running the tests is not the same as knowing the commit
 was reviewed, and anyone who can push a tag could otherwise point it at a commit
 that merely compiles.
 
-**Before the first publish, the repository needs three things nothing in the
+**Before the first publish, the repository needs four things nothing in the
 workflows creates.**
 
 - A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
