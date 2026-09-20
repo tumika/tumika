@@ -54,6 +54,12 @@ type Asset struct {
 	Name   string
 	URL    string
 	SHA256 string
+	// Signature is the text of the `<name>.sig` the release publishes beside this
+	// asset, empty when it publishes none. It is content, not a digest, so
+	// checksums.txt cannot supply it: the caller reads the file the same way it
+	// reads release.yaml, and a component whose rule is signed is not published
+	// without it.
+	Signature string
 }
 
 // Document is one file to publish, and the bytes to sign.
@@ -94,21 +100,66 @@ type Result struct {
 	Skipped []Skip
 }
 
-// componentBinaries names the file each component publishes its raw binary
-// under: <binary>_<component version>_<goos>_<goarch>, the name template in
-// source/daemon/.goreleaser.yml.
+// componentAssets is the name every component's assets are published under:
+// <binary>_<component version>_<goos>_<goarch><extension>. For the daemon it is
+// the name template in source/daemon/.goreleaser.yml; for the desktop app it is
+// the name the release workflow renames Tauri's bundle to.
+//
+// Four names a release carries begin the same way, and only the extension tells
+// them apart:
+//
+//	tumika_0.0.1_linux_arm64                          the daemon binary the BOM names
+//	tumika_0.0.1_linux_arm64.tar.gz                   the archive a person downloads
+//	tumika-desktop_0.1.0_darwin_arm64.app.tar.gz      the app's updater archive
+//	tumika-desktop_0.1.0_darwin_arm64.app.tar.gz.sig  its detached minisign signature
+//
+// GOOS and GOARCH carry no dot, so the daemon's rule — which takes the whole
+// remainder as the platform — matches the raw binary and never the .tar.gz beside
+// it. The desktop's rule requires the exact `.app.tar.gz` extension, leaving a
+// dot-free platform part, so it matches the archive and never the `.sig`: that
+// file's text becomes the archive's signature field rather than an asset of its
+// own. The two binary names differ, so no name satisfies both components.
+//
+// The app is bundled for darwin_arm64 and darwin_amd64 — Apple silicon and Intel
+// — but nothing here enumerates platforms: a component publishes the platforms
+// its assets name, and a release that drops one publishes one fewer.
 //
 // A release naming a component absent from this map is skipped rather than
 // published without it — a component whose asset name nobody knows is a
 // component no client can fetch.
-var componentBinaries = map[string]string{
-	release.DaemonComponent: "tumika",
+var componentAssets = map[string]assetRule{
+	release.DaemonComponent:  {binary: "tumika"},
+	release.DesktopComponent: {binary: "tumika-desktop", extension: ".app.tar.gz", signed: true},
 }
 
-// A platform suffix is Go's own GOOS and GOARCH, which carry no separator and
-// no dot — the dot is what tells the raw binary apart from the .tar.gz archive
-// built for the same platform.
+// assetRule is how one component's asset names are written and read back.
+type assetRule struct {
+	// binary is the first field of every asset name.
+	binary string
+	// extension follows the platform. Empty for a raw binary.
+	extension string
+	// signed means every asset is published beside a detached <name>.sig, whose
+	// text the bill of materials carries. An asset whose signature is missing is
+	// not publishable: the updater that consumes the entry has nothing else to
+	// check the download against.
+	signed bool
+}
+
+// prefix is what an asset name for this component starts with at a component
+// version.
+func (r assetRule) prefix(version string) string { return r.binary + "_" + version + "_" }
+
+// pattern names what was looked for, for an error a publish run reports.
+func (r assetRule) pattern(version string) string {
+	return r.prefix(version) + "<goos>_<goarch>" + r.extension
+}
+
+// A platform part is Go's own GOOS or GOARCH: lower-case alphanumeric, with no
+// separator and no dot.
 var platformPartPattern = regexp.MustCompile(`^[a-z0-9]+$`)
+
+// signatureSuffix names the detached signature published beside an asset.
+const signatureSuffix = ".sig"
 
 // edgeTagPrefix is what an edge tag is spelled with. It never matches the
 // release workflow's v*.*.* glob, so an edge build is cut without a calendar
@@ -330,13 +381,16 @@ func build(c candidate, earlier []*built) (*built, error) {
 // the same component version, because bytes are never republished under one
 // component version.
 func resolveComponent(c candidate, name, version string, earlier []*built) (release.Component, error) {
-	binary, ok := componentBinaries[name]
+	rule, ok := componentAssets[name]
 	if !ok {
 		return release.Component{}, fmt.Errorf("component %s publishes no asset name this generator knows", name)
 	}
 	version = publishedVersion(version, c.label, c.channel)
 
-	assets := findAssets(c.rel.Assets, binary+"_"+version+"_")
+	assets, err := findAssets(c.rel.Assets, rule, version)
+	if err != nil {
+		return release.Component{}, err
+	}
 	if len(assets) > 0 {
 		return release.Component{Version: version, Assets: assets}, nil
 	}
@@ -345,8 +399,8 @@ func resolveComponent(c candidate, name, version string, earlier []*built) (rele
 		return release.Component{Version: version, Assets: carried, FromRelease: from}, nil
 	}
 	return release.Component{}, fmt.Errorf(
-		"no %s_%s_<goos>_<goarch> asset, and no earlier release publishes %s %s",
-		binary, version, name, version)
+		"no %s asset, and no earlier release publishes %s %s",
+		rule.pattern(version), name, version)
 }
 
 // publishedVersion is the component version a release's assets are named by.
@@ -366,12 +420,24 @@ func publishedVersion(version, label string, channel release.Channel) string {
 	return version + suffix
 }
 
-// findAssets collects the raw binaries whose names start with prefix, keyed by
-// the platform the name ends in.
-func findAssets(assets []Asset, prefix string) map[string]release.Asset {
+// findAssets collects the assets a component publishes at a component version,
+// keyed by the platform their names carry.
+//
+// A missing asset is no assets at all, which resolveComponent reads as a
+// component this release did not build. A signed component's asset arriving
+// without its signature is an error instead, because neither other answer is
+// right: published unsigned, the entry hands an updater bytes it cannot verify;
+// left out, the release looks like one that did not build the component and
+// carries an older component version over under this release's name.
+func findAssets(assets []Asset, rule assetRule, version string) (map[string]release.Asset, error) {
+	prefix := rule.prefix(version)
 	found := map[string]release.Asset{}
 	for _, a := range assets {
 		rest, ok := strings.CutPrefix(a.Name, prefix)
+		if !ok {
+			continue
+		}
+		rest, ok = strings.CutSuffix(rest, rule.extension)
 		if !ok {
 			continue
 		}
@@ -379,12 +445,19 @@ func findAssets(assets []Asset, prefix string) map[string]release.Asset {
 		if !ok || !platformPartPattern.MatchString(goos) || !platformPartPattern.MatchString(goarch) {
 			continue
 		}
-		found[release.PlatformKey(goos, goarch)] = release.Asset{URL: a.URL, SHA256: a.SHA256}
+		if rule.signed && strings.TrimSpace(a.Signature) == "" {
+			return nil, fmt.Errorf("%s is published without its %s%s", a.Name, a.Name, signatureSuffix)
+		}
+		found[release.PlatformKey(goos, goarch)] = release.Asset{
+			URL:       a.URL,
+			SHA256:    a.SHA256,
+			Signature: a.Signature,
+		}
 	}
 	if len(found) == 0 {
-		return nil
+		return nil, nil
 	}
-	return found
+	return found, nil
 }
 
 // carryOver finds the assets an unchanged component keeps pointing at, and the

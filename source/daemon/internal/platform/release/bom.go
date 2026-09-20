@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/mod/semver"
 )
@@ -92,6 +93,12 @@ type Component struct {
 type Asset struct {
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`
+	// Signature is the text of the detached signature file published beside the
+	// asset: minisign, for the desktop updater archive, because that is what the
+	// app's updater verifies with. Absent for an asset published without one,
+	// which the daemon's own are — a download is checked against SHA256, and the
+	// digest is trustworthy because the signature over this document covers it.
+	Signature string `json:"signature,omitempty"`
 }
 
 // Release labels are CalVer `YYYY.MM.NN`, zero-padded, optionally with a
@@ -229,6 +236,43 @@ func (a Asset) validate() error {
 	}
 	if !sha256Pattern.MatchString(a.SHA256) {
 		return fmt.Errorf("%q is not a sha256 digest", a.SHA256)
+	}
+	if a.Signature != "" {
+		if err := validateAssetSignature(a.Signature); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// maxAssetSignatureBytes bounds an asset's detached signature. A minisign
+// signature is an untrusted-comment line and a base64 line: a few hundred bytes.
+const maxAssetSignatureBytes = 4 << 10
+
+// validateAssetSignature holds an asset's signature to the shape a detached
+// signature file has, and no further.
+//
+// The format belongs to whichever client verifies with it, and this package
+// never parses one, so the check refuses only what cannot be a signature file at
+// all: an unbounded one, a blank one, and one carrying control characters. A
+// published document is read by a shell installer as well as by Go, and a NUL or
+// an escape sequence in a value it echoes is not something a signature ever
+// needs.
+func validateAssetSignature(signature string) error {
+	if len(signature) > maxAssetSignatureBytes {
+		return fmt.Errorf("signature is %d bytes, past the %d byte cap", len(signature), maxAssetSignatureBytes)
+	}
+	if strings.TrimSpace(signature) == "" {
+		return errors.New("signature is blank")
+	}
+	for _, r := range signature {
+		switch r {
+		case '\n', '\r', '\t':
+			continue
+		}
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("signature carries %q, which a signature file does not", r)
+		}
 	}
 	return nil
 }
