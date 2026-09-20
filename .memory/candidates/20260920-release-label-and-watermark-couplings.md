@@ -6,10 +6,17 @@ saw:
   - source/daemon/.goreleaser.yml
   - scripts/release-label.sh
   - scripts/verify-release-assets.sh
+  - scripts/release-component-version.sh
+  - scripts/check-release-monotonic.sh
+  - scripts/validate-release.sh
+  - scripts/install.sh
+  - .github/workflows/release.yml
+  - .github/workflows/ci-build.yml
   - release.yaml
   - source/daemon/internal/repository/migrations/0002_update_state_published_at.sql
 ---
 - A label stamped with `-X main.release` that fails `ValidateReleaseLabel` (bom.go) makes `publishedAt` in update.go return an error, and every `Check` with it: an invalid label is worse than the `dev` default, which just dates the build at the zero time. scripts/release-label.sh holds the only shell copy of the label pattern, and a test in platform/release fails when it drifts from `releaseLabelPattern`.
 - goreleaser's ldflags templates cannot run a command, so the label reaches the build only through the `TUMIKA_RELEASE` environment variable (`envOrDefault` in .goreleaser.yml). Every invoker must export it, and verify-release-assets.sh fails a non-snapshot build that has none rather than skipping, because a build without it silently ships `release dev` and leaves the recency rule inert.
+- A component version reaches the build only through the `TUMIKA_DAEMON_VERSION` environment variable (`.Env.TUMIKA_DAEMON_VERSION` in .goreleaser.yml, which hard-fails with "map has no entry for key" when it is unset). Its value is read from release.yaml by scripts/release-component-version.sh, and verify-release-assets.sh reads release.yaml itself rather than the build, so a stale or hand-set env var names the assets consistently but is still caught. goreleaser's `metadata.json` version is the tag on a release, so it must not be used as the component version; it is used only to tell a snapshot (`-snapshot` suffix) from a release.
 - Edge decides on recency alone, so a host that 404s the running build's own `/releases/<label>.json` while replaying an older signed channel head would roll the daemon back. `Apply` therefore stores the installed head's publication time in `update_state.to_published_at`, and `watermark` in update.go falls back to it only on `ErrNoRelease`, and only while the row's `to_version` is the running component version and its status is pending or confirmed. A daemon with no watermark still takes the head, so a pruned edge release stays survivable. The column is read and written by `Watermark`/`PutWatermark` alone, never by `GetUpdateState`, `PutUpdateState` or `IncrementBootAttempts`: `ConfirmBoot` runs before `Migrate`, so a state-machine statement naming a column the previous schema lacks leaves the failed boot uncounted and a broken update never reaches `MaxBootAttempts`.
 - `Check` never writes: a cleanly read own BOM wins and does not raise the watermark, because Check is called on a timer and must stay a read of the update row.

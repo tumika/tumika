@@ -169,18 +169,19 @@ jobs:
       - name: the release ships what the updater and installer expect
         run: scripts/verify-release-assets.sh
 
-      # install.sh is delivered by `release.extra_files`, so it never appears
-      # under dist/ and the script above cannot see it. Deleting those two lines
-      # from .goreleaser.yml would leave every check green and 404 the install
-      # command in this release's own notes — so the draft's asset list is what
-      # gets asked.
+      # install.sh and release.yaml are delivered by `release.extra_files`, so
+      # they never appear under dist/ and the script above cannot see them.
+      # install.sh downloads release.yaml to resolve the asset name, so deleting
+      # either line from .goreleaser.yml would leave every check green and break
+      # the install command in this release's own notes — so the draft's asset
+      # list is what gets asked.
       - name: the documented install command will work
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
           echo "$assets"
-          for want in install.sh checksums.txt; do
+          for want in install.sh release.yaml checksums.txt; do
             grep -qx "$want" <<<"$assets" \
               || { echo "the release has no $want; the documented install command would 404" >&2; exit 1; }
           done

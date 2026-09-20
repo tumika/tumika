@@ -34,3 +34,18 @@ depguard never sees `import "C"`, in either cgo mode. And
 exclude the file, the pattern match skips the package, and the build exits zero.
 Both were verified by adding a cgo package. `go list` reporting a non-empty
 `CgoFiles` is what actually fires.
+
+## Release builds
+
+`release.yml`'s image job takes its build args and tags from `release.yaml`, not
+from the git tag. `VERSION` is the daemon component's semver
+(`scripts/release-component-version.sh daemon`) and `RELEASE` is the label
+(`scripts/release-label.sh`); each script fails the job rather than yielding an
+empty value that would override the Dockerfile's defaults. The image is tagged
+with the component version and with the label, both as `type=raw`, because the
+tag is a zero-padded CalVer that `type=semver` cannot parse. `:latest` is a
+third `type=raw` tag enabled only when the label carries no `-beta.`.
+
+`ci-build.yml`'s snapshot release build exports `TUMIKA_DAEMON_VERSION` only.
+`.goreleaser.yml` fails without it, and leaving `TUMIKA_RELEASE` unset keeps the
+snapshot on the `dev` label that `verify-release-assets.sh` asserts.
