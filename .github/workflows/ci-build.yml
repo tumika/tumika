@@ -191,12 +191,13 @@ jobs:
         working-directory: source/desktop/src-tauri
         run: cargo test
 
-      # --debug skips the release optimisation pass and, more to the point,
-      # skips signing and notarization, which this repository does not do. It
+      # --debug skips the release optimisation pass. Signing is ad-hoc
+      # (signingIdentity "-") and notarization is not done. Updater artifacts
+      # are switched off because CI holds no updater private key. The build
       # still runs the whole bundle path, which is where a missing icon or a
       # malformed tauri.conf.json shows up.
       - name: tauri build
-        run: pnpm tauri build --debug
+        run: pnpm tauri build --debug -c '{"bundle":{"createUpdaterArtifacts":false}}'
 
   # The SHIPPED image (ADR: D9). The test-harness image is not built here: the
   # linux-install job below builds it from the same context and then actually
