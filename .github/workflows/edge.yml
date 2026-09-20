@@ -1,0 +1,193 @@
+name: edge
+
+# Cuts an edge build: one manual run, from any branch, no tag written by hand.
+#
+# Edge is the channel for trying a change on a real installation before it is a
+# release. It is deliberately the cheapest thing in this repository to publish —
+# no gate, no tests, no requirement that the commit ever reached main — because
+# the point is to get a branch onto a machine, and the tests that matter for a
+# branch already run on its pull request.
+#
+# What keeps that cheapness safe is that an edge build cannot be mistaken for a
+# release:
+#
+#   - it tags itself edge-<run number>, which release.yml's v*.*.* glob can
+#     never match, so publishing one never triggers the calendar release
+#     workflow;
+#   - its component version carries an -edge.<run number> suffix, so no client
+#     comparing versions ever confuses it with the calendar release it was cut
+#     from, and scripts/check-release-monotonic.sh ignores edge tags when it
+#     looks for the previous release;
+#   - only a daemon whose update.channel is `edge` is offered one, and the edge
+#     channel is ordered by publication time alone — an edge build moving a
+#     component version backwards is expected rather than refused.
+on:
+  workflow_dispatch:
+
+# Read-only at the top. Only the build job publishes, and it needs nothing
+# beyond contents: write — an edge build pushes no image.
+permissions:
+  contents: read
+
+# Two runs on the same ref would race on the prune and on the Pages deploy.
+# Never cancelled: a cancelled run leaves a draft release and a pushed tag
+# behind, which is the one state this workflow cannot clean up after itself.
+concurrency:
+  group: edge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # goreleaser builds the changelog from the commit range since the
+          # previous tag, so a shallow clone silently produces an empty one.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: source/daemon/go.sum
+
+      # The release LABEL for `-X main.release` and the daemon COMPONENT's
+      # semver for `-X main.version` and every asset name, both derived from
+      # release.yaml and the run number, and both validated by the same two
+      # scripts the calendar release reads that file with.
+      #
+      # The script's output is two KEY=VALUE lines, so it is redirected whole:
+      # the redirect keeps the script's exit status, where
+      # `echo "X=$(script)" >> "$GITHUB_ENV"` would keep echo's and export an
+      # empty value from a failed run.
+      #
+      # `--write release.yaml` rewrites the working copy so that every component
+      # version in it carries the edge suffix. That file is what goreleaser
+      # attaches as a release asset (release.extra_files), and it is what the
+      # BOM generator and scripts/verify-release-assets.sh both read the daemon
+      # component version from — so the asset names, the file describing them
+      # and the binary's own stamp all come from one value.
+      - name: the edge release label and the daemon component version
+        run: scripts/edge-version.sh --write release.yaml "$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+
+      # The tag is created here rather than by hand, on the commit this run
+      # checked out, and pushed before the release is built so the release
+      # points at a tag that exists. `edge-<n>` is outside release.yml's
+      # v*.*.* glob by construction: an edge build must never set the calendar
+      # release workflow running.
+      - name: tag this commit
+        run: |
+          tag="edge-$GITHUB_RUN_NUMBER"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+
+      # Same build as a calendar release, with the same config: the two values
+      # above are all .goreleaser.yml needs, and an edge binary must be built
+      # exactly the way a released one is or it is not a preview of anything.
+      #
+      # GORELEASER_CURRENT_TAG names the tag rather than leaving goreleaser to
+      # describe it from HEAD, which would find an older edge tag on a branch
+      # whose own tag was just pushed.
+      #
+      # --skip=validate is what the edge build needs beyond that: the working
+      # tree carries the generated release.yaml, which validate refuses as a
+      # dirty state, and validate also expects the tag to be the semver-shaped
+      # latest one on HEAD. Neither check is about the artefacts, and the two
+      # things they would protect — the version stamped and the assets produced
+      # — are asserted directly by the step below.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --config source/daemon/.goreleaser.yml --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: edge-${{ github.run_number }}
+
+      # goreleaser published a DRAFT (see .goreleaser.yml). Nothing below is
+      # downloadable until the promote step, so a failure here leaves a draft to
+      # delete rather than a broken build people can install. The script reads
+      # the expected version out of release.yaml — the edge one written above —
+      # and TUMIKA_RELEASE out of the environment.
+      - name: the edge build ships what the updater expects
+        run: scripts/verify-release-assets.sh
+
+      # release.yaml is delivered by `release.extra_files`, so it never appears
+      # under dist/ and the script above cannot see it; checksums.txt is
+      # uploaded by goreleaser itself. The BOM generator skips a release
+      # carrying no release.yaml asset, which would leave this build published
+      # and invisible to every edge daemon.
+      - name: the edge build carries the assets the site depends on
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=$(gh release view "edge-$GITHUB_RUN_NUMBER" --json assets --jq '.assets[].name')
+          echo "$assets"
+          for want in release.yaml checksums.txt; do
+            grep -qx "$want" <<<"$assets" \
+              || { echo "the release has no $want" >&2; exit 1; }
+          done
+
+      # Promoted only now, and as a prerelease: an edge build is never what
+      # /releases/latest points at, and it is not a release anyone should reach
+      # by browsing.
+      - name: publish the edge build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "edge-$GITHUB_RUN_NUMBER" --draft=false --prerelease=true
+
+      # Edge builds accumulate without limit otherwise, five raw binaries and
+      # archives at a time. Pruned after the promote, so this run's own build is
+      # among the ones kept. A pruned build's BOM disappears with it, which a
+      # daemon still running it reads as "older than the head" rather than as an
+      # error.
+      - name: keep the newest five edge builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release list --limit 200 \
+            --json tagName,isDraft,createdAt \
+            --jq '.[] | [.tagName, .isDraft, .createdAt] | @tsv' \
+            | scripts/edge-prune.sh --delete
+
+      # An edge build is identified by the branch and commit it was cut from,
+      # which is the one thing the tag and the version do not say. Written even
+      # when a step above failed: a run that got as far as pushing a tag is one
+      # somebody has to go and look at.
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## edge-$GITHUB_RUN_NUMBER"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| branch | \`$GITHUB_REF_NAME\` |"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| release | \`${TUMIKA_RELEASE:-not computed}\` |"
+            echo "| daemon | \`${TUMIKA_DAEMON_VERSION:-not computed}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Called, not left to publish-pages.yml's own `release: published` trigger:
+  # the promote step above publishes with the default GITHUB_TOKEN, and GitHub
+  # raises no workflow events for anything that token did. Without this the edge
+  # channel head would keep pointing at the previous build until the weekly
+  # schedule caught up.
+  #
+  # A called workflow cannot hold more permission than the job that calls it, so
+  # the two the deploy job in publish-pages.yml needs are granted here; the top
+  # of this file stays read-only. `secrets: inherit` satisfies the signing key
+  # that workflow declares as required.
+  pages:
+    name: pages
+    needs: build
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-pages.yml
+    secrets: inherit
