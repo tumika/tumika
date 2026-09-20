@@ -1,0 +1,13 @@
+components:
+  - name: daemon
+    dir: source/daemon
+    runner: go-test
+    args: ["-race", "./..."]
+
+  - name: desktop-web
+    dir: source/desktop
+    runner: vitest
+
+  - name: desktop-tauri
+    dir: source/desktop/src-tauri
+    runner: cargo-nextest
