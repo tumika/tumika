@@ -52,6 +52,26 @@ jobs:
             exit 1
           fi
 
+      # The tag names the release this commit's release.yaml describes. A tag
+      # that disagrees with the label would publish one release under another's
+      # name, and every asset below is named from release.yaml rather than from
+      # the tag — so the disagreement would be invisible in the result.
+      - name: the tag names the release release.yaml describes
+        run: scripts/validate-release.sh --tag "$GITHUB_REF_NAME"
+
+      # A component version that repeats or lowers the last published one
+      # produces a release no client moves onto: the update rules never
+      # downgrade. Asked before anything is built, because a published release
+      # is not something a later step can take back.
+      #
+      # contents: read is all this needs — it reads the release list and one
+      # asset of an already-published release.
+      - name: every component version advances past the last published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/check-release-monotonic.sh
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.6"
