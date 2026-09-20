@@ -14,7 +14,11 @@ go run ./source/daemon/cmd/tumika        # run the CLI locally
 go run ./source/daemon/cmd/tumika token rotate   # mint one, printed once
 go run ./source/daemon/cmd/tumika serve          # run the daemon in the foreground
 
-# Release build dry-run (produces dist/):
+# Release build dry-run (produces dist/). Both variables are mandatory: the
+# component version names every asset, and an unset one fails the build with
+# `map has no entry for key` rather than guessing.
+export TUMIKA_DAEMON_VERSION=$(scripts/release-component-version.sh daemon)
+export TUMIKA_RELEASE=$(scripts/release-label.sh)
 go run github.com/goreleaser/goreleaser/v2@latest release --config source/daemon/.goreleaser.yml --snapshot --clean
 ```
 
