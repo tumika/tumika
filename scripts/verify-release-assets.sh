@@ -22,7 +22,15 @@
 # release would ship a daemon whose component version is not the one the BOM and
 # the tag describe.
 #
-# Usage: scripts/verify-release-assets.sh [dist-dir]
+# A release that carries the daemon over unchanged builds no daemon assets, and
+# demanding them would fail it. TUMIKA_CHANGED_COMPONENTS is the gate's
+# `changed=` list (scripts/check-release-monotonic.sh): when it is set and does
+# not name the daemon, every assertion below is skipped. Leaving it unset means
+# the daemon changed, which is what every caller that builds the daemon
+# unconditionally — the snapshot build in ci-build.yml, the edge build — relies
+# on. An absent list is not an empty one.
+#
+# Usage: TUMIKA_CHANGED_COMPONENTS=daemon,desktop scripts/verify-release-assets.sh [dist-dir]
 set -euo pipefail
 
 DIST="${1:-dist}"
@@ -45,6 +53,26 @@ rebase() {
 fail() { echo "FAIL: $*" >&2; exit 1; }
 NATIVE=""
 ok()   { echo "  ok: $*"; }
+
+# Whether the daemon is one of the components this release builds. The list is
+# validated rather than merely searched: a garbled or empty value would
+# otherwise skip every assertion in this script and still print PASS.
+if [[ -n "${TUMIKA_CHANGED_COMPONENTS+set}" ]]; then
+  CHANGED="$TUMIKA_CHANGED_COMPONENTS"
+  [[ -n "$CHANGED" ]] \
+    || fail "TUMIKA_CHANGED_COMPONENTS names no component; a release that rebuilds nothing publishes nothing to verify. Unset it to assert the daemon's assets"
+  [[ "$CHANGED" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]] \
+    || fail "TUMIKA_CHANGED_COMPONENTS='$CHANGED' is not a comma-separated list of component names"
+  case ",$CHANGED," in
+    *,daemon,*) ;;
+    *)
+      echo "TUMIKA_CHANGED_COMPONENTS=$CHANGED does not name the daemon: it is carried over from an earlier release, which is the release that carries its assets"
+      echo
+      echo "PASS"
+      exit 0
+      ;;
+  esac
+fi
 
 [[ -f "$ARTIFACTS" ]] || fail "no $ARTIFACTS — did goreleaser run?"
 [[ -f "$CHECKSUMS" ]] || fail "no $CHECKSUMS; it is what anyone checking a download compares against"
