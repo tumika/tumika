@@ -249,18 +249,29 @@ func (s *updateService) publishedAt(ctx context.Context) (time.Time, error) {
 // must be the running component version, and its status must be pending or
 // confirmed. A rolled_back or failed row records a build that is NOT running,
 // and its publication time would date this daemon by a release it never kept.
+//
+// The state is what that gate is read from, and the watermark is read through
+// its own repository method only once the gate has passed. Reaching it means a
+// daemon that is serving, so the migrations have run and the column is there.
 func (s *updateService) watermark(ctx context.Context) (time.Time, error) {
 	state, err := s.deps.Repo.Get(ctx)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("read the update state: %w", err)
 	}
-	if state.ToPublishedAt == nil || state.ToVersion != s.deps.Version {
+	if state.ToVersion != s.deps.Version {
 		return time.Time{}, nil
 	}
 	if state.Status != domain.UpdatePending && state.Status != domain.UpdateConfirmed {
 		return time.Time{}, nil
 	}
-	return *state.ToPublishedAt, nil
+	at, err := s.deps.Repo.Watermark(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read the update watermark: %w", err)
+	}
+	if at == nil {
+		return time.Time{}, nil
+	}
+	return *at, nil
 }
 
 // Apply installs a version, leaving the process running on the old one.
@@ -361,22 +372,25 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// ConfirmBoot resolves harmlessly. The reverse order leaves a swapped binary
 	// with no record, and nothing would ever roll it back.
 	started := s.now()
-	// The head's publication time is recorded with the version it ships, so the
-	// binary that boots next can date itself even after its own bill of
-	// materials stops being served — which is what keeps a 404 from becoming a
-	// downgrade.
-	headPublishedAt := head.PublishedAt
 	state := domain.UpdateState{
-		Status:        domain.UpdatePending,
-		FromVersion:   s.deps.Version,
-		ToVersion:     version,
-		BootAttempts:  0,
-		StartedAt:     &started,
-		UpdatedAt:     started,
-		ToPublishedAt: &headPublishedAt,
+		Status:       domain.UpdatePending,
+		FromVersion:  s.deps.Version,
+		ToVersion:    version,
+		BootAttempts: 0,
+		StartedAt:    &started,
+		UpdatedAt:    started,
 	}
+	// The head's publication time is recorded with the version it ships, in the
+	// same transaction, so the binary that boots next can date itself even after
+	// its own bill of materials stops being served — which is what keeps a 404
+	// from becoming a downgrade. One transaction because a watermark that names
+	// a version the row does not is a floor belonging to nothing.
+	headPublishedAt := head.PublishedAt
 	if err := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
-		return s.deps.Repo.Put(ctx, state)
+		if err := s.deps.Repo.Put(ctx, state); err != nil {
+			return err
+		}
+		return s.deps.Repo.PutWatermark(ctx, &headPublishedAt)
 	}); err != nil {
 		return fmt.Errorf("record the pending update: %w", err)
 	}

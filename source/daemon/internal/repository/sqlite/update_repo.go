@@ -24,7 +24,7 @@ func (r *UpdateStateRepo) Get(ctx context.Context) (domain.UpdateState, error) {
 		return domain.UpdateState{}, mapError(err)
 	}
 	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
-		row.StartedAt, row.UpdatedAt, row.ToPublishedAt)
+		row.StartedAt, row.UpdatedAt)
 }
 
 func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
@@ -39,10 +39,24 @@ func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
 		BootAttempts: int64(s.BootAttempts),
 		StartedAt:    nullTime(s.StartedAt),
 		UpdatedAt:    formatTime(updated),
-		// A nil watermark is stored as NULL rather than a zero time, which would
-		// read back as year 1 and pass for a real publication time.
-		ToPublishedAt: nullTime(s.ToPublishedAt),
 	}))
+}
+
+// Watermark and PutWatermark read and write to_published_at on its own, which
+// is what keeps it off the statements ConfirmBoot issues before the migrations
+// have run. A daemon on the previous schema must never reach either.
+func (r *UpdateStateRepo) Watermark(ctx context.Context) (*time.Time, error) {
+	at, err := r.s.readQ(ctx).GetUpdateWatermark(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return parseNullTime(at)
+}
+
+func (r *UpdateStateRepo) PutWatermark(ctx context.Context, at *time.Time) error {
+	// A nil watermark is stored as NULL rather than a zero time, which would
+	// read back as year 1 and pass for a real publication time.
+	return mapError(r.s.writeQ(ctx).SetUpdateWatermark(ctx, nullTime(at)))
 }
 
 // IncrementBootAttempts bumps the counter and returns the new state in one
@@ -56,7 +70,7 @@ func (r *UpdateStateRepo) IncrementBootAttempts(ctx context.Context) (domain.Upd
 		return domain.UpdateState{}, mapError(err)
 	}
 	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
-		row.StartedAt, row.UpdatedAt, row.ToPublishedAt)
+		row.StartedAt, row.UpdatedAt)
 }
 
 func updateStateFrom(
@@ -64,7 +78,6 @@ func updateStateFrom(
 	bootAttempts int64,
 	startedAt sql.NullString,
 	updatedAt string,
-	toPublishedAt sql.NullString,
 ) (domain.UpdateState, error) {
 	updated, err := parseTime(updatedAt)
 	if err != nil {
@@ -74,17 +87,12 @@ func updateStateFrom(
 	if err != nil {
 		return domain.UpdateState{}, err
 	}
-	published, err := parseNullTime(toPublishedAt)
-	if err != nil {
-		return domain.UpdateState{}, err
-	}
 	return domain.UpdateState{
-		Status:        domain.UpdateStatus(status),
-		FromVersion:   fromVersion,
-		ToVersion:     toVersion,
-		BootAttempts:  int(bootAttempts),
-		StartedAt:     started,
-		UpdatedAt:     updated,
-		ToPublishedAt: published,
+		Status:       domain.UpdateStatus(status),
+		FromVersion:  fromVersion,
+		ToVersion:    toVersion,
+		BootAttempts: int(bootAttempts),
+		StartedAt:    started,
+		UpdatedAt:    updated,
 	}, nil
 }

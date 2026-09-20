@@ -16,6 +16,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/tumika/tumika/source/daemon/internal/domain"
 )
@@ -129,4 +130,18 @@ type UpdateStateRepository interface {
 	// every boot of a pending update, which is precisely when the process may
 	// be dying partway through.
 	IncrementBootAttempts(ctx context.Context) (domain.UpdateState, error)
+
+	// Watermark is the publication time recorded for the release the last
+	// update installed, and nil when none was recorded.
+	//
+	// PutWatermark records one, and is called with the pending row in the same
+	// transaction so the two cannot disagree.
+	//
+	// These two are apart from the state machine above because they need the
+	// migrated schema, and the boot path — ConfirmBoot — runs BEFORE the
+	// migrations. Nothing on that path may call them: a statement naming a
+	// column the previous schema lacks fails, the failed boot is never counted,
+	// and an update that cannot start never reaches the rollback threshold.
+	Watermark(ctx context.Context) (*time.Time, error)
+	PutWatermark(ctx context.Context, at *time.Time) error
 }

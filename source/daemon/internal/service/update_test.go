@@ -144,10 +144,16 @@ func (f fakeSettings) Get(_ context.Context, key string) (domain.SettingView, er
 }
 
 // fakeUpdateRepo is the single-row state table, in memory.
+//
+// The watermark is kept beside the state, as the column is beside the row, and
+// markErr makes both of its methods fail the way a database that has not been
+// migrated yet does.
 type fakeUpdateRepo struct {
-	state   domain.UpdateState
-	putErr  error
-	incrErr error
+	state     domain.UpdateState
+	watermark *time.Time
+	putErr    error
+	incrErr   error
+	markErr   error
 }
 
 func newUpdateRepo() *fakeUpdateRepo {
@@ -172,6 +178,21 @@ func (f *fakeUpdateRepo) IncrementBootAttempts(context.Context) (domain.UpdateSt
 	}
 	f.state.BootAttempts++
 	return f.state, nil
+}
+
+func (f *fakeUpdateRepo) Watermark(context.Context) (*time.Time, error) {
+	if f.markErr != nil {
+		return nil, f.markErr
+	}
+	return f.watermark, nil
+}
+
+func (f *fakeUpdateRepo) PutWatermark(_ context.Context, at *time.Time) error {
+	if f.markErr != nil {
+		return f.markErr
+	}
+	f.watermark = at
+	return nil
 }
 
 // harness builds a service over a real binary path in a temp directory, so the
@@ -740,8 +761,8 @@ func TestAWatermarkRefusesAReplayedOlderHeadWhenTheOwnDocumentIsWithheld(t *test
 		h := withheld(t)
 		h.repo.state = domain.UpdateState{
 			Status: domain.UpdateConfirmed, FromVersion: "0.0.2-edge.139", ToVersion: running,
-			ToPublishedAt: &published,
 		}
+		h.repo.watermark = &published
 
 		available, newer, err := h.svc.Check(t.Context())
 		if err != nil {
@@ -786,11 +807,9 @@ func TestAWatermarkFromAnotherBuildIsIgnored(t *testing.T) {
 	}{
 		{"rolled back", domain.UpdateState{
 			Status: domain.UpdateRolledBack, FromVersion: running, ToVersion: "0.0.2-edge.150",
-			ToPublishedAt: &published,
 		}},
 		{"pending another version", domain.UpdateState{
 			Status: domain.UpdatePending, FromVersion: running, ToVersion: "0.0.2-edge.150",
-			ToPublishedAt: &published,
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -799,6 +818,7 @@ func TestAWatermarkFromAnotherBuildIsIgnored(t *testing.T) {
 			h.source.offer(release.ChannelEdge, "edge.100", published.Add(-48*time.Hour), "0.0.2-edge.100")
 			delete(h.source.boms, runningRelease)
 			h.repo.state = tc.state
+			h.repo.watermark = &published
 
 			if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
 				t.Errorf("Check = %v/%v, want the head offered: the watermark is another build's",
@@ -818,9 +838,8 @@ func TestTheOwnBillOfMaterialsWinsOverTheWatermark(t *testing.T) {
 	// that but older than the watermark. Only the document decides.
 	h.source.publish(runningRelease, release.ChannelEdge, published.Add(-365*24*time.Hour), running)
 	h.source.offer(release.ChannelEdge, "edge.147", published.Add(-48*time.Hour), "0.0.2-edge.147")
-	h.repo.state = domain.UpdateState{
-		Status: domain.UpdateConfirmed, ToVersion: running, ToPublishedAt: &published,
-	}
+	h.repo.state = domain.UpdateState{Status: domain.UpdateConfirmed, ToVersion: running}
+	h.repo.watermark = &published
 
 	if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
 		t.Errorf("Check = %v/%v, want the head offered on the strength of the own document",
@@ -837,13 +856,56 @@ func TestApplyRecordsThePublicationTimeOfWhatItInstalls(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	state, err := h.repo.Get(t.Context())
+	got, err := h.repo.Watermark(t.Context())
 	if err != nil {
-		t.Fatalf("Get: %v", err)
+		t.Fatalf("Watermark: %v", err)
 	}
 	want := published.Add(24 * time.Hour)
-	if state.ToPublishedAt == nil || !state.ToPublishedAt.Equal(want) {
-		t.Errorf("ToPublishedAt = %v, want the head's publication time %v", state.ToPublishedAt, want)
+	if got == nil || !got.Equal(want) {
+		t.Errorf("watermark = %v, want the head's publication time %v", got, want)
+	}
+}
+
+// ConfirmBoot runs BEFORE the migrations, so a database still on the previous
+// schema has no to_published_at for it to read. Every statement the boot path
+// issues must therefore survive a watermark that cannot be reached: a failure
+// there would leave the attempt uncounted, and a binary that cannot start would
+// never reach MaxBootAttempts and never be rolled back.
+func TestBootRecoveryDoesNotTouchTheWatermark(t *testing.T) {
+	h := newHarness(t, "0.2.0")
+	if err := os.WriteFile(h.binary+".old", []byte("binary 0.1.0"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+	h.repo.state = domain.UpdateState{
+		Status: domain.UpdatePending, FromVersion: "0.1.0", ToVersion: "0.2.0",
+	}
+	h.repo.markErr = errors.New("no such column: to_published_at")
+
+	for attempt := 1; attempt < domain.MaxBootAttempts; attempt++ {
+		rolledBack, err := h.svc.ConfirmBoot(t.Context())
+		if err != nil {
+			t.Fatalf("ConfirmBoot attempt %d: %v", attempt, err)
+		}
+		if rolledBack {
+			t.Fatalf("attempt %d rolled back before %d failures", attempt, domain.MaxBootAttempts)
+		}
+		if h.repo.state.BootAttempts != attempt {
+			t.Fatalf("BootAttempts = %d after attempt %d", h.repo.state.BootAttempts, attempt)
+		}
+	}
+
+	rolledBack, err := h.svc.ConfirmBoot(t.Context())
+	if err != nil {
+		t.Fatalf("ConfirmBoot at the threshold: %v", err)
+	}
+	if !rolledBack {
+		t.Errorf("after %d failed boots the update was not rolled back", domain.MaxBootAttempts)
+	}
+	if h.repo.state.Status != domain.UpdateRolledBack {
+		t.Errorf("status = %q, want rolled_back", h.repo.state.Status)
+	}
+	if got := h.read(t, h.binary); got != "binary 0.1.0" {
+		t.Errorf("the restored binary is %q, want the previous one", got)
 	}
 }
 

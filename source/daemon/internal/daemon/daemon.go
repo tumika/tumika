@@ -126,9 +126,8 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		return nil, err
 	}
 
-	// Each repository is constructed once and handed to exactly one service.
-	// This is the only place that rule can be broken, so it is the place to
-	// check it in review.
+	// Each repository is constructed once and handed to exactly one service;
+	// this is where that rule could be broken.
 	//
 	// Settings are owned by ConfigService, and the updater reads update.channel
 	// through it: construction opens nothing, so it can stand above the boot

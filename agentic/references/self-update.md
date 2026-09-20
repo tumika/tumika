@@ -68,7 +68,10 @@ replaying a genuine, correctly signed, older channel head dates the daemon at
 nothing, and the older release supersedes it. The watermark is written by the
 daemon itself, from the head it is installing, before the binary is swapped, so
 nothing the host serves can lower it. A bill of materials that reads cleanly is
-authoritative and leaves the watermark alone, which keeps `Check` a read.
+authoritative and leaves the watermark alone, which keeps `Check` a read. The
+watermark is read and written through its own repository methods rather than
+alongside the state machine's columns, because `ConfirmBoot` runs before
+`Migrate` and everything it reads has to exist on the previous schema.
 
 ## Trust chain
 

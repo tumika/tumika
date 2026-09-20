@@ -35,6 +35,33 @@ func newStore(t *testing.T) *Store {
 	return s
 }
 
+// newStoreAtVersion opens a database migrated only as far as one version, which
+// is the database a binary meets on the boot path: ConfirmBoot runs before
+// Migrate, so whatever the previous binary left is what it reads and writes.
+func newStoreAtVersion(t *testing.T, version int64) *Store {
+	t.Helper()
+
+	s, err := Open(t.Context(), filepath.Join(t.TempDir(), "tumika.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	goose.SetBaseFS(migrations.FS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("SetDialect: %v", err)
+	}
+	if err := goose.UpToContext(t.Context(), s.rw, ".", version); err != nil {
+		t.Fatalf("migrate up to %d: %v", version, err)
+	}
+	return s
+}
+
 func seedProvider(t *testing.T, s *Store, id string) {
 	t.Helper()
 	repo := NewProviderRepo(s)
@@ -82,13 +109,15 @@ func TestMigrationsRollBackAndForwardAgain(t *testing.T) {
 
 	watermark := time.Date(2026, 9, 20, 7, 28, 0, 0, time.UTC)
 	err := repo.Put(ctx, domain.UpdateState{
-		Status:        domain.UpdateConfirmed,
-		FromVersion:   "0.0.1",
-		ToVersion:     "0.0.2",
-		ToPublishedAt: &watermark,
+		Status:      domain.UpdateConfirmed,
+		FromVersion: "0.0.1",
+		ToVersion:   "0.0.2",
 	})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
+	}
+	if err := repo.PutWatermark(ctx, &watermark); err != nil {
+		t.Fatalf("PutWatermark: %v", err)
 	}
 
 	goose.SetBaseFS(migrations.FS)
@@ -122,10 +151,106 @@ func TestMigrationsRollBackAndForwardAgain(t *testing.T) {
 	if got.Status != domain.UpdateConfirmed || got.ToVersion != "0.0.2" {
 		t.Errorf("state = %+v, want the row preserved across the round trip", got)
 	}
-	// A column re-added is empty, which is exactly how a row written before the
-	// daemon recorded watermarks reads: no watermark at all, never a zero time.
-	if got.ToPublishedAt != nil {
-		t.Errorf("ToPublishedAt = %v, want nil on a row with no watermark", got.ToPublishedAt)
+	// A column re-added is empty, which is exactly how a database carrying no
+	// watermark reads: none at all, never a zero time.
+	mark, err := repo.Watermark(ctx)
+	if err != nil {
+		t.Fatalf("Watermark after re-migrating: %v", err)
+	}
+	if mark != nil {
+		t.Errorf("watermark = %v, want nil on a database that holds none", mark)
+	}
+}
+
+// ConfirmBoot runs before Migrate, so the state machine's statements meet a
+// database still on the schema the previous binary left. Every one of them has
+// to work there, up to and including the rollback the threshold triggers —
+// a statement naming a later schema's column fails, the boot goes uncounted,
+// and a binary that cannot start is never rolled back.
+func TestTheUpdateStateMachineWorksOnThePreviousSchema(t *testing.T) {
+	s := newStoreAtVersion(t, 1)
+	repo := NewUpdateStateRepo(s)
+	ctx := t.Context()
+
+	got, err := repo.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get on schema 1: %v", err)
+	}
+	if got.Status != domain.UpdateIdle {
+		t.Errorf("seeded status = %q, want idle", got.Status)
+	}
+
+	started := time.Now().UTC()
+	err = repo.Put(ctx, domain.UpdateState{
+		Status:      domain.UpdatePending,
+		FromVersion: "0.0.1",
+		ToVersion:   "0.0.2",
+		StartedAt:   &started,
+	})
+	if err != nil {
+		t.Fatalf("Put on schema 1: %v", err)
+	}
+
+	for i := 1; i <= domain.MaxBootAttempts; i++ {
+		got, err = repo.IncrementBootAttempts(ctx)
+		if err != nil {
+			t.Fatalf("IncrementBootAttempts %d on schema 1: %v", i, err)
+		}
+		if got.BootAttempts != i {
+			t.Fatalf("BootAttempts = %d, want %d", got.BootAttempts, i)
+		}
+	}
+	if !got.ShouldRollBack() {
+		t.Fatalf("after %d attempts ShouldRollBack must be true", domain.MaxBootAttempts)
+	}
+
+	// The rollback itself, which is the write that closes the boot path.
+	got.Status = domain.UpdateRolledBack
+	if err := repo.Put(ctx, got); err != nil {
+		t.Fatalf("record the rollback on schema 1: %v", err)
+	}
+}
+
+// The watermark needs the migrated schema, which is why it is read and written
+// apart from the state machine and only by a daemon that is already serving.
+func TestTheWatermarkRoundTrips(t *testing.T) {
+	s := newStore(t)
+	repo := NewUpdateStateRepo(s)
+	ctx := t.Context()
+
+	// The seeded row carries none, and reads as none rather than as a zero time
+	// that would pass for a real publication time.
+	got, err := repo.Watermark(ctx)
+	if err != nil {
+		t.Fatalf("Watermark on a fresh database: %v", err)
+	}
+	if got != nil {
+		t.Errorf("seeded watermark = %v, want nil", got)
+	}
+
+	published := time.Now().UTC().Add(-time.Hour)
+	if err := repo.PutWatermark(ctx, &published); err != nil {
+		t.Fatalf("PutWatermark: %v", err)
+	}
+	got, err = repo.Watermark(ctx)
+	if err != nil {
+		t.Fatalf("Watermark: %v", err)
+	}
+	if got == nil || !got.Equal(published) {
+		t.Errorf("watermark = %v, want %v", got, published)
+	}
+
+	// It survives the boots counted against the update, because the state
+	// machine's statements do not name its column at all.
+	if _, err := repo.IncrementBootAttempts(ctx); err != nil {
+		t.Fatalf("IncrementBootAttempts: %v", err)
+	}
+	got, err = repo.Watermark(ctx)
+	if err != nil {
+		t.Fatalf("Watermark after an increment: %v", err)
+	}
+	if got == nil || !got.Equal(published) {
+		t.Errorf("watermark = %v after an increment, want %v", got, published)
 	}
 }
 
@@ -489,20 +614,13 @@ func TestUpdateStateSeededAndIncremented(t *testing.T) {
 	if got.Status != domain.UpdateIdle {
 		t.Errorf("seeded status = %q, want idle", got.Status)
 	}
-	// The seeded row has no watermark, and reads as none rather than as a zero
-	// time that would pass for a real publication time.
-	if got.ToPublishedAt != nil {
-		t.Errorf("seeded ToPublishedAt = %v, want nil", got.ToPublishedAt)
-	}
 
 	started := time.Now().UTC().Truncate(time.Nanosecond)
-	publishedAt := started.Add(-time.Hour)
 	err = repo.Put(ctx, domain.UpdateState{
-		Status:        domain.UpdatePending,
-		FromVersion:   "v0.0.1",
-		ToVersion:     "v0.0.2",
-		StartedAt:     &started,
-		ToPublishedAt: &publishedAt,
+		Status:      domain.UpdatePending,
+		FromVersion: "v0.0.1",
+		ToVersion:   "v0.0.2",
+		StartedAt:   &started,
 	})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
@@ -522,11 +640,6 @@ func TestUpdateStateSeededAndIncremented(t *testing.T) {
 	}
 	if got.StartedAt == nil || !got.StartedAt.Equal(started) {
 		t.Errorf("StartedAt = %v, want %v", got.StartedAt, started)
-	}
-	// The watermark survives every boot counted against the update, because it
-	// is what dates the build once its own release document stops being served.
-	if got.ToPublishedAt == nil || !got.ToPublishedAt.Equal(publishedAt) {
-		t.Errorf("ToPublishedAt = %v, want %v", got.ToPublishedAt, publishedAt)
 	}
 }
 
