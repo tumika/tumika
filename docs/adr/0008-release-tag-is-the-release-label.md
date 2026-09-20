@@ -20,10 +20,11 @@ the workflow builds has to be addressed by the other.
 
 - **The gate enforces both halves before anything is built:**
   - the tag equals `v<label>` from `release.yaml`;
-  - each component version is strictly greater than the one in the last published calendar
-    release. A beta's component version carries a `-beta.N` suffix, which semver orders below
-    the stable version of the same core, so one strict comparison covers beta to beta and beta
-    to stable.
+  - each component version is greater than or equal to the one in the last published calendar
+    release. A lower version is refused; an equal one is a component carried over from that
+    release, whose rules are in ADR 0010. A beta's component version carries a `-beta.N`
+    suffix, which semver orders below the stable version of the same core, so one comparison
+    covers beta to beta and beta to stable.
   - The comparison fails closed: if the release list or the previous release's assets cannot
     be read, the gate fails rather than passing without a comparison. A previous release that
     carries no `release.yaml` asset is the one case that passes, and it is decided from a

@@ -124,8 +124,24 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.6"
-          cache: true
-          cache-dependency-path: source/daemon/go.sum
+          # Off: setup-go's key is derived from go.sum alone, so it is the key
+          # release.yml's gate and goreleaser jobs restore. This job runs the
+          # branch's code, and goreleaser holds contents: write. The caches are
+          # keyed under a prefix of their own below.
+          cache: false
+
+      - id: go-paths
+        run: |
+          echo "mod=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.go-paths.outputs.mod }}
+            ${{ steps.go-paths.outputs.build }}
+          key: go-edge-${{ runner.os }}-${{ hashFiles('source/daemon/go.sum') }}
+          restore-keys: go-edge-${{ runner.os }}-
 
       # The release LABEL for `-X main.release` and the daemon COMPONENT's
       # semver for `-X main.version` and every asset name, both derived from
@@ -260,18 +276,31 @@ jobs:
           # holding a token it could push with.
           persist-credentials: false
 
-      # pnpm before setup-node: `cache: pnpm` asks node to locate the pnpm store,
-      # which only works once pnpm is on PATH. The pnpm version comes from the
-      # `packageManager` field of the app's package.json.
+      # The pnpm version comes from the `packageManager` field of the app's
+      # package.json.
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: source/desktop/package.json
 
+      # No `cache: pnpm` here: setup-node's key is derived from the lockfile hash
+      # alone, so it is the same key release.yml's desktop job and the sign job
+      # below restore. This job runs the branch's code and would write into a
+      # cache they read. The store is cached under a prefix of its own instead.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "26.7.0"
-          cache: pnpm
-          cache-dependency-path: source/desktop/pnpm-lock.yaml
+
+      - name: locate the pnpm store
+        id: pnpm-store
+        working-directory: source/desktop
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      # A key prefix of its own, for the same reason as the cargo cache below.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-edge-${{ runner.os }}-${{ hashFiles('source/desktop/pnpm-lock.yaml') }}
+          restore-keys: pnpm-edge-${{ runner.os }}-
 
       # `--write release.yaml` suffixes every component version in the working
       # copy, and the desktop component's is then read back out of it — the same
