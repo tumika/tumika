@@ -10,7 +10,9 @@ name: publish-pages
 #   - A DNS CNAME for get.tumika.org pointing at the Pages host. The record that
 #     names the domain to Pages is scripts/site/CNAME, which every deploy
 #     republishes.
-#   - The Actions secret TUMIKA_RELEASE_SIGNING_KEY: the PEM release signing key
+#   - The environment `release-signing`, with its deployment-branch policy limited
+#     to `main` and `v*.*.*` tags, holding the secret TUMIKA_RELEASE_SIGNING_KEY:
+#     the PEM release signing key
 #     (SEC1 "EC PRIVATE KEY" or PKCS#8 "PRIVATE KEY", ECDSA P-256). tumika-bom
 #     reads it from the environment only — never an argument, never a file it
 #     names in an error — and refuses a key that is not among the keys compiled
@@ -31,15 +33,11 @@ on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
-  # The edge workflow calls this one after publishing its own release. The
-  # secret is declared rather than left implicit: a caller passing
-  # `secrets: inherit` satisfies a declared requirement, and a caller that
-  # forgets fails at the call instead of producing an unsigned-looking run.
+  # release.yml calls this one after it promotes a release. It passes no secrets:
+  # the signing key is an environment secret, resolved by the build job below
+  # under that environment's branch policy, so no caller can hand it over and
+  # none can be made to.
   workflow_call:
-    secrets:
-      TUMIKA_RELEASE_SIGNING_KEY:
-        description: PEM ECDSA P-256 release signing key.
-        required: true
 
 # Read-only at the top. Only the deploy job is elevated, and it holds no
 # checkout and runs no repository code — see its own permissions block.
@@ -57,6 +55,12 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # The signing key exists only in this environment, whose deployment-branch
+    # policy admits `main` and `v*.*.*` tags. A run from any other ref — an edge
+    # branch, a pushed workflow file — fails to resolve the secret instead of
+    # receiving it, and this job runs repository code (`go run ./cmd/tumika-bom`)
+    # with the key in its environment.
+    environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

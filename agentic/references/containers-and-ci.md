@@ -64,11 +64,18 @@ Two workflows beyond `release.yml` publish the release host (ADR-0009):
   `contents: read`, the `build` job adds `contents: write`, and its concurrency
   group is per ref, never cancelled.
 
-`release.yml` and `edge.yml` each end in a `pages` job that calls
-`publish-pages.yml` (`uses:` plus `secrets: inherit`). The promote step publishes
-with `GITHUB_TOKEN`, which raises no workflow event, so the trigger would not
-fire on its own. A called workflow cannot hold more permission than its caller,
-so each `pages` job grants `contents: read`, `pages: write` and `id-token: write`.
+`release.yml` ends in a `pages` job that calls `publish-pages.yml` (`uses:`,
+passing no secrets). The promote step publishes with `GITHUB_TOKEN`, which raises
+no workflow event, so the trigger would not fire on its own. A called workflow
+cannot hold more permission than its caller, so the job grants `contents: read`,
+`pages: write` and `id-token: write`.
+
+`edge.yml` does not call it. It runs from any branch, and a called workflow runs
+at the caller's commit, which would put that branch's `tumika-bom` source in front
+of the signing key. Its build job (`actions: write`) instead dispatches
+`publish-pages.yml` on `main`. The signing key is a secret of the `release-signing`
+environment, whose deployment-branch policy admits only `main` and `v*.*.*` tags,
+so a run from any other ref cannot resolve it.
 
 The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in
 `.github/` invokes them.

@@ -25,11 +25,12 @@ on:
   workflow_dispatch:
 
 # Read-only at the top. Only the build job publishes, and it needs nothing
-# beyond contents: write — an edge build pushes no image.
+# beyond contents: write — an edge build pushes no image — and actions: write to
+# start the site publish.
 permissions:
   contents: read
 
-# Two runs on the same ref would race on the prune and on the Pages deploy.
+# Two runs on the same ref would race on the prune.
 # Never cancelled: a cancelled run leaves a draft release and a pushed tag
 # behind, which is the one state this workflow cannot clean up after itself.
 concurrency:
@@ -42,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -154,6 +156,19 @@ jobs:
             --jq '.[] | [.tagName, .isDraft, .createdAt] | @tsv' \
             | scripts/edge-prune.sh --delete
 
+      # The site is published by publish-pages.yml run on main, not called from
+      # here. A called workflow runs at the caller's commit, and this workflow
+      # runs from any branch, so calling it would put a branch's own
+      # tumika-bom source in front of the release signing key. Dispatched on
+      # main, the signing job runs main's code under the `release-signing`
+      # environment's branch policy. The generator reads the published edge
+      # release from the API, so it needs nothing from this branch. GITHUB_TOKEN
+      # may dispatch a workflow even though it raises no other workflow event.
+      - name: publish the site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run publish-pages.yml --ref main
+
       # An edge build is identified by the branch and commit it was cut from,
       # which is the one thing the tag and the version do not say. Written even
       # when a step above failed: a run that got as far as pushing a tag is one
@@ -171,23 +186,3 @@ jobs:
             echo "| release | \`${TUMIKA_RELEASE:-not computed}\` |"
             echo "| daemon | \`${TUMIKA_DAEMON_VERSION:-not computed}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # Called, not left to publish-pages.yml's own `release: published` trigger:
-  # the promote step above publishes with the default GITHUB_TOKEN, and GitHub
-  # raises no workflow events for anything that token did. Without this the edge
-  # channel head would keep pointing at the previous build until the weekly
-  # schedule caught up.
-  #
-  # A called workflow cannot hold more permission than the job that calls it, so
-  # the two the deploy job in publish-pages.yml needs are granted here; the top
-  # of this file stays read-only. `secrets: inherit` satisfies the signing key
-  # that workflow declares as required.
-  pages:
-    name: pages
-    needs: build
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/publish-pages.yml
-    secrets: inherit

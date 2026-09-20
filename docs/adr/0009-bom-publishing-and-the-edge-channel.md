@@ -21,16 +21,19 @@ without a release.
   run reads the published releases and writes every release document and every channel head.
   Only published releases are read, so a head can only point at a release that exists, and a
   failed Pages deploy is recovered by re-running. `publish-pages.yml` runs weekly, on dispatch,
-  and on `release: published`. `release.yml` and `edge.yml` also call it as a job, because
-  they publish with the default `GITHUB_TOKEN`, and GitHub raises no workflow event for
-  anything that token does.
+  and on `release: published`. `release.yml` calls it as a job and `edge.yml` dispatches it on
+  `main`, because both publish with the default `GITHUB_TOKEN`, and GitHub raises no workflow
+  event for anything that token does.
 
 - **Signatures are detached and cover the exact bytes published.** Each `<document>.json` has a
   `<document>.json.sig` beside it. The bytes that are signed are the bytes that are written and
   served; nothing re-serialises them afterwards.
 
-- **The signing key is an Actions secret; the public keys are compiled in.**
+- **The signing key is an environment secret; the public keys are compiled in.**
   `TUMIKA_RELEASE_SIGNING_KEY` holds an ECDSA P-256 private key as PEM, either SEC1 or PKCS#8.
+  It is a secret of the `release-signing` environment, whose deployment-branch policy admits
+  only `main` and `v*.*.*` tags, and the signing job of `publish-pages.yml` selects that
+  environment. No caller passes it, so no workflow run from another ref can obtain it.
   `platform/release/keys.go` holds the list of public keys a daemon trusts. Rotation ships the
   new public key in a release signed by the old key; a daemon that applies it then accepts both.
 
@@ -38,7 +41,9 @@ without a release.
   `edge-<run number>`, a namespace that never matches `v*.*.*`, so it cannot start the calendar
   release workflow. The release label is `edge.<n>` and each component version carries an
   `-edge.<n>` suffix. The workflow keeps the newest five edge releases and deletes the rest with
-  their tags; the prune considers only tags spelled `edge-<digits>` and never a `v*` tag.
+  their tags; the prune considers only tags spelled `edge-<digits>` and never a `v*` tag. The
+  edge workflow runs from any branch, so it does not call `publish-pages.yml`, which would run
+  at the branch's commit with the signing key: it dispatches that workflow on `main`.
 
 - **The installer verifies before it trusts.** `scripts/install-daemon.sh` is served from the
   site, not attached to a release. It verifies the BOM's signature with `openssl` against a

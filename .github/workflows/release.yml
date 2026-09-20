@@ -316,8 +316,9 @@ jobs:
   #
   # A called workflow cannot hold more permission than the job that calls it,
   # so the two the deploy job in publish-pages.yml needs are granted here; the
-  # top of this file stays read-only. `secrets: inherit` satisfies the signing
-  # key that workflow declares as required.
+  # top of this file stays read-only. No secrets are passed: the signing key is
+  # an environment secret that workflow's build job resolves itself, and only for
+  # `main` and `v*.*.*` tags.
   pages:
     name: pages
     needs: [goreleaser, image]
@@ -326,4 +327,3 @@ jobs:
       pages: write
       id-token: write
     uses: ./.github/workflows/publish-pages.yml
-    secrets: inherit

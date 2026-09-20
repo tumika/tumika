@@ -14,6 +14,7 @@ saw:
   - .github/workflows/release.yml
 ---
 - The bytes signed are the bytes published. tumika-bom signs the serialised document, writes it, and reads the file back to verify; anything that re-serialises, reformats or rewrites a document between that and the deploy (assemble step, a static file overwriting a BOM path) leaves a signature no daemon accepts.
+- The signing key must stay unreachable from any ref but `main` and `v*.*.*` tags: it lives in the `release-signing` environment, publish-pages.yml's build job selects it, and edge.yml (which runs from any branch) dispatches publish-pages.yml on main instead of calling it. Calling it, or passing `secrets: inherit`, hands a branch's own tumika-bom source the key.
 - The public key embedded in scripts/install-daemon.sh and the first entry of `releaseKeyPEMs` in keys.go must agree. installer_key_test.go guards it; a rotation touches both.
 - Edge tags are `edge-<n>` and must never match release.yml's `v*.*.*` glob or the calendar-tag filter in check-release-monotonic.sh and bomgen's ParseTag; an edge tag that did would start a calendar release or be read as the previous release.
 - edge-prune.sh must only ever consider tags spelled `edge-<digits>`; a widened pattern deletes `v*` releases and their tags.

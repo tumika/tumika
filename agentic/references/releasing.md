@@ -86,7 +86,7 @@ label.
 `publish-pages.yml` listens for `release: published`, but the promote step
 publishes with the default `GITHUB_TOKEN` and GitHub raises no workflow event
 for anything that token does — so after a real release that trigger never fires.
-The `pages` job calls the workflow directly (`uses:` plus `secrets: inherit`),
+The `pages` job calls the workflow directly (`uses:`, passing no secrets),
 after both the promote step and the image push. A called workflow cannot hold
 more permission than the job calling it, so that job grants the `pages: write`
 and `id-token: write` its deploy job needs while the top of `release.yml` stays
@@ -116,8 +116,9 @@ workflows creates.**
 - A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
 - Settings, Pages, Source set to GitHub Actions. Any other source ignores the
   uploaded artifact and keeps serving whatever is there.
-- The Actions secret `TUMIKA_RELEASE_SIGNING_KEY`: an ECDSA P-256 private key as
-  PEM (SEC1 or PKCS#8), for example from `openssl ecparam -name prime256v1
+- The environment `release-signing`, whose deployment-branch policy admits only
+  `main` and `v*.*.*` tags, holding the secret `TUMIKA_RELEASE_SIGNING_KEY`: an
+  ECDSA P-256 private key as PEM (SEC1 or PKCS#8), for example from `openssl ecparam -name prime256v1
   -genkey -noout`. Its public half must be the first entry of `releaseKeyPEMs`
   in `source/daemon/internal/platform/release/keys.go`, which is also the key
   embedded in `scripts/install-daemon.sh`; `installer_key_test.go` fails when
@@ -150,7 +151,8 @@ choosing any branch). It tags the commit `edge-<run number>`, labels it
 `edge.<n>`, suffixes every component version with `-edge.<n>`, publishes a
 prerelease without the gate or an image, keeps the newest five edge releases
 (`scripts/edge-prune.sh`, which only touches tags spelled `edge-<digits>`), and
-calls `publish-pages.yml`. A cancelled run can leave a draft and a tag behind;
+dispatches `publish-pages.yml` on `main` rather than calling it, so the signing
+key is never in reach of the branch that was built. A cancelled run can leave a draft and a tag behind;
 the draft is never published and can be deleted by hand.
 
 **What makes a published release trustworthy is the signature on its BOM.** The
