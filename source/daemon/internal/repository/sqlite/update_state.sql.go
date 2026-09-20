@@ -42,6 +42,26 @@ func (q *Queries) GetUpdateState(ctx context.Context) (GetUpdateStateRow, error)
 	return i, err
 }
 
+const getUpdateWatermark = `-- name: GetUpdateWatermark :one
+SELECT to_published_at
+FROM update_state
+WHERE id = 1
+`
+
+// to_published_at is when the release named by to_version was published: the
+// recency floor the updater falls back to once that release's own document
+// stops being served, and NULL when there is no floor.
+//
+// It is read and written on its own and never named by the three statements
+// above, because those run on the boot path, which happens BEFORE the
+// migrations: every column they name has to exist on the previous schema.
+func (q *Queries) GetUpdateWatermark(ctx context.Context) (sql.NullString, error) {
+	row := q.db.QueryRowContext(ctx, getUpdateWatermark)
+	var to_published_at sql.NullString
+	err := row.Scan(&to_published_at)
+	return to_published_at, err
+}
+
 const incrementBootAttempts = `-- name: IncrementBootAttempts :one
 UPDATE update_state
 SET boot_attempts = boot_attempts + 1,
@@ -105,5 +125,16 @@ func (q *Queries) PutUpdateState(ctx context.Context, arg PutUpdateStateParams) 
 		arg.StartedAt,
 		arg.UpdatedAt,
 	)
+	return err
+}
+
+const setUpdateWatermark = `-- name: SetUpdateWatermark :exec
+UPDATE update_state
+SET to_published_at = ?
+WHERE id = 1
+`
+
+func (q *Queries) SetUpdateWatermark(ctx context.Context, toPublishedAt sql.NullString) error {
+	_, err := q.db.ExecContext(ctx, setUpdateWatermark, toPublishedAt)
 	return err
 }

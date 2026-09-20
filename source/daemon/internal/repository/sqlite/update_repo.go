@@ -23,7 +23,8 @@ func (r *UpdateStateRepo) Get(ctx context.Context) (domain.UpdateState, error) {
 	if err != nil {
 		return domain.UpdateState{}, mapError(err)
 	}
-	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts, row.StartedAt, row.UpdatedAt)
+	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
+		row.StartedAt, row.UpdatedAt)
 }
 
 func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
@@ -41,6 +42,23 @@ func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
 	}))
 }
 
+// Watermark and PutWatermark read and write to_published_at on its own, which
+// is what keeps it off the statements ConfirmBoot issues before the migrations
+// have run. A daemon on the previous schema must never reach either.
+func (r *UpdateStateRepo) Watermark(ctx context.Context) (*time.Time, error) {
+	at, err := r.s.readQ(ctx).GetUpdateWatermark(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return parseNullTime(at)
+}
+
+func (r *UpdateStateRepo) PutWatermark(ctx context.Context, at *time.Time) error {
+	// A nil watermark is stored as NULL rather than a zero time, which would
+	// read back as year 1 and pass for a real publication time.
+	return mapError(r.s.writeQ(ctx).SetUpdateWatermark(ctx, nullTime(at)))
+}
+
 // IncrementBootAttempts bumps the counter and returns the new state in one
 // statement. Read-modify-write would be wrong here specifically: this runs on
 // every boot of a pending update, which is exactly the moment the process is
@@ -51,7 +69,8 @@ func (r *UpdateStateRepo) IncrementBootAttempts(ctx context.Context) (domain.Upd
 	if err != nil {
 		return domain.UpdateState{}, mapError(err)
 	}
-	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts, row.StartedAt, row.UpdatedAt)
+	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
+		row.StartedAt, row.UpdatedAt)
 }
 
 func updateStateFrom(

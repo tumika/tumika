@@ -1,0 +1,7 @@
+# The single source of the release label.
+#
+# A release's label is chosen by editing this file: the release workflow reads it
+# through scripts/release-label.sh and stamps it into every binary and image the
+# release publishes. The tag names the component version and says nothing about
+# the label.
+release: 2026.09.01

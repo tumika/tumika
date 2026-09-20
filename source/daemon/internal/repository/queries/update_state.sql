@@ -25,3 +25,20 @@ SET boot_attempts = boot_attempts + 1,
     updated_at    = ?
 WHERE id = 1
 RETURNING status, from_version, to_version, boot_attempts, started_at, updated_at;
+
+-- to_published_at is when the release named by to_version was published: the
+-- recency floor the updater falls back to once that release's own document
+-- stops being served, and NULL when there is no floor.
+--
+-- It is read and written on its own and never named by the three statements
+-- above, because those run on the boot path, which happens BEFORE the
+-- migrations: every column they name has to exist on the previous schema.
+-- name: GetUpdateWatermark :one
+SELECT to_published_at
+FROM update_state
+WHERE id = 1;
+
+-- name: SetUpdateWatermark :exec
+UPDATE update_state
+SET to_published_at = ?
+WHERE id = 1;

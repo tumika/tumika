@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tumika/tumika/source/daemon/internal/domain"
@@ -27,6 +29,7 @@ const (
 	KeyServerListen        = "server.listen"
 	KeyUpdateCheckInterval = "update.check_interval"
 	KeyUpdateAutoApply     = "update.auto_apply"
+	KeyUpdateChannel       = "update.channel"
 	KeyProviderSelected    = "provider.selected"
 	KeyClaudeCodeAutoLogin = "provider.claude_code.auto_login_enabled"
 	// gosec G101 flags this because the identifier contains "credential" and
@@ -61,6 +64,13 @@ var settingDefinitions = []domain.SettingDefinition{
 		Kind:        domain.SettingBool,
 		Description: "Apply an available update automatically rather than waiting to be told.",
 		Default:     json.RawMessage(`false`),
+	},
+	{
+		Key:         KeyUpdateChannel,
+		Kind:        domain.SettingEnum,
+		Description: "Release channel the daemon follows: stable, beta or edge.",
+		Default:     json.RawMessage(`"stable"`),
+		Allowed:     domain.ReleaseChannels(),
 	},
 	{
 		Key:         KeyProviderSelected,
@@ -361,6 +371,16 @@ func validate(def domain.SettingDefinition, raw json.RawMessage) (json.RawMessag
 		}
 		if _, _, err := net.SplitHostPort(str); err != nil {
 			return nil, fmt.Errorf("%w: %s: %s is not host:port", ErrInvalidSetting, def.Key, str)
+		}
+		return mustMarshal(str), nil
+
+	case domain.SettingEnum:
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return nil, fmt.Errorf("%w: %s expects one of %s", ErrInvalidSetting, def.Key, strings.Join(def.Allowed, ", "))
+		}
+		if !slices.Contains(def.Allowed, str) {
+			return nil, fmt.Errorf("%w: %s: %q is not one of %s", ErrInvalidSetting, def.Key, str, strings.Join(def.Allowed, ", "))
 		}
 		return mustMarshal(str), nil
 

@@ -126,6 +126,24 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		return nil, err
 	}
 
+	// Each repository is constructed once and handed to exactly one service;
+	// this is where that rule could be broken.
+	//
+	// Settings are owned by ConfigService, and the updater reads update.channel
+	// through it: construction opens nothing, so it can stand above the boot
+	// resolution below, which must come before anything a new binary can fail
+	// at.
+	configRepo := sqlite.NewConfigRepo(store)
+	config := service.NewConfigService(configRepo, store)
+
+	// schemaVersion is the migration version the database is at. The updater's
+	// pre-flight and the health report both need it, and neither owns a
+	// repository that could answer: a narrowed function hands over the one
+	// number without handing over a table.
+	schemaVersion := func(ctx context.Context) (int64, error) {
+		return sqlite.SchemaVersion(ctx, store)
+	}
+
 	// The previous boot is resolved FIRST — before migrations, before key
 	// custody, before the provider registry.
 	//
@@ -136,7 +154,7 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	// Restart=always looped forever — the exact "daemon that cannot start"
 	// outcome the design exists to prevent. The pre-flight cannot catch them
 	// either: `tumika version` never opens the database.
-	updates, err := newUpdateService(ctx, opts, store)
+	updates, err := newUpdateService(ctx, opts, store, config, schemaVersion)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -171,12 +189,6 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 	}
 	opts.Logger.InfoContext(ctx, "database ready", "path", opts.Paths.DB, "schema_version", version)
 
-	// Each repository is constructed once and handed to exactly one service.
-	// This is the only place that rule can be broken, so it is the place to
-	// check it in review.
-	configRepo := sqlite.NewConfigRepo(store)
-
-	config := service.NewConfigService(configRepo, store)
 	// AuthService reaches settings through ConfigService rather than taking the
 	// repository: it is owned there, and a second writer would bypass the rules
 	// that live with it.
@@ -266,10 +278,6 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		updateRunner = runner.NewUpdate(updates, config, opts.Logger, interval, jitterFor(binary, interval))
 	}
 
-	schemaVersion := func(ctx context.Context) (int64, error) {
-		return sqlite.SchemaVersion(ctx, store)
-	}
-
 	return &Daemon{
 		opts:         opts,
 		store:        store,
@@ -280,8 +288,18 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		updates:      updates,
 		updateRunner: updateRunner,
 		appliedByAPI: make(chan struct{}),
-		health: service.NewHealthService(
-			buildinfo.Version(), time.Now(), schemaVersion, auth, sealer.Backend()),
+		health: service.NewHealthService(service.HealthDeps{
+			Build:          buildinfo.Get(),
+			Started:        time.Now(),
+			Schema:         schemaVersion,
+			Auth:           auth,
+			SecretsBackend: sealer.Backend(),
+			// The channel is read through ConfigService, which owns settings.
+			Settings: config,
+			// Nil where self-update is disabled, which is how the version
+			// report knows to leave update state out.
+			Updates: updates,
+		}),
 		log:     opts.Logger,
 		started: time.Now(),
 	}, nil
@@ -501,7 +519,13 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 //
 // Separated from New's body so it can run immediately after the store opens —
 // the boot resolution has to happen before anything a new binary might fail at.
-func newUpdateService(ctx context.Context, opts Options, store *sqlite.Store) (service.UpdateService, error) {
+func newUpdateService(
+	ctx context.Context,
+	opts Options,
+	store *sqlite.Store,
+	settings service.SettingGetter,
+	schema service.SchemaVersionFunc,
+) (service.UpdateService, error) {
 	switch {
 	case opts.Updates != nil:
 		return opts.Updates, nil
@@ -517,9 +541,19 @@ func newUpdateService(ctx context.Context, opts Options, store *sqlite.Store) (s
 	if err != nil {
 		return nil, err
 	}
-	return service.NewUpdateService(
-		sqlite.NewUpdateStateRepo(store), release.NewGitHub(), store,
-		buildinfo.Version(), binary), nil
+	return service.NewUpdateService(service.UpdateDeps{
+		Repo:   sqlite.NewUpdateStateRepo(store),
+		Source: release.NewGitHub(),
+		Tx:     store,
+		// Narrowed to reading one setting: update.channel belongs to
+		// ConfigService, and the updater neither writes settings nor reads
+		// secret ones.
+		Settings: settings,
+		Schema:   schema,
+		Version:  buildinfo.Version(),
+		Release:  buildinfo.Release(),
+		Binary:   binary,
+	}), nil
 }
 
 // jitterFor spreads a fleet's update checks out.

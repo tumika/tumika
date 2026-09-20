@@ -7,27 +7,42 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/tumika/tumika/source/daemon/internal/cli"
 	"github.com/tumika/tumika/source/daemon/internal/platform/buildinfo"
+	"github.com/tumika/tumika/source/daemon/internal/repository/migrations"
 )
 
-// Injected at release time via -ldflags "-X main.version=… -X main.commit=… -X main.date=…".
+// Injected at release time via -ldflags "-X main.version=… -X main.release=…
+// -X main.commit=… -X main.date=…".
 //
-// Keep these names and this package stable: goreleaser writes them, and the
-// self-updater short-circuits on the "dev" default (agentic/tumika-repo.md, "Version
-// injection").
+// version is this component's semver; release is the label of the release that
+// shipped it. Keep these names and this package stable: goreleaser writes them,
+// and the self-updater short-circuits on the "dev" default (agentic/tumika-repo.md,
+// "Version injection").
 var (
 	version = "dev"
+	release = "dev"
 	commit  = "none"
 	date    = "unknown"
 )
 
 func main() {
-	buildinfo.Set(version, commit, date)
+	// The embedded migrations are read here because depguard keeps the cli and
+	// platform layers out of the repository package: main is the one place that
+	// can learn the number and hand it to buildinfo. An error means the binary
+	// was built without its migrations, so it could never migrate a database
+	// either — saying so before any command runs is the earliest honest failure.
+	schemaVersion, err := migrations.MaxVersion()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tumika: %v\n", err)
+		os.Exit(1)
+	}
+	buildinfo.Set(version, release, commit, date, schemaVersion)
 
 	// One channel for both signals rather than signal.NotifyContext plus a
 	// second registration.

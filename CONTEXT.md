@@ -79,3 +79,35 @@ rotated.
 **approval** — A point where a workflow pauses and waits for a human decision before an action
 with external effect (sending a drafted reply). An approval is a first-class, persisted state,
 not a prompt on a terminal. *Stage 2.*
+
+---
+
+## Shipping
+
+**component** — One separately versioned thing tumika ships: the **daemon** and the **desktop
+app** are the two. Each has its own version, and it changes only when that component does.
+
+**release** — A named, dated cut that groups the exact versions of every component shipped
+together. It is identified by a label (a year, a month and a sequence, the first cut of a month
+being the monthly cut and later ones hotfixes) that people read and never compare. A release
+does not have a version of its own.
+_Avoid_: bare "version", which could mean this label or a component's version — say
+**release** or **component version**.
+
+**bill of materials (BOM)** — The published record of one release: which version of each
+component it contains and where to fetch them. It is how a component's version is resolved to
+the version of another component that belongs with it.
+
+**channel** — A named stream of releases that a daemon follows: **stable**, **beta** or
+**edge**. The daemon holds the setting; the desktop app has none and follows the daemon. A
+channel is cumulative: edge also receives what beta and stable publish, and beta also receives
+what stable publishes.
+
+**head** — The release a channel currently offers: the most recently published one among the
+channels it receives. Stable and beta releases are cut from the main branch; an **edge** release
+is an unvetted build of any branch, published on demand without a person tagging it, so its
+version carries no meaning and only its recency does.
+
+**pairing** — The rule that the desktop app runs exactly the app version named by the BOM of
+the release its daemon is running, so the two never differ by more than a release. It applies in
+both directions: if the daemon moves to an older release, the app follows.

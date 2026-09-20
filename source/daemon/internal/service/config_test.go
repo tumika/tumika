@@ -338,6 +338,75 @@ func TestResetRestoresTheDefault(t *testing.T) {
 	}
 }
 
+func TestUpdateChannelDefaultsToStable(t *testing.T) {
+	svc, _, _ := newService(t)
+
+	view, err := svc.Get(t.Context(), service.KeyUpdateChannel)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(view.Value) != `"stable"` || view.IsSet {
+		t.Errorf("Get = %+v, want the stable default and IsSet false", view)
+	}
+}
+
+func TestUpdateChannelAcceptsOnlyKnownChannels(t *testing.T) {
+	for _, ch := range []string{"stable", "beta", "edge"} {
+		svc, repo, _ := newService(t)
+		if _, err := svc.Set(t.Context(), map[string]json.RawMessage{service.KeyUpdateChannel: json.RawMessage(`"` + ch + `"`)}); err != nil {
+			t.Errorf("Set(%s): %v", ch, err)
+		}
+		if got := string(repo.data[service.KeyUpdateChannel].Value); got != `"`+ch+`"` {
+			t.Errorf("stored %s, want %q", got, ch)
+		}
+	}
+
+	for _, bad := range []string{`"nightly"`, `""`, `"Stable"`, `true`, `3`} {
+		svc, repo, _ := newService(t)
+		_, err := svc.Set(t.Context(), map[string]json.RawMessage{service.KeyUpdateChannel: json.RawMessage(bad)})
+		if !errors.Is(err, service.ErrInvalidSetting) {
+			t.Errorf("Set(%s) = %v, want ErrInvalidSetting", bad, err)
+		}
+		if repo.writes != 0 {
+			t.Errorf("Set(%s) wrote %d rows; a rejected value must write none", bad, repo.writes)
+		}
+	}
+}
+
+func TestUpdateChannelInvalidValueRejectsTheWholeBatch(t *testing.T) {
+	svc, repo, _ := newService(t)
+
+	_, err := svc.Set(t.Context(), map[string]json.RawMessage{
+		service.KeyUpdateAutoApply: json.RawMessage(`true`),
+		service.KeyUpdateChannel:   json.RawMessage(`"nightly"`),
+	})
+	if !errors.Is(err, service.ErrInvalidSetting) {
+		t.Fatalf("Set = %v, want ErrInvalidSetting", err)
+	}
+	if repo.writes != 0 {
+		t.Errorf("%d writes happened; a rejected batch must write nothing", repo.writes)
+	}
+}
+
+func TestUpdateChannelResetFallsBackToStable(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := t.Context()
+
+	if _, err := svc.Set(ctx, map[string]json.RawMessage{service.KeyUpdateChannel: json.RawMessage(`"edge"`)}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := svc.Reset(ctx, service.KeyUpdateChannel); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	view, err := svc.Get(ctx, service.KeyUpdateChannel)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if view.IsSet || string(view.Value) != `"stable"` {
+		t.Errorf("after Reset: %+v, want the stable default and IsSet false", view)
+	}
+}
+
 func TestRepositoryErrorsPropagate(t *testing.T) {
 	svc, repo, _ := newService(t)
 	boom := errors.New("database is gone")

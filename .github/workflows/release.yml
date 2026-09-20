@@ -110,6 +110,20 @@ jobs:
           cache: true
           cache-dependency-path: source/daemon/go.sum
 
+      # The release LABEL for `-X main.release`, exported for every step below.
+      #
+      # It comes from release.yaml, never from the tag: a tag names the component
+      # version, and a label the daemon rejects
+      # (release.ValidateReleaseLabel) makes every update check on the released
+      # binary return an error. scripts/release-label.sh fails the job when the
+      # file names no label the daemon accepts, so a release is never published
+      # carrying the "dev" default — which reads as "no release" and leaves the
+      # recency half of the channel rules with nothing to compare against.
+      - name: the release label
+        run: |
+          label=$(scripts/release-label.sh)
+          echo "TUMIKA_RELEASE=$label" >> "$GITHUB_ENV"
+
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
@@ -194,10 +208,20 @@ jobs:
       # github.event.repository.updated_at is not a build date at all: it moves
       # when the description or topics change, and is identical for every image
       # built from the same tag.
+      #
+      # The release label is emitted separately, from release.yaml through
+      # scripts/release-label.sh — the same source the goreleaser job stamps into
+      # the published binaries, so the image and the release archives report the
+      # same label for the same tag. The script fails the job rather than
+      # yielding an empty RELEASE, which would override the Dockerfile's own
+      # default with a label that validates as neither.
       - id: buildmeta
         run: |
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+          release=$(scripts/release-label.sh)
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -209,5 +233,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.buildmeta.outputs.version }}
+            RELEASE=${{ steps.buildmeta.outputs.release }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.buildmeta.outputs.date }}

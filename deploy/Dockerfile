@@ -33,13 +33,23 @@ COPY source/daemon/ ./
 # cross-compiles for the Pi and modernc.org/sqlite is pure Go precisely so it
 # can. Setting it here means the image build is one more place that would fail
 # if a cgo dependency ever crept in.
+#
+# RELEASE is the release LABEL, a different thing from VERSION: the component's
+# semver identifies the binary, the label identifies the cut it shipped in. It
+# only ever holds a label the daemon accepts (release.ValidateReleaseLabel —
+# YYYY.MM.NN[-beta.N] or edge.N), because one it rejects makes every update
+# check return an error: the release workflow passes the label release.yaml
+# names, validated by scripts/release-label.sh. A build that passes none leaves
+# "dev" standing, which reads as "no release".
 ARG VERSION=dev
+ARG RELEASE=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 go build \
       -trimpath \
       -ldflags="-s -w \
         -X main.version=${VERSION} \
+        -X main.release=${RELEASE} \
         -X main.commit=${COMMIT} \
         -X main.date=${BUILD_DATE}" \
       -o /out/tumika ./cmd/tumika

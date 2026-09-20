@@ -12,7 +12,22 @@ const (
 	SettingBool     SettingKind = "bool"
 	SettingDuration SettingKind = "duration"
 	SettingAddress  SettingKind = "address" // host:port
+	SettingEnum     SettingKind = "enum"    // one of SettingDefinition.Allowed
 )
+
+// Release channel names accepted by the update channel setting. They mirror the
+// channels a release publishes to; domain does not import the release package,
+// so the names are declared here.
+const (
+	ChannelStable = "stable"
+	ChannelBeta   = "beta"
+	ChannelEdge   = "edge"
+)
+
+// ReleaseChannels lists the values the update channel setting accepts.
+func ReleaseChannels() []string {
+	return []string{ChannelStable, ChannelBeta, ChannelEdge}
+}
 
 // SettingDefinition describes a configuration key tumika understands.
 //
@@ -28,6 +43,9 @@ type SettingDefinition struct {
 	// Default is the value used when nothing is stored. It is also what the API
 	// reports, so a client can show what a reset would produce.
 	Default json.RawMessage `json:"default"`
+	// Allowed lists the accepted values of an enum setting; it is empty for every
+	// other kind.
+	Allowed []string `json:"allowed,omitempty"`
 	// Secret marks a setting whose value must not be returned. None exist yet —
 	// credentials are not settings — but the flag is here so that the first one
 	// that does cannot be added without deciding.

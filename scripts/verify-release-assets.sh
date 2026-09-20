@@ -133,5 +133,35 @@ grep -q "^tumika ${VERSION} " <<<"$first_line" \
   || fail "the binary reports '${first_line}', not version ${VERSION}; the ldflags did not take, and IsDev() would disable self-update"
 ok "the binary itself reports ${VERSION}"
 
+# The release LABEL, which `-X main.release` carries and which nothing above
+# would notice the loss of: metadata.json has no such field, and a binary
+# stamped with the "dev" label builds, runs and reports a correct version.
+#
+# It is the label the updater compares recency against, so without it a stable
+# or beta daemon degrades to a semver-only comparison and an edge daemon accepts
+# any head — a channel rule that silently stops applying.
+#
+# There is no skip path here either, for the same reason as above. A release
+# build takes its label from release.yaml, so on one "TUMIKA_RELEASE is unset"
+# means the build was never stamped — exactly the case this assertion exists to
+# catch — rather than a situation in which the assertion cannot be made.
+#
+# A snapshot build is the one that legitimately carries no label: it is never
+# published, and it names itself, because .goreleaser.yml stamps snapshots with
+# a version ending in "-snapshot". It is still asserted, against the "dev"
+# default, so a `-X main.release` that stops reaching the compiler is caught on
+# every CI run rather than at the next release.
+if [[ -n "${TUMIKA_RELEASE:-}" ]]; then
+  want_release="$TUMIKA_RELEASE"
+else
+  [[ "$VERSION" == *-snapshot ]] \
+    || fail "TUMIKA_RELEASE is unset, so this build carries no release label; export it first: TUMIKA_RELEASE=\$(scripts/release-label.sh)"
+  want_release=dev
+fi
+
+grep -qF "(release ${want_release}," <<<"$first_line" \
+  || fail "the binary reports '${first_line}', not release ${want_release}; -X main.release did not take, and the recency half of the update rules would be inert"
+ok "the binary itself reports release ${want_release}"
+
 echo
 echo "PASS"

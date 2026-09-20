@@ -61,11 +61,12 @@ type Setting struct {
 }
 
 type UpdateState struct {
-	ID           int64
-	Status       string
-	FromVersion  string
-	ToVersion    string
-	BootAttempts int64
-	StartedAt    sql.NullString
-	UpdatedAt    string
+	ID            int64
+	Status        string
+	FromVersion   string
+	ToVersion     string
+	BootAttempts  int64
+	StartedAt     sql.NullString
+	UpdatedAt     string
+	ToPublishedAt sql.NullString
 }

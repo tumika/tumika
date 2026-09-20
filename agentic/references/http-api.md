@@ -20,3 +20,21 @@ Note this differs from the plan's literal ordering, which put recovery and
 logging innermost. Placed there, recovery would not cover a panic in the layers
 above it and logging would never see a rejected request — both of which defeat
 the point of having them.
+
+## `/v1/version`
+
+Behind the bearer token like every other route; there is no unauthenticated
+variant, because an open version route fingerprints the daemon. It answers with
+one report from one service call:
+
+- the build identity: `version` (the component version), `release`, `commit`,
+  `date`, `go`, `platform`, `claude_cli`, and `schema_version` (the highest
+  database migration the binary embeds);
+- `channel`, the update channel the daemon follows, empty when the setting
+  cannot be read;
+- `update`, the self-update state, present only when self-update applies and the
+  row can be read.
+
+`tumika version --json` reports the build identity only. It has no `channel`,
+because it runs offline without a daemon or a database; the channel is a
+daemon setting, so ask this endpoint for it.
