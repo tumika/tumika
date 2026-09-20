@@ -49,3 +49,26 @@ third `type=raw` tag enabled only when the label carries no `-beta.`.
 `ci-build.yml`'s snapshot release build exports `TUMIKA_DAEMON_VERSION` only.
 `.goreleaser.yml` fails without it, and leaving `TUMIKA_RELEASE` unset keeps the
 snapshot on the `dev` label that `verify-release-assets.sh` asserts.
+
+## Publishing workflows
+
+Two workflows beyond `release.yml` publish the release host (ADR-0009):
+
+- **`publish-pages.yml`** builds the signed BOM tree with `tumika-bom`, assembles
+  it with `scripts/assemble-site.sh`, and deploys it to Pages. It runs on
+  `release: published`, weekly, on dispatch, and as a called workflow. Its top
+  level is `contents: read`; only the `deploy` job holds `pages: write` and
+  `id-token: write`, and it checks nothing out. Concurrency group `pages` is
+  never cancelled, so one deploy runs at a time.
+- **`edge.yml`** cuts an edge build on dispatch from any branch. Its top level is
+  `contents: read`, the `build` job adds `contents: write`, and its concurrency
+  group is per ref, never cancelled.
+
+`release.yml` and `edge.yml` each end in a `pages` job that calls
+`publish-pages.yml` (`uses:` plus `secrets: inherit`). The promote step publishes
+with `GITHUB_TOKEN`, which raises no workflow event, so the trigger would not
+fire on its own. A called workflow cannot hold more permission than its caller,
+so each `pages` job grants `contents: read`, `pages: write` and `id-token: write`.
+
+The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in
+`.github/` invokes them.

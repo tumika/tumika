@@ -1,0 +1,22 @@
+---
+about: couplings in BOM publishing and the edge channel that a change can break without a failing build; what breaks if any of these change
+saw:
+  - source/daemon/internal/bomgen/bomgen.go
+  - source/daemon/cmd/tumika-bom/main.go
+  - source/daemon/internal/platform/release/keys.go
+  - source/daemon/internal/platform/release/installer_key_test.go
+  - source/daemon/.goreleaser.yml
+  - scripts/install-daemon.sh
+  - scripts/edge-prune.sh
+  - scripts/check-release-monotonic.sh
+  - .github/workflows/publish-pages.yml
+  - .github/workflows/edge.yml
+  - .github/workflows/release.yml
+---
+- The bytes signed are the bytes published. tumika-bom signs the serialised document, writes it, and reads the file back to verify; anything that re-serialises, reformats or rewrites a document between that and the deploy (assemble step, a static file overwriting a BOM path) leaves a signature no daemon accepts.
+- The public key embedded in scripts/install-daemon.sh and the first entry of `releaseKeyPEMs` in keys.go must agree. installer_key_test.go guards it; a rotation touches both.
+- Edge tags are `edge-<n>` and must never match release.yml's `v*.*.*` glob or the calendar-tag filter in check-release-monotonic.sh and bomgen's ParseTag; an edge tag that did would start a calendar release or be read as the previous release.
+- edge-prune.sh must only ever consider tags spelled `edge-<digits>`; a widened pattern deletes `v*` releases and their tags.
+- goreleaser must keep uploading release.yaml (release.extra_files) and checksums.txt. bomgen skips a release lacking either, and a skip fails the generator run unless -allow-skips, so every publish goes red.
+- Adding a component to release.yaml requires a row in bomgen's `componentBinaries`, or every release naming it is skipped.
+- A GitHub prerelease flag that disagrees with the tag's channel skips the release; the promote steps set it explicitly for that reason.

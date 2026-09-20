@@ -95,13 +95,9 @@ archives:
       {{ .Binary }}_{{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}_{{ .Os }}_{{ .Arch }}
 
 checksum:
-  # ONE checksums file covering both archives, because the updater and the
-  # installer both verify against it before replacing anything.
-  #
-  # Phase 2, before any public release: sign this with an ECDSA key from Actions
-  # secrets and verify the signature in the updater. A checksum fetched from the
-  # same host as the binary proves the download was not corrupted; it does not
-  # prove who produced it.
+  # ONE checksums file covering both archives. The BOM generator reads each raw
+  # asset's sha256 from it, so a release without it is skipped. It is not a
+  # trust root: the signature on the published BOM is.
   name_template: checksums.txt
 
 snapshot:

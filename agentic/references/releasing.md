@@ -110,7 +110,51 @@ ancestor of `main`: re-running the tests is not the same as knowing the commit
 was reviewed, and anyone who can push a tag could otherwise point it at a commit
 that merely compiles.
 
-**Before any public release:** sign `checksums.txt` with an ECDSA key from
-Actions secrets and verify it in the updater. A checksum fetched from the same
-host as the binary proves the download was not corrupted; it does not prove who
-produced it.
+**Before the first publish, the repository needs three things nothing in the
+workflows creates.**
+
+- A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
+- Settings, Pages, Source set to GitHub Actions. Any other source ignores the
+  uploaded artifact and keeps serving whatever is there.
+- The Actions secret `TUMIKA_RELEASE_SIGNING_KEY`: an ECDSA P-256 private key as
+  PEM (SEC1 or PKCS#8), for example from `openssl ecparam -name prime256v1
+  -genkey -noout`. Its public half must be the first entry of `releaseKeyPEMs`
+  in `source/daemon/internal/platform/release/keys.go`, which is also the key
+  embedded in `scripts/install-daemon.sh`; `installer_key_test.go` fails when
+  the two differ. `tumika-bom` refuses a key that is not in the compiled-in list.
+
+**The site is assembled from three inputs and served from one host.**
+`publish-pages.yml` runs `tumika-bom` (which reads the published releases and
+writes every document and its detached `.sig`), then
+`scripts/assemble-site.sh <bom-dir> <installer> <static-dir> <out-dir>`, which
+adds the installer and `scripts/site/` and refuses a tree without an installer,
+`CNAME`, `index.html`, a channel head, or a document's signature. It serves:
+
+| Path | Content |
+|---|---|
+| `/channels/<channel>.json` (+ `.sig`) | the head release of `stable`, `beta` or `edge` |
+| `/releases/<label>.json` (+ `.sig`) | one release's bill of materials |
+| `/install-daemon.sh` | the installer |
+| `/`, `/CNAME` | the landing page and the custom domain record |
+
+The BOMs are regenerated whole on every run, so re-running the workflow retries
+a failed deploy. The generator reads each raw asset's SHA-256 from
+`checksums.txt`, and skips a release lacking `release.yaml` or `checksums.txt`,
+so goreleaser must keep uploading both. A skipped release fails the run unless
+`-allow-skips` is passed. A component the generator does not know how to name
+(`componentBinaries` in `internal/bomgen`) is a skipped release too, so adding a
+component adds a row there.
+
+**An edge build is cut by running the `edge` workflow** (`workflow_dispatch`,
+choosing any branch). It tags the commit `edge-<run number>`, labels it
+`edge.<n>`, suffixes every component version with `-edge.<n>`, publishes a
+prerelease without the gate or an image, keeps the newest five edge releases
+(`scripts/edge-prune.sh`, which only touches tags spelled `edge-<digits>`), and
+calls `publish-pages.yml`. A cancelled run can leave a draft and a tag behind;
+the draft is never published and can be deleted by hand.
+
+**What makes a published release trustworthy is the signature on its BOM.** The
+BOM carries each asset's SHA-256, and the signature covers the exact bytes
+served, so a checksum fetched from the same host as the binary is not what the
+updater or the installer relies on. `checksums.txt` is an input to the
+generator, not a trust root.
