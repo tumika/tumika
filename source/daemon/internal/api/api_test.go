@@ -101,11 +101,18 @@ func do(t *testing.T, svc *fakeConfigService, method, target, body string) *http
 	return rec
 }
 
-type stubHealth struct{}
+// stubHealth is the report the version and health handlers encode. A handler's
+// whole job there is to pass the service's answer through, so the content comes
+// from the stub.
+type stubHealth struct {
+	report service.VersionReport
+}
 
 func (stubHealth) Snapshot(context.Context) domain.Health {
 	return domain.Health{Status: "ok"}
 }
+
+func (s stubHealth) Version(context.Context) service.VersionReport { return s.report }
 
 func TestListConfig(t *testing.T) {
 	svc := &fakeConfigService{views: []domain.SettingView{{

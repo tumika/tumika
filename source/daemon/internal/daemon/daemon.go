@@ -280,8 +280,18 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		updates:      updates,
 		updateRunner: updateRunner,
 		appliedByAPI: make(chan struct{}),
-		health: service.NewHealthService(
-			buildinfo.Version(), time.Now(), schemaVersion, auth, sealer.Backend()),
+		health: service.NewHealthService(service.HealthDeps{
+			Build:          buildinfo.Get(),
+			Started:        time.Now(),
+			Schema:         schemaVersion,
+			Auth:           auth,
+			SecretsBackend: sealer.Backend(),
+			// The channel is read through ConfigService, which owns settings.
+			Settings: config,
+			// Nil where self-update is disabled, which is how the version
+			// report knows to leave update state out.
+			Updates: updates,
+		}),
 		log:     opts.Logger,
 		started: time.Now(),
 	}, nil

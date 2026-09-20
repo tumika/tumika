@@ -14,10 +14,13 @@ func newVersionCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print build information",
-		Long: "Print the version, commit and build date of this binary.\n\n" +
+		Long: "Print the component version, release, commit and build date of this binary.\n\n" +
 			"The updater execs `tumika version` on a freshly staged binary and asserts the\n" +
 			"semver matches before replacing the live one, so this command's output is part\n" +
-			"of the update contract (ADR-0003).",
+			"of the update contract (ADR-0003).\n\n" +
+			"--json adds the highest database migration this binary embeds. The update\n" +
+			"channel is a daemon setting and is not reported here: this command answers\n" +
+			"without a daemon and without opening the database. Ask GET /v1/version for it.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			info := buildinfo.Get()

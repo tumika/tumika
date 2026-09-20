@@ -91,37 +91,6 @@ func TestUpdateStateIsReported(t *testing.T) {
 	}
 }
 
-// Update state joins /v1/version, because "which version am I running" and "is
-// an update half-applied" are the same question after a daemon restarts itself.
-func TestVersionCarriesUpdateState(t *testing.T) {
-	updates := &fakeUpdates{state: domain.UpdateState{
-		Status: domain.UpdatePending, ToVersion: "0.2.0",
-	}}
-
-	rec := doUpdate(t, updates, nil, http.MethodGet, "/v1/version", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
-	}
-	if !strings.Contains(rec.Body.String(), `"update"`) {
-		t.Errorf("version does not carry update state: %s", rec.Body)
-	}
-}
-
-// A daemon whose update row cannot be read must still answer `version`: it is
-// what the updater execs to pre-flight a staged binary, so it has to work on a
-// broken install.
-func TestVersionSurvivesAnUnreadableUpdateState(t *testing.T) {
-	updates := &fakeUpdates{stateErr: errors.New("database is locked")}
-
-	rec := doUpdate(t, updates, nil, http.MethodGet, "/v1/version", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("version failed because update state could not be read: %d %s", rec.Code, rec.Body)
-	}
-	if strings.Contains(rec.Body.String(), `"update"`) {
-		t.Errorf("an unreadable state was reported anyway: %s", rec.Body)
-	}
-}
-
 func TestUpdateCheckReportsWhatIsAvailable(t *testing.T) {
 	updates := &fakeUpdates{available: "0.2.0", newer: true}
 
@@ -236,9 +205,6 @@ func TestVersionWorksWithoutAnUpdateService(t *testing.T) {
 	rec := doUpdate(t, nil, nil, http.MethodGet, "/v1/version", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
-	}
-	if strings.Contains(rec.Body.String(), `"update"`) {
-		t.Errorf("update state was reported with no updater: %s", rec.Body)
 	}
 }
 
