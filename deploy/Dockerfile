@@ -38,8 +38,9 @@ COPY source/daemon/ ./
 # semver identifies the binary, the label identifies the cut it shipped in. It
 # only ever holds a label the daemon accepts (release.ValidateReleaseLabel —
 # YYYY.MM.NN[-beta.N] or edge.N), because one it rejects makes every update
-# check return an error. A build from a tag that is not a label leaves "dev"
-# standing, which reads as "no release".
+# check return an error: the release workflow passes the label release.yaml
+# names, validated by scripts/release-label.sh. A build that passes none leaves
+# "dev" standing, which reads as "no release".
 ARG VERSION=dev
 ARG RELEASE=dev
 ARG COMMIT=none

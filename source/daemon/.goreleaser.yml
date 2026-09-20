@@ -48,12 +48,12 @@ builds:
       #
       # main.release is the release LABEL, which is not the tag and not the
       # component version: it comes from TUMIKA_RELEASE, which the release
-      # workflow exports only when the tag is a label the daemon will accept
-      # (release.ValidateReleaseLabel — YYYY.MM.NN[-beta.N] or edge.N). A label
-      # the daemon rejects makes every update check return an error, so an
-      # unusable tag must leave the "dev" default standing instead. Left at
-      # "dev", the label reads as "no release", and the recency half of the
-      # channel rules has nothing to compare against.
+      # workflow reads out of release.yaml through scripts/release-label.sh —
+      # the single source of the label, and the only thing that validates it
+      # against the shape the daemon accepts (release.ValidateReleaseLabel —
+      # YYYY.MM.NN[-beta.N] or edge.N). The default is what a snapshot build
+      # carries: left at "dev" the label reads as "no release", and the recency
+      # half of the channel rules has nothing to compare against.
       - -s -w
       - -X main.version={{ .Version }}
       - -X main.release={{ envOrDefault "TUMIKA_RELEASE" "dev" }}

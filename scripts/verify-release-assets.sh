@@ -141,14 +141,27 @@ ok "the binary itself reports ${VERSION}"
 # or beta daemon degrades to a semver-only comparison and an edge daemon accepts
 # any head — a channel rule that silently stops applying.
 #
-# Keyed on the environment rather than skipped on a guess: a build is stamped
-# with a label only when TUMIKA_RELEASE names one, so unset means there is no
-# label to assert, not that the assertion could not be made.
+# There is no skip path here either, for the same reason as above. A release
+# build takes its label from release.yaml, so on one "TUMIKA_RELEASE is unset"
+# means the build was never stamped — exactly the case this assertion exists to
+# catch — rather than a situation in which the assertion cannot be made.
+#
+# A snapshot build is the one that legitimately carries no label: it is never
+# published, and it names itself, because .goreleaser.yml stamps snapshots with
+# a version ending in "-snapshot". It is still asserted, against the "dev"
+# default, so a `-X main.release` that stops reaching the compiler is caught on
+# every CI run rather than at the next release.
 if [[ -n "${TUMIKA_RELEASE:-}" ]]; then
-  grep -qF "(release ${TUMIKA_RELEASE}," <<<"$first_line" \
-    || fail "the binary reports '${first_line}', not release ${TUMIKA_RELEASE}; -X main.release did not take, and the recency half of the update rules would be inert"
-  ok "the binary itself reports release ${TUMIKA_RELEASE}"
+  want_release="$TUMIKA_RELEASE"
+else
+  [[ "$VERSION" == *-snapshot ]] \
+    || fail "TUMIKA_RELEASE is unset, so this build carries no release label; export it first: TUMIKA_RELEASE=\$(scripts/release-label.sh)"
+  want_release=dev
 fi
+
+grep -qF "(release ${want_release}," <<<"$first_line" \
+  || fail "the binary reports '${first_line}', not release ${want_release}; -X main.release did not take, and the recency half of the update rules would be inert"
+ok "the binary itself reports release ${want_release}"
 
 echo
 echo "PASS"
