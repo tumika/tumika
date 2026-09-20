@@ -38,7 +38,9 @@ Channels are cumulative and the head is the most recently published release the
 channel receives (ADR-0007). A head replaces the running build when:
 
 - **stable, beta:** it was published later AND its component version is
-  semver-greater. Never an automatic downgrade.
+  semver-greater. Never an automatic downgrade. A release that carries the daemon
+  over from an earlier one repeats its component version, so it is not
+  semver-greater and offers no update.
 - **edge:** it was published later. Semver is not consulted.
 
 `supersedes` in `service/update.go` is the one rule; `Check` and `Apply` both
@@ -89,6 +91,10 @@ publication time. Each has a detached signature beside it (`<document>.sig`):
   malformed documents are refused.
 - The asset's `sha256` comes from the signed BOM and is enforced on the download;
   the file is written only if it matches.
+- An asset may carry a `signature`: the text of a minisign `.sig`, published for
+  the desktop app's Tauri updater, which verifies it against the public key
+  committed in `tauri.conf.json` (ADR-0010). The daemon's own assets carry none
+  and are checked by `sha256` alone; the daemon does not read the field.
 - The release label from the daemon's own build stamp is validated against a
   strict pattern before it is placed in a URL.
 
