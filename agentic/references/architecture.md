@@ -18,7 +18,7 @@ source/daemon/internal/platform/provider/anthropicapi/
 source/daemon/internal/platform/tokencustody/  # stores the minted API token in the platform keychain (macOS)
 source/daemon/internal/platform/secrets/       # Sealer (AES-256-GCM) + env / keychain / file key custody
 source/daemon/internal/platform/servicemgr/    # ServiceManager + launchd / systemd drivers
-source/daemon/internal/platform/release/       # ReleaseSource (self-update)
+source/daemon/internal/platform/release/       # release Source (channel heads, signed BOM verification, asset fetch)
 source/daemon/internal/platform/paths/         # filesystem layout resolution
 source/daemon/internal/platform/logging/       # slog setup + secret redaction handler
 source/daemon/internal/platform/buildinfo/     # version/commit/date, injected at build time
