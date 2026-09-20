@@ -4,14 +4,23 @@
 # Three separate contracts run through these names, and none of them is checked
 # by the compiler or by `goreleaser check`:
 #
-#   - scripts/install.sh downloads `tumika_<version>_<os>_<arch>` and verifies it
-#     against checksums.txt
+#   - scripts/install.sh downloads
+#     `tumika_<daemon component version>_<os>_<arch>` and verifies it against
+#     checksums.txt
 #   - `tumika update` fetches the same raw asset (ADR-0003)
 #   - both would fail at the NEXT RELEASE rather than here, on somebody else's
 #     machine, with no obvious cause
 #
 # Dropping the raw archive, renaming a template, or losing a target are all
 # one-line edits to .goreleaser.yml that leave the build perfectly green.
+#
+# The version every assertion below is made against comes from release.yaml, the
+# single source of the component versions — the same place .goreleaser.yml takes
+# it from, through TUMIKA_DAEMON_VERSION. Asking the build what version it used
+# would make the check agree with itself: a build carrying a stale or hand-set
+# TUMIKA_DAEMON_VERSION would name its assets consistently and pass, and the
+# release would ship a daemon whose component version is not the one the BOM and
+# the tag describe.
 #
 # Usage: scripts/verify-release-assets.sh [dist-dir]
 set -euo pipefail
@@ -40,18 +49,37 @@ ok()   { echo "  ok: $*"; }
 [[ -f "$ARTIFACTS" ]] || fail "no $ARTIFACTS — did goreleaser run?"
 [[ -f "$CHECKSUMS" ]] || fail "no $CHECKSUMS; install.sh and the updater both verify against it"
 
-# The version goreleaser used, taken from its own metadata rather than guessed.
-VERSION=$(python3 -c "
+# The daemon component's version, from release.yaml — not from the build.
+VERSION=$("$(dirname "$0")/release-component-version.sh" daemon) \
+  || fail "could not read the daemon component version from release.yaml"
+
+# Whether this is a snapshot, decided from metadata.json's version rather than
+# from the asset names the checks below are about to assert. metadata.json's
+# version is the TAG on a release and `<component version>-snapshot` on a
+# snapshot, because .goreleaser.yml's snapshot.version_template says so and
+# goreleaser applies that template in no other mode; a release tag is a CalVer
+# label and cannot end in "-snapshot". Reading the suffix off the archive names
+# instead would let a snapshot build slip through a release job unremarked —
+# the names would define the very thing they are being checked against.
+META_VERSION=$(python3 -c "
 import json
 print(json.load(open('$DIST/metadata.json'))['version'])
 ")
-[[ -n "$VERSION" ]] || fail "could not read the version from $DIST/metadata.json"
+[[ -n "$META_VERSION" ]] || fail "could not read the version from $DIST/metadata.json"
 
-ok "version is $VERSION"
+if [[ "$META_VERSION" == *-snapshot ]]; then
+  SNAPSHOT=1
+  ASSET_VERSION="${VERSION}-snapshot"
+else
+  SNAPSHOT=""
+  ASSET_VERSION="$VERSION"
+fi
+
+ok "release.yaml names daemon $VERSION; assets are expected at $ASSET_VERSION"
 
 for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   os="${target%%/*}"; arch="${target##*/}"
-  asset="tumika_${VERSION}_${os}_${arch}"
+  asset="tumika_${ASSET_VERSION}_${os}_${arch}"
 
   # The RAW binary, which is what gets downloaded and executed directly.
   # goreleaser leaves it in a per-target directory rather than at the dist root
@@ -64,7 +92,7 @@ a = json.load(open('$ARTIFACTS'))
 print(next((x['path'] for x in a
             if x.get('type') == 'Binary' and x.get('name') == '$asset'), ''))
 ")
-  [[ -n "$found" ]] || fail "no raw asset '$asset'; install.sh and \`tumika update\` both fetch it by that name"
+  [[ -n "$found" ]] || fail "no raw asset '$asset'; install.sh and \`tumika update\` both fetch it by that name, and release.yaml is what names it"
   found=$(rebase "$found")
   [[ -f "$found" ]] || fail "the raw asset '$asset' is registered at $found, which does not exist"
 
@@ -105,7 +133,9 @@ ok "all four targets ship a raw binary and an archive"
 # Asking metadata.json is not the same question: goreleaser fills that in from
 # the tag whether or not the ldflags reached the compiler. Verified — dropping
 # `-X main.version` left the metadata correct and the binary reporting "dev",
-# and the check passed.
+# and the check passed. Nor is the asset name the same question: the name comes
+# from the archive template, the stamp from the ldflags, and either can be
+# edited without the other.
 #
 # It matters beyond cosmetics: buildinfo.IsDev() disables self-update entirely,
 # so the release would ship a binary that can never update itself and nothing
@@ -129,9 +159,9 @@ ok "all four targets ship a raw binary and an archive"
 reported=$("$NATIVE" version)
 first_line=${reported%%$'\n'*}
 
-grep -q "^tumika ${VERSION} " <<<"$first_line" \
-  || fail "the binary reports '${first_line}', not version ${VERSION}; the ldflags did not take, and IsDev() would disable self-update"
-ok "the binary itself reports ${VERSION}"
+grep -q "^tumika ${ASSET_VERSION} " <<<"$first_line" \
+  || fail "the binary reports '${first_line}', not version ${ASSET_VERSION}; release.yaml names the daemon ${VERSION}, so either the ldflags did not take or the build used a different TUMIKA_DAEMON_VERSION"
+ok "the binary itself reports ${ASSET_VERSION}"
 
 # The release LABEL, which `-X main.release` carries and which nothing above
 # would notice the loss of: metadata.json has no such field, and a binary
@@ -147,14 +177,13 @@ ok "the binary itself reports ${VERSION}"
 # catch — rather than a situation in which the assertion cannot be made.
 #
 # A snapshot build is the one that legitimately carries no label: it is never
-# published, and it names itself, because .goreleaser.yml stamps snapshots with
-# a version ending in "-snapshot". It is still asserted, against the "dev"
-# default, so a `-X main.release` that stops reaching the compiler is caught on
-# every CI run rather than at the next release.
+# published, and it says so in metadata.json. It is still asserted, against the
+# "dev" default, so a `-X main.release` that stops reaching the compiler is
+# caught on every CI run rather than at the next release.
 if [[ -n "${TUMIKA_RELEASE:-}" ]]; then
   want_release="$TUMIKA_RELEASE"
 else
-  [[ "$VERSION" == *-snapshot ]] \
+  [[ -n "$SNAPSHOT" ]] \
     || fail "TUMIKA_RELEASE is unset, so this build carries no release label; export it first: TUMIKA_RELEASE=\$(scripts/release-label.sh)"
   want_release=dev
 fi

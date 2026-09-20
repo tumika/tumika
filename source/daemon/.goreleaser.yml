@@ -46,26 +46,40 @@ builds:
       # keeps the "dev" default, and `IsDev()` then disables self-update
       # entirely for the whole release.
       #
-      # main.release is the release LABEL, which is not the tag and not the
-      # component version: it comes from TUMIKA_RELEASE, which the release
-      # workflow reads out of release.yaml through scripts/release-label.sh —
-      # the single source of the label, and the only thing that validates it
+      # Neither of the two versions comes from the tag. release.yaml is the
+      # single source of both, and the tag only says which release is being cut.
+      #
+      # main.version is the DAEMON COMPONENT's semver, read out of release.yaml
+      # by scripts/release-component-version.sh into TUMIKA_DAEMON_VERSION. The
+      # tag is a zero-padded CalVer label (v2026.09.01), which is not semver at
+      # all, so a binary stamped from it could never be compared by the
+      # updater's parseVersion. A missing TUMIKA_DAEMON_VERSION fails the build
+      # with "map has no entry for key" — deliberately, because the fallback
+      # would be a binary whose component version is a guess.
+      #
+      # main.release is the release LABEL, a different thing again: it comes
+      # from TUMIKA_RELEASE, which the release workflow reads out of the same
+      # file through scripts/release-label.sh — the only thing that validates it
       # against the shape the daemon accepts (release.ValidateReleaseLabel —
       # YYYY.MM.NN[-beta.N] or edge.N). The default is what a snapshot build
       # carries: left at "dev" the label reads as "no release", and the recency
       # half of the channel rules has nothing to compare against.
       - -s -w
-      - -X main.version={{ .Version }}
+      - -X main.version={{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}
       - -X main.release={{ envOrDefault "TUMIKA_RELEASE" "dev" }}
       - -X main.commit={{ .FullCommit }}
       - -X main.date={{ .Date }}
 
 archives:
+  # Every asset is named by the daemon COMPONENT version, never by {{ .Version }}
+  # — which is the tag, and therefore the CalVer release label. install.sh, the
+  # updater and the BOM all address an asset by the component semver they
+  # already know; a label in the name would make them unaddressable.
   - id: tumika
     ids:
       - tumika
     name_template: >-
-      tumika_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+      tumika_{{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}_{{ .Os }}_{{ .Arch }}
 
   # Raw, uncompressed. This is what the self-updater downloads, and what
   # scripts/install.sh fetches — the name template is part of both contracts.
@@ -75,7 +89,7 @@ archives:
     formats:
       - binary
     name_template: >-
-      {{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+      {{ .Binary }}_{{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}_{{ .Os }}_{{ .Arch }}
 
 checksum:
   # ONE checksums file covering both archives, because the updater and the
@@ -88,7 +102,12 @@ checksum:
   name_template: checksums.txt
 
 snapshot:
-  version_template: "{{ incpatch .Version }}-snapshot"
+  # A snapshot names itself, off the same component version the assets carry, so
+  # metadata.json and the asset names agree and verify-release-assets.sh can
+  # tell a snapshot from a release without being told. Deriving it from the tag
+  # instead would turn v2026.09.01 into 2026.9.2-snapshot — a bumped, unpadded
+  # label masquerading as a component version.
+  version_template: "{{ .Env.TUMIKA_DAEMON_VERSION }}-snapshot"
 
 changelog:
   sort: asc
@@ -103,12 +122,13 @@ release:
     owner: tumika
     name: tumika
 
-  # The tag glob in release.yml is v*.*.*, which also matches v1.0.0-rc1.
-  # goreleaser publishes a full release by default, and GitHub then resolves
-  # /releases/latest to it — so an RC would be served to every new user by
-  # install.sh AND by the documented
-  # releases/latest/download/install.sh URL. `auto` marks any tag with a
-  # prerelease segment as one.
+  # The tag glob in release.yml is v*.*.*, which also matches a beta tag such as
+  # v2026.09.01-beta.1. goreleaser publishes a full release by default, and
+  # GitHub then resolves /releases/latest to it — so a beta would be served to
+  # every new user by install.sh AND by the documented
+  # releases/latest/download/install.sh URL. `auto` marks any tag carrying a
+  # prerelease segment as one; the promote step sets the flag explicitly when it
+  # makes the release public.
   prerelease: auto
 
   # Published as a DRAFT, then promoted by the workflow only after the assets
@@ -119,10 +139,14 @@ release:
   # workflow red while the broken release stayed downloadable. A gate that
   # reports rather than prevents is not a gate.
   draft: true
-  # Shipped with every release so it can be fetched from the stable
-  # releases/latest/download/install.sh URL.
+  # install.sh is shipped with every release so it can be fetched from the stable
+  # releases/latest/download/install.sh URL. release.yaml rides along because it
+  # names the label and every component version this release was built from: the
+  # gate reads the previously published one to enforce that a component version
+  # only ever moves forward.
   extra_files:
     - glob: scripts/install.sh
+    - glob: release.yaml
   header: |
     ## tumika
 

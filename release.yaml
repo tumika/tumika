@@ -1,7 +1,11 @@
-# The single source of the release label.
+# The single source of the release label and of each component's version.
 #
 # A release's label is chosen by editing this file: the release workflow reads it
 # through scripts/release-label.sh and stamps it into every binary and image the
-# release publishes. The tag names the component version and says nothing about
-# the label.
+# release publishes. Each entry under `components:` is that component's semver,
+# read through scripts/release-component-version.sh; a beta release carries a
+# -beta.N prerelease suffix on the component versions it changes. The release's
+# tag is v<label>. scripts/validate-release.sh checks the whole file.
 release: 2026.09.01
+components:
+  daemon: 0.0.1
