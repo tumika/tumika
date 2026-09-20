@@ -23,7 +23,8 @@ func (r *UpdateStateRepo) Get(ctx context.Context) (domain.UpdateState, error) {
 	if err != nil {
 		return domain.UpdateState{}, mapError(err)
 	}
-	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts, row.StartedAt, row.UpdatedAt)
+	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
+		row.StartedAt, row.UpdatedAt, row.ToPublishedAt)
 }
 
 func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
@@ -38,6 +39,9 @@ func (r *UpdateStateRepo) Put(ctx context.Context, s domain.UpdateState) error {
 		BootAttempts: int64(s.BootAttempts),
 		StartedAt:    nullTime(s.StartedAt),
 		UpdatedAt:    formatTime(updated),
+		// A nil watermark is stored as NULL rather than a zero time, which would
+		// read back as year 1 and pass for a real publication time.
+		ToPublishedAt: nullTime(s.ToPublishedAt),
 	}))
 }
 
@@ -51,7 +55,8 @@ func (r *UpdateStateRepo) IncrementBootAttempts(ctx context.Context) (domain.Upd
 	if err != nil {
 		return domain.UpdateState{}, mapError(err)
 	}
-	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts, row.StartedAt, row.UpdatedAt)
+	return updateStateFrom(row.Status, row.FromVersion, row.ToVersion, row.BootAttempts,
+		row.StartedAt, row.UpdatedAt, row.ToPublishedAt)
 }
 
 func updateStateFrom(
@@ -59,6 +64,7 @@ func updateStateFrom(
 	bootAttempts int64,
 	startedAt sql.NullString,
 	updatedAt string,
+	toPublishedAt sql.NullString,
 ) (domain.UpdateState, error) {
 	updated, err := parseTime(updatedAt)
 	if err != nil {
@@ -68,12 +74,17 @@ func updateStateFrom(
 	if err != nil {
 		return domain.UpdateState{}, err
 	}
+	published, err := parseNullTime(toPublishedAt)
+	if err != nil {
+		return domain.UpdateState{}, err
+	}
 	return domain.UpdateState{
-		Status:       domain.UpdateStatus(status),
-		FromVersion:  fromVersion,
-		ToVersion:    toVersion,
-		BootAttempts: int(bootAttempts),
-		StartedAt:    started,
-		UpdatedAt:    updated,
+		Status:        domain.UpdateStatus(status),
+		FromVersion:   fromVersion,
+		ToVersion:     toVersion,
+		BootAttempts:  int(bootAttempts),
+		StartedAt:     started,
+		UpdatedAt:     updated,
+		ToPublishedAt: published,
 	}, nil
 }

@@ -699,8 +699,9 @@ func TestTheUpdateRulePerChannel(t *testing.T) {
 }
 
 // A daemon whose own release has been pruned — every edge release is, in time —
-// is dated at the zero time, so the head is offered rather than the daemon
-// being pinned to nothing.
+// and which carries no watermark for the build it is running is dated at the
+// zero time, so the head is offered rather than the daemon being pinned to
+// nothing.
 func TestAPrunedOwnReleaseCountsAsOlderThanTheHead(t *testing.T) {
 	h := newHarness(t, "0.0.2-edge.140")
 	h.settings.channel = release.ChannelEdge
@@ -709,6 +710,140 @@ func TestAPrunedOwnReleaseCountsAsOlderThanTheHead(t *testing.T) {
 
 	if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
 		t.Errorf("Check = %v/%v, want an offer: a pruned release dates the daemon at nothing", newer, err)
+	}
+}
+
+// THE rollback a hostile release host gets for free without forging anything.
+//
+// Edge decides on recency alone, and a 404 on the running build's own document
+// is indistinguishable from a legitimate prune. So a host that withholds that
+// one document and replays a genuine, correctly signed, OLDER channel head
+// would walk the daemon backwards — the signature chain is intact throughout.
+// The watermark this daemon wrote when it installed the build it is running is
+// the floor that refuses it.
+func TestAWatermarkRefusesAReplayedOlderHeadWhenTheOwnDocumentIsWithheld(t *testing.T) {
+	const running = "0.0.2-edge.140"
+	replayed := published.Add(-48 * time.Hour)
+
+	withheld := func(t *testing.T) *harness {
+		t.Helper()
+		h := newHarness(t, running)
+		h.settings.channel = release.ChannelEdge
+		h.source.offer(release.ChannelEdge, "edge.100", replayed, "0.0.2-edge.100")
+		// The host serves the replayed head and its document, and withholds the
+		// running build's own.
+		delete(h.source.boms, runningRelease)
+		return h
+	}
+
+	t.Run("with a watermark", func(t *testing.T) {
+		h := withheld(t)
+		h.repo.state = domain.UpdateState{
+			Status: domain.UpdateConfirmed, FromVersion: "0.0.2-edge.139", ToVersion: running,
+			ToPublishedAt: &published,
+		}
+
+		available, newer, err := h.svc.Check(t.Context())
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if available != "0.0.2-edge.100" {
+			t.Errorf("Check offered %q, want the head's version reported either way", available)
+		}
+		if newer {
+			t.Error("a replayed older head superseded a build with a newer watermark")
+		}
+
+		if err := h.svc.Apply(t.Context(), "0.0.2-edge.100"); !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("Apply = %v, want ErrConflict", err)
+		}
+		if got := h.read(t, h.binary); got != "binary "+running {
+			t.Errorf("the running binary is %q; it was rolled backwards", got)
+		}
+	})
+
+	// The same host, the same replay, against a daemon that has never updated:
+	// it has nothing to be dated by, so it takes the head. That is the case the
+	// watermark must not break, because it is every first install.
+	t.Run("without a watermark", func(t *testing.T) {
+		h := withheld(t)
+
+		if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
+			t.Errorf("Check = %v/%v, want the head offered to a daemon with no watermark", newer, err)
+		}
+	})
+}
+
+// A watermark counts only while it belongs to the build that is running. A
+// rolled_back row records a version this daemon does NOT run, so dating the
+// daemon by it would pin it to a release it never kept.
+func TestAWatermarkFromAnotherBuildIsIgnored(t *testing.T) {
+	const running = "0.0.2-edge.140"
+
+	for _, tc := range []struct {
+		name  string
+		state domain.UpdateState
+	}{
+		{"rolled back", domain.UpdateState{
+			Status: domain.UpdateRolledBack, FromVersion: running, ToVersion: "0.0.2-edge.150",
+			ToPublishedAt: &published,
+		}},
+		{"pending another version", domain.UpdateState{
+			Status: domain.UpdatePending, FromVersion: running, ToVersion: "0.0.2-edge.150",
+			ToPublishedAt: &published,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, running)
+			h.settings.channel = release.ChannelEdge
+			h.source.offer(release.ChannelEdge, "edge.100", published.Add(-48*time.Hour), "0.0.2-edge.100")
+			delete(h.source.boms, runningRelease)
+			h.repo.state = tc.state
+
+			if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
+				t.Errorf("Check = %v/%v, want the head offered: the watermark is another build's",
+					newer, err)
+			}
+		})
+	}
+}
+
+// The running build's own bill of materials is the authority whenever it can be
+// read; the watermark only stands in for one that is gone.
+func TestTheOwnBillOfMaterialsWinsOverTheWatermark(t *testing.T) {
+	const running = "0.0.2-edge.140"
+	h := newHarness(t, running)
+	h.settings.channel = release.ChannelEdge
+	// The daemon's own release is dated a year ago, and the head is newer than
+	// that but older than the watermark. Only the document decides.
+	h.source.publish(runningRelease, release.ChannelEdge, published.Add(-365*24*time.Hour), running)
+	h.source.offer(release.ChannelEdge, "edge.147", published.Add(-48*time.Hour), "0.0.2-edge.147")
+	h.repo.state = domain.UpdateState{
+		Status: domain.UpdateConfirmed, ToVersion: running, ToPublishedAt: &published,
+	}
+
+	if _, newer, err := h.svc.Check(t.Context()); err != nil || !newer {
+		t.Errorf("Check = %v/%v, want the head offered on the strength of the own document",
+			newer, err)
+	}
+}
+
+// The watermark is written with the pending row, before the binary is swapped,
+// so the build that boots next can date itself without asking the host.
+func TestApplyRecordsThePublicationTimeOfWhatItInstalls(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+
+	if err := h.svc.Apply(t.Context(), "0.2.0"); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	state, err := h.repo.Get(t.Context())
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	want := published.Add(24 * time.Hour)
+	if state.ToPublishedAt == nil || !state.ToPublishedAt.Equal(want) {
+		t.Errorf("ToPublishedAt = %v, want the head's publication time %v", state.ToPublishedAt, want)
 	}
 }
 

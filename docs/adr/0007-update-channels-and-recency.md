@@ -36,10 +36,17 @@ decide from a channel's head whether the running build should be replaced.
 
 ## Consequences
 
-- A daemon must know when its own release was published. It fetches its own release's BOM;
-  a development build or a release whose BOM is not published counts as older, so it
-  is offered the head. Any other failure stops the check, because an unverifiable document
-  says nothing about recency.
+- A daemon must know when its own release was published. It fetches its own release's BOM. A
+  development build counts as older, so it is offered the head. Any failure other than a 404
+  stops the check, because an unverifiable document says nothing about recency.
+- **A 404 on the running build's own BOM falls back to a watermark**, the publication time the
+  daemon recorded in `update_state` when it installed the build it is running. Edge decides on
+  recency alone and a pruned BOM is indistinguishable from one a hostile host withholds, so
+  without a floor that host could roll an edge daemon backwards by replaying a genuine, older,
+  correctly signed channel head — no forged signature required. The watermark counts only while
+  it belongs to the running build (its `to_version` is the running component version and its
+  status is `pending` or `confirmed`). A daemon with no such watermark counts as older and is
+  offered the head, which is what keeps a first install and a long-pruned edge build updatable.
 - An edge daemon can be moved to a lower component version. That is deliberate.
 - Publication time is written by the publisher into a signed document, so the ordering is as
   trustworthy as the signature.

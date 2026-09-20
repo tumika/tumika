@@ -40,6 +40,13 @@ type UpdateState struct {
 	BootAttempts int
 	StartedAt    *time.Time
 	UpdatedAt    time.Time
+	// ToPublishedAt is when the release shipping ToVersion was published. It is
+	// the recency watermark the updater falls back to when that release's own
+	// document is no longer served, so a host that answers 404 for it cannot
+	// date the running build at nothing and replay an older head. Nil means
+	// there is no watermark: a first install, or a row a build that recorded
+	// none left behind.
+	ToPublishedAt *time.Time
 }
 
 // ShouldRollBack reports whether a pending update has failed to boot often

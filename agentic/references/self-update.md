@@ -48,10 +48,27 @@ component version must equal the head's, or `Apply` refuses with a conflict.
 
 The running build's publication time comes from its own
 `/releases/<label>.json`. A development build (release `dev`) counts as older.
-A release whose document is not published (404, as with a pruned edge release)
-counts as older. Any other failure, an unverifiable signature or an unreachable
-host, stops the check, because reading it as "older" could downgrade an edge
-daemon on the strength of a document nobody verified.
+Any failure other than a 404 — an unverifiable signature, an unreachable host —
+stops the check, because reading it as "older" could downgrade an edge daemon on
+the strength of a document nobody verified.
+
+A 404 falls back to the **watermark**: the publication time `Apply` recorded in
+`update_state.to_published_at` alongside the version it installed. It counts
+only when it belongs to the running build — the row's `to_version` is the
+running component version and its status is `pending` or `confirmed`; a
+`rolled_back` row's watermark dates a build that is not running. With no
+watermark for the running build, a 404 counts as older, so a first install and a
+daemon whose pruned edge release predates its own watermark are still offered
+the head.
+
+Without that floor an edge daemon can be rolled backwards with no forged
+signature at all: edge decides on recency alone, and a host that withholds the
+running build's own document — indistinguishable from a legitimate prune — while
+replaying a genuine, correctly signed, older channel head dates the daemon at
+nothing, and the older release supersedes it. The watermark is written by the
+daemon itself, from the head it is installing, before the binary is swapped, so
+nothing the host serves can lower it. A bill of materials that reads cleanly is
+authoritative and leaves the watermark alone, which keeps `Check` a read.
 
 ## Trust chain
 

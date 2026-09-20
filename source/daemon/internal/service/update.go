@@ -207,13 +207,19 @@ func supersedes(channel release.Channel, head release.Head, version string, publ
 
 // publishedAt is when the release this binary was shipped in was published.
 //
-// A development build, and a build whose bill of materials is no longer
-// published (edge releases are pruned), is dated at the zero time — older than
-// anything a channel offers, so such a daemon is offered the head rather than
-// pinned to nothing. Any other failure is returned instead: a signature that
-// does not verify, or a host that is down, says nothing about recency, and
-// reading it as "older" would hand an edge daemon a DOWNGRADE on the strength
-// of a document nobody could verify.
+// A development build is dated at the zero time — older than anything a channel
+// offers, so it is offered the head rather than pinned to nothing. When the
+// running build's own bill of materials is not published (edge releases are
+// pruned) the WATERMARK stands in for it, and only a daemon with no watermark
+// falls back to the zero time. Any other failure is returned instead: a
+// signature that does not verify, or a host that is down, says nothing about
+// recency, and reading it as "older" would hand an edge daemon a DOWNGRADE on
+// the strength of a document nobody could verify.
+//
+// A bill of materials that reads cleanly is authoritative and the watermark is
+// left alone: the watermark is a floor for a document that has gone, and
+// raising it would make Check — which a runner calls on a timer and which
+// otherwise touches nothing — a writer of the state row.
 func (s *updateService) publishedAt(ctx context.Context) (time.Time, error) {
 	if s.deps.Release == "" || s.deps.Release == buildinfo.DevRelease {
 		return time.Time{}, nil
@@ -221,11 +227,40 @@ func (s *updateService) publishedAt(ctx context.Context) (time.Time, error) {
 	bom, err := s.deps.Source.ReleaseBOM(ctx, s.deps.Release)
 	if err != nil {
 		if errors.Is(err, release.ErrNoRelease) {
-			return time.Time{}, nil
+			return s.watermark(ctx)
 		}
 		return time.Time{}, fmt.Errorf("read the bill of materials of release %s: %w", s.deps.Release, err)
 	}
 	return bom.PublishedAt, nil
+}
+
+// watermark is the publication time this daemon recorded for the build it is
+// running, and the zero time when it has none.
+//
+// It is what stops a rollback by omission. Recency alone decides on edge, so a
+// host that serves a 404 for the running build's own document — which is
+// indistinguishable from a legitimate prune — dates the daemon at nothing, and
+// a genuine, correctly signed, older channel head then supersedes it. No
+// signature has to be forged; withholding one document is enough. The watermark
+// is written from the release being installed, by this daemon, before the
+// binary is swapped, so no reply from the host can lower it.
+//
+// It counts only while it belongs to the running build: the row's ToVersion
+// must be the running component version, and its status must be pending or
+// confirmed. A rolled_back or failed row records a build that is NOT running,
+// and its publication time would date this daemon by a release it never kept.
+func (s *updateService) watermark(ctx context.Context) (time.Time, error) {
+	state, err := s.deps.Repo.Get(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read the update state: %w", err)
+	}
+	if state.ToPublishedAt == nil || state.ToVersion != s.deps.Version {
+		return time.Time{}, nil
+	}
+	if state.Status != domain.UpdatePending && state.Status != domain.UpdateConfirmed {
+		return time.Time{}, nil
+	}
+	return *state.ToPublishedAt, nil
 }
 
 // Apply installs a version, leaving the process running on the old one.
@@ -326,13 +361,19 @@ func (s *updateService) Apply(ctx context.Context, version string) error {
 	// ConfirmBoot resolves harmlessly. The reverse order leaves a swapped binary
 	// with no record, and nothing would ever roll it back.
 	started := s.now()
+	// The head's publication time is recorded with the version it ships, so the
+	// binary that boots next can date itself even after its own bill of
+	// materials stops being served — which is what keeps a 404 from becoming a
+	// downgrade.
+	headPublishedAt := head.PublishedAt
 	state := domain.UpdateState{
-		Status:       domain.UpdatePending,
-		FromVersion:  s.deps.Version,
-		ToVersion:    version,
-		BootAttempts: 0,
-		StartedAt:    &started,
-		UpdatedAt:    started,
+		Status:        domain.UpdatePending,
+		FromVersion:   s.deps.Version,
+		ToVersion:     version,
+		BootAttempts:  0,
+		StartedAt:     &started,
+		UpdatedAt:     started,
+		ToPublishedAt: &headPublishedAt,
 	}
 	if err := s.deps.Tx.InTx(ctx, func(ctx context.Context) error {
 		return s.deps.Repo.Put(ctx, state)

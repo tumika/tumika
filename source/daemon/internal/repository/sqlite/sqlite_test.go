@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pressly/goose/v3"
+
 	"github.com/tumika/tumika/source/daemon/internal/domain"
+	"github.com/tumika/tumika/source/daemon/internal/repository/migrations"
 )
 
 // newStore opens a migrated database on a temp file. Not in-memory: the DSN
@@ -58,8 +61,71 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 1 {
-		t.Errorf("schema version = %d, want 1", v)
+	want, err := migrations.MaxVersion()
+	if err != nil {
+		t.Fatalf("MaxVersion: %v", err)
+	}
+	if v != want {
+		t.Errorf("schema version = %d, want %d", v, want)
+	}
+}
+
+// Every migration has a working Down, and the daemon meets it on a database
+// that already holds rows: a rollback after an update puts an older binary in
+// front of a schema it has never seen, and the operator's way out is to migrate
+// back. A Down that drops data, or one that cannot be re-applied, is only
+// discovered at that moment.
+func TestMigrationsRollBackAndForwardAgain(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	repo := NewUpdateStateRepo(s)
+
+	watermark := time.Date(2026, 9, 20, 7, 28, 0, 0, time.UTC)
+	err := repo.Put(ctx, domain.UpdateState{
+		Status:        domain.UpdateConfirmed,
+		FromVersion:   "0.0.1",
+		ToVersion:     "0.0.2",
+		ToPublishedAt: &watermark,
+	})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	goose.SetBaseFS(migrations.FS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("SetDialect: %v", err)
+	}
+	if err := goose.DownContext(ctx, s.rw, "."); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+
+	// The row an older binary finds: still there, still readable, without the
+	// column the newer schema added.
+	var status, toVersion string
+	err = s.rw.QueryRowContext(ctx,
+		`SELECT status, to_version FROM update_state WHERE id = 1`).Scan(&status, &toVersion)
+	if err != nil {
+		t.Fatalf("read the row after Down: %v", err)
+	}
+	if status != string(domain.UpdateConfirmed) || toVersion != "0.0.2" {
+		t.Errorf("row after Down = %q/%q, want confirmed/0.0.2", status, toVersion)
+	}
+
+	if err := Migrate(ctx, s); err != nil {
+		t.Fatalf("Migrate after Down: %v", err)
+	}
+	got, err := repo.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get after re-migrating: %v", err)
+	}
+	if got.Status != domain.UpdateConfirmed || got.ToVersion != "0.0.2" {
+		t.Errorf("state = %+v, want the row preserved across the round trip", got)
+	}
+	// A column re-added is empty, which is exactly how a row written before the
+	// daemon recorded watermarks reads: no watermark at all, never a zero time.
+	if got.ToPublishedAt != nil {
+		t.Errorf("ToPublishedAt = %v, want nil on a row with no watermark", got.ToPublishedAt)
 	}
 }
 
@@ -423,13 +489,20 @@ func TestUpdateStateSeededAndIncremented(t *testing.T) {
 	if got.Status != domain.UpdateIdle {
 		t.Errorf("seeded status = %q, want idle", got.Status)
 	}
+	// The seeded row has no watermark, and reads as none rather than as a zero
+	// time that would pass for a real publication time.
+	if got.ToPublishedAt != nil {
+		t.Errorf("seeded ToPublishedAt = %v, want nil", got.ToPublishedAt)
+	}
 
 	started := time.Now().UTC().Truncate(time.Nanosecond)
+	publishedAt := started.Add(-time.Hour)
 	err = repo.Put(ctx, domain.UpdateState{
-		Status:      domain.UpdatePending,
-		FromVersion: "v0.0.1",
-		ToVersion:   "v0.0.2",
-		StartedAt:   &started,
+		Status:        domain.UpdatePending,
+		FromVersion:   "v0.0.1",
+		ToVersion:     "v0.0.2",
+		StartedAt:     &started,
+		ToPublishedAt: &publishedAt,
 	})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
@@ -449,6 +522,11 @@ func TestUpdateStateSeededAndIncremented(t *testing.T) {
 	}
 	if got.StartedAt == nil || !got.StartedAt.Equal(started) {
 		t.Errorf("StartedAt = %v, want %v", got.StartedAt, started)
+	}
+	// The watermark survives every boot counted against the update, because it
+	// is what dates the build once its own release document stops being served.
+	if got.ToPublishedAt == nil || !got.ToPublishedAt.Equal(publishedAt) {
+		t.Errorf("ToPublishedAt = %v, want %v", got.ToPublishedAt, publishedAt)
 	}
 }
 
