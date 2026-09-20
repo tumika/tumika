@@ -75,7 +75,9 @@ at the caller's commit, which would put that branch's `tumika-bom` source in fro
 of the signing key. Its build job (`actions: write`) instead dispatches
 `publish-pages.yml` on `main`. The signing key is a secret of the `release-signing`
 environment, whose deployment-branch policy admits only `main` and `v*.*.*` tags,
-so a run from any other ref cannot resolve it.
+so a run from any other branch cannot resolve it. The environment cannot tell
+whether a `v*.*.*` tag was cut from `main`, so a tag ruleset restricting who may
+create those tags is what closes the tag path.
 
 The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in
 `.github/` invokes them.

@@ -10,6 +10,10 @@ name: publish-pages
 #   - A DNS CNAME for get.tumika.org pointing at the Pages host. The record that
 #     names the domain to Pages is scripts/site/CNAME, which every deploy
 #     republishes.
+#   - A tag ruleset restricting who may create `v*.*.*` tags. The environment
+#     below admits those tags, and nothing in this file can check that a tag was
+#     cut from main: a workflow at a tagged commit controls its own jobs. Who may
+#     create the tag is the control.
 #   - The environment `release-signing`, with its deployment-branch policy limited
 #     to `main` and `v*.*.*` tags, holding the secret TUMIKA_RELEASE_SIGNING_KEY:
 #     the PEM release signing key
@@ -56,7 +60,7 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     # The signing key exists only in this environment, whose deployment-branch
-    # policy admits `main` and `v*.*.*` tags. A run from any other ref — an edge
+    # policy admits `main` and `v*.*.*` tags. A run from any other branch — an edge
     # branch, a pushed workflow file — fails to resolve the secret instead of
     # receiving it, and this job runs repository code (`go run ./cmd/tumika-bom`)
     # with the key in its environment.

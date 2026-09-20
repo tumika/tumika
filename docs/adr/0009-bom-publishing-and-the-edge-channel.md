@@ -33,7 +33,10 @@ without a release.
   `TUMIKA_RELEASE_SIGNING_KEY` holds an ECDSA P-256 private key as PEM, either SEC1 or PKCS#8.
   It is a secret of the `release-signing` environment, whose deployment-branch policy admits
   only `main` and `v*.*.*` tags, and the signing job of `publish-pages.yml` selects that
-  environment. No caller passes it, so no workflow run from another ref can obtain it.
+  environment. No caller passes it, so no run from another branch can obtain it. The policy admits `v*.*.*`
+  tags and cannot check that a tag was cut from `main`, and a workflow at a tagged commit
+  controls its own jobs, so a check inside the workflow proves nothing: a tag ruleset limiting
+  who may create those tags is what closes that path.
   `platform/release/keys.go` holds the list of public keys a daemon trusts. Rotation ships the
   new public key in a release signed by the old key; a daemon that applies it then accepts both.
 

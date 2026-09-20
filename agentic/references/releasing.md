@@ -116,6 +116,10 @@ workflows creates.**
 - A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
 - Settings, Pages, Source set to GitHub Actions. Any other source ignores the
   uploaded artifact and keeps serving whatever is there.
+- A tag ruleset restricting who may create `v*.*.*` tags. The `release-signing`
+  environment admits them, and a workflow at a tagged commit controls its own
+  jobs, so no check inside the workflow can establish that a tag was cut from
+  `main`: who may create the tag is the control.
 - The environment `release-signing`, whose deployment-branch policy admits only
   `main` and `v*.*.*` tags, holding the secret `TUMIKA_RELEASE_SIGNING_KEY`: an
   ECDSA P-256 private key as PEM (SEC1 or PKCS#8), for example from `openssl ecparam -name prime256v1
