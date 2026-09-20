@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>get.tumika.org — tumika release host</title>
+    <style>
+      body {
+        margin: 0 auto;
+        max-width: 42rem;
+        padding: 2rem 1rem;
+        font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        color: #1b1b1b;
+        background: #fff;
+      }
+      code,
+      pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.9em;
+      }
+      pre {
+        overflow-x: auto;
+        padding: 0.75rem 1rem;
+        background: #f4f4f4;
+        border-radius: 6px;
+      }
+      ul {
+        padding-left: 1.2rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>tumika</h1>
+    <p>
+      This host serves tumika's installer and the signed bills of materials its daemons read to
+      find an update. Everything here is generated from the published GitHub releases; nothing is
+      edited by hand.
+    </p>
+
+    <h2>Install the daemon</h2>
+    <pre><code>curl -fsSL https://get.tumika.org/install-daemon.sh | sh</code></pre>
+
+    <h2>What is published</h2>
+    <ul>
+      <li><code>/channels/&lt;channel&gt;.json</code> — the head of a channel: stable, beta or edge.</li>
+      <li><code>/releases/&lt;label&gt;.json</code> — one release's components and their assets.</li>
+      <li>
+        <code>&lt;document&gt;.json.sig</code> — the detached ECDSA P-256 signature beside every
+        document. A daemon refuses a document that does not verify against a key compiled into it.
+      </li>
+    </ul>
+
+    <p>Source and releases: <a href="https://github.com/tumika/tumika">github.com/tumika/tumika</a>.</p>
+  </body>
+</html>
