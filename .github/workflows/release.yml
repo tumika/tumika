@@ -110,6 +110,21 @@ jobs:
           cache: true
           cache-dependency-path: source/daemon/go.sum
 
+      # The release LABEL for `-X main.release`, exported for every step below.
+      #
+      # It is exported ONLY when the tag is a label the daemon accepts
+      # (release.ValidateReleaseLabel: YYYY.MM.NN[-beta.N]). Tags are semver, so
+      # most of them are not, and injecting one the daemon rejects would make
+      # every update check on the released binary return an error rather than
+      # degrade. Unset leaves the binary on its "dev" default, and
+      # verify-release-assets.sh then has no label to assert.
+      - name: the release label, when the tag carries one
+        run: |
+          label="${GITHUB_REF_NAME#v}"
+          if [[ "$label" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-beta\.[0-9]+)?$ ]]; then
+            echo "TUMIKA_RELEASE=$label" >> "$GITHUB_ENV"
+          fi
+
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
@@ -194,10 +209,24 @@ jobs:
       # github.event.repository.updated_at is not a build date at all: it moves
       # when the description or topics change, and is identical for every image
       # built from the same tag.
+      #
+      # The release label is emitted separately, and falls back to "dev": the
+      # image's binary carries a label only when the tag is one the daemon
+      # accepts (release.ValidateReleaseLabel), because a label it rejects turns
+      # every update check into an error. Passing the build arg unconditionally
+      # is why the fallback is spelled out — an empty RELEASE would override the
+      # Dockerfile's own default with a label that validates as neither.
       - id: buildmeta
         run: |
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+          release=dev
+          label="${GITHUB_REF_NAME#v}"
+          if [[ "$label" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-beta\.[0-9]+)?$ ]]; then
+            release="$label"
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -209,5 +238,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.buildmeta.outputs.version }}
+            RELEASE=${{ steps.buildmeta.outputs.release }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.buildmeta.outputs.date }}

@@ -133,5 +133,22 @@ grep -q "^tumika ${VERSION} " <<<"$first_line" \
   || fail "the binary reports '${first_line}', not version ${VERSION}; the ldflags did not take, and IsDev() would disable self-update"
 ok "the binary itself reports ${VERSION}"
 
+# The release LABEL, which `-X main.release` carries and which nothing above
+# would notice the loss of: metadata.json has no such field, and a binary
+# stamped with the "dev" label builds, runs and reports a correct version.
+#
+# It is the label the updater compares recency against, so without it a stable
+# or beta daemon degrades to a semver-only comparison and an edge daemon accepts
+# any head — a channel rule that silently stops applying.
+#
+# Keyed on the environment rather than skipped on a guess: a build is stamped
+# with a label only when TUMIKA_RELEASE names one, so unset means there is no
+# label to assert, not that the assertion could not be made.
+if [[ -n "${TUMIKA_RELEASE:-}" ]]; then
+  grep -qF "(release ${TUMIKA_RELEASE}," <<<"$first_line" \
+    || fail "the binary reports '${first_line}', not release ${TUMIKA_RELEASE}; -X main.release did not take, and the recency half of the update rules would be inert"
+  ok "the binary itself reports release ${TUMIKA_RELEASE}"
+fi
+
 echo
 echo "PASS"
