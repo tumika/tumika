@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"golang.org/x/mod/semver"
 )
 
 // The repo root, from this package's directory: internal/platform/release is
@@ -117,5 +119,123 @@ func TestReleaseLabelScriptRejectsMissingKey(t *testing.T) {
 				t.Fatalf("the script accepted %q", content)
 			}
 		})
+	}
+}
+
+// A component version is semver: the same X.Y.Z core the updater compares,
+// which x/mod/semver also accepts in shorthand ("v1", "v1.2") and the release
+// files never carry.
+func validComponentVersion(v string) bool {
+	if !semver.IsValid("v" + v) {
+		return false
+	}
+	core := v
+	if i := strings.IndexAny(core, "-+"); i >= 0 {
+		core = core[:i]
+	}
+	return strings.Count(core, ".") == 2
+}
+
+// scripts/release-component-version.sh carries the semver pattern in shell, so
+// it is asserted to agree with x/mod/semver, which the daemon compares with.
+func TestComponentVersionScriptAgreesWithSemver(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+	script := filepath.Join(repoRoot, "scripts", "release-component-version.sh")
+
+	versions := []string{
+		"0.0.1",
+		"1.2.3",
+		"0.0.2-beta.1",
+		"1.0.0-edge.147",
+		"1.0.0+build.5",
+		"1.0.0-rc.1+build",
+		"1.2",
+		"1",
+		"01.2.3",
+		"1.2.3-",
+		"1.2.3-beta..1",
+		"1.2.3-01",
+		"v1.2.3",
+		"2026.09.01",
+		"x.y.z",
+	}
+
+	for _, version := range versions {
+		t.Run(version, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "release.yaml")
+			content := "release: 2026.09.01\ncomponents:\n  daemon: " + version + "\n"
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("write %s: %v", path, err)
+			}
+
+			out, runErr := exec.Command(bash, script, "daemon", path).Output() //nolint:gosec // both paths are the test's own
+			accepted := runErr == nil
+			want := validComponentVersion(version)
+
+			if accepted != want {
+				t.Fatalf("the script accepted=%v, semver accepted=%v for %q", accepted, want, version)
+			}
+			if accepted {
+				if got := strings.TrimSpace(string(out)); got != version {
+					t.Fatalf("the script printed %q, want %q", got, version)
+				}
+			}
+		})
+	}
+}
+
+func TestComponentVersionScriptRejectsMalformedFiles(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+	script := filepath.Join(repoRoot, "scripts", "release-component-version.sh")
+
+	for name, content := range map[string]string{
+		"no block":        "release: 2026.09.01\n",
+		"missing":         "components:\n  desktop: 0.1.0\n",
+		"empty":           "components:\n  daemon:\n",
+		"duplicate":       "components:\n  daemon: 0.0.1\n  daemon: 0.0.2\n",
+		"after the block": "components:\n  desktop: 0.1.0\nother:\n  daemon: 0.0.1\n",
+		"top level":       "daemon: 0.0.1\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "release.yaml")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("write %s: %v", path, err)
+			}
+			if err := exec.Command(bash, script, "daemon", path).Run(); err == nil { //nolint:gosec // both paths are the test's own
+				t.Fatalf("the script accepted %q", content)
+			}
+		})
+	}
+	if err := exec.Command(bash, script, "daemon", filepath.Join(t.TempDir(), "absent.yaml")).Run(); err == nil { //nolint:gosec // the test's own paths
+		t.Fatal("the script accepted a missing file")
+	}
+}
+
+// The release workflow runs validate-release.sh on the committed file, so the
+// file as committed has to pass it, with the tag its label implies and not
+// with any other.
+func TestReleaseYAMLValidates(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+	script := filepath.Join(repoRoot, "scripts", "validate-release.sh")
+	file := filepath.Join(repoRoot, "release.yaml")
+	label := readReleaseYAML(t, file)
+
+	if out, err := exec.Command(bash, script, "--tag", "v"+label, file).CombinedOutput(); err != nil { //nolint:gosec // the test's own paths
+		t.Fatalf("release.yaml does not validate: %v\n%s", err, out)
+	}
+	if err := exec.Command(bash, script, "--tag", "v"+label+"1", file).Run(); err == nil { //nolint:gosec // the test's own paths
+		t.Fatal("a tag that is not v<label> validated")
+	}
+	if err := exec.Command(bash, script, file).Run(); err != nil { //nolint:gosec // the test's own paths
+		t.Fatalf("release.yaml without a tag does not validate: %v", err)
 	}
 }
