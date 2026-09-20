@@ -9,7 +9,7 @@ saw:
   - scripts/release-component-version.sh
   - scripts/check-release-monotonic.sh
   - scripts/validate-release.sh
-  - scripts/install.sh
+  - scripts/install-daemon.sh
   - .github/workflows/release.yml
   - .github/workflows/ci-build.yml
   - release.yaml

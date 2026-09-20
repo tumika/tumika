@@ -92,6 +92,12 @@ publication time. Each has a detached signature beside it (`<document>.sig`):
 - The release label from the daemon's own build stamp is validated against a
   strict pattern before it is placed in a URL.
 
+The documents are published to `https://get.tumika.org` by `publish-pages.yml`,
+generated from the Releases API and signed with the release key whose public half
+is in `keys.go` (ADR-0009). `scripts/install-daemon.sh` follows the same chain for
+a first install: it verifies the BOM's signature with `openssl` against an
+embedded copy of that key before reading anything out of it.
+
 The boot counter increments BEFORE the attempt is judged, so a binary that dies
 during startup still counts; counting after a successful start would loop
 forever without ever reaching the rollback.

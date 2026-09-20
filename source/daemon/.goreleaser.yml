@@ -72,17 +72,20 @@ builds:
 
 archives:
   # Every asset is named by the daemon COMPONENT version, never by {{ .Version }}
-  # — which is the tag, and therefore the CalVer release label. install.sh, the
-  # updater and the BOM all address an asset by the component semver they
-  # already know; a label in the name would make them unaddressable.
+  # — which is the tag, and therefore the CalVer release label. The BOM
+  # generator finds a release's assets by the prefix
+  # `tumika_<component version>_`, and verify-release-assets.sh asserts the same
+  # names; a label in the name would leave every release with no component
+  # assets at all.
   - id: tumika
     ids:
       - tumika
     name_template: >-
       tumika_{{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}_{{ .Os }}_{{ .Arch }}
 
-  # Raw, uncompressed. This is what the self-updater downloads, and what
-  # scripts/install.sh fetches — the name template is part of both contracts.
+  # Raw, uncompressed. This is the asset the BOM names, so it is what the
+  # self-updater and scripts/install-daemon.sh both download — the name template
+  # is what lets the generator find it.
   - id: raw
     ids:
       - tumika
@@ -92,13 +95,9 @@ archives:
       {{ .Binary }}_{{ .Env.TUMIKA_DAEMON_VERSION }}{{ if .IsSnapshot }}-snapshot{{ end }}_{{ .Os }}_{{ .Arch }}
 
 checksum:
-  # ONE checksums file covering both archives, because the updater and the
-  # installer both verify against it before replacing anything.
-  #
-  # Phase 2, before any public release: sign this with an ECDSA key from Actions
-  # secrets and verify the signature in the updater. A checksum fetched from the
-  # same host as the binary proves the download was not corrupted; it does not
-  # prove who produced it.
+  # ONE checksums file covering both archives. The BOM generator reads each raw
+  # asset's sha256 from it, so a release without it is skipped. It is not a
+  # trust root: the signature on the published BOM is.
   name_template: checksums.txt
 
 snapshot:
@@ -123,10 +122,10 @@ release:
     name: tumika
 
   # The tag glob in release.yml is v*.*.*, which also matches a beta tag such as
-  # v2026.09.01-beta.1. goreleaser publishes a full release by default, and
-  # GitHub then resolves /releases/latest to it — so a beta would be served to
-  # every new user by install.sh AND by the documented
-  # releases/latest/download/install.sh URL. `auto` marks any tag carrying a
+  # v2026.09.01-beta.1. goreleaser publishes a full release by default, so a
+  # beta would carry prerelease=false — and the BOM generator refuses a release
+  # whose GitHub prerelease flag disagrees with the channel its tag names, which
+  # would drop the beta off the site entirely. `auto` marks any tag carrying a
   # prerelease segment as one; the promote step sets the flag explicitly when it
   # makes the release public.
   prerelease: auto
@@ -139,13 +138,12 @@ release:
   # workflow red while the broken release stayed downloadable. A gate that
   # reports rather than prevents is not a gate.
   draft: true
-  # install.sh is shipped with every release so it can be fetched from the stable
-  # releases/latest/download/install.sh URL. release.yaml rides along because it
-  # names the label and every component version this release was built from: the
-  # gate reads the previously published one to enforce that a component version
-  # only ever moves forward.
+  # release.yaml is attached because it names the label and every component
+  # version this release was built from: the gate reads the previously published
+  # one to enforce that a component version only ever moves forward. The
+  # installer is not a release asset — it is served from get.tumika.org, where a
+  # first-time user has no release to download it from.
   extra_files:
-    - glob: scripts/install.sh
     - glob: release.yaml
   header: |
     ## tumika
@@ -159,7 +157,7 @@ release:
     **Install**
 
     ```sh
-    curl -fsSL https://github.com/tumika/tumika/releases/latest/download/install.sh | sh
+    curl -fsSL https://get.tumika.org/install-daemon.sh | sh
     ```
 
     Then `sudo tumika install` to run it as a service — a systemd unit on Linux,

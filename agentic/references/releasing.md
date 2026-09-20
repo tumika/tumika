@@ -11,10 +11,12 @@ because a tag can be pushed to any commit — including one whose PR checks neve
 ran.
 
 **Two archives, and both are load-bearing.** The `.tar.gz` is what a person
-downloads; the RAW binary is what `tumika update` fetches and what
-`scripts/install.sh` downloads (ADR-0003), because the updater replaces the
-running binary with an atomic rename and needs one uncompressed file at a
-predictable URL. `scripts/verify-release-assets.sh` checks that contract on both
+downloads; the RAW binary is the one the bill of materials names, so it is what
+`tumika update` and `scripts/install-daemon.sh` both fetch (ADR-0003), because
+the updater replaces the running binary with an atomic rename and needs one
+uncompressed file at a predictable URL. The BOM generator finds it by the prefix
+`tumika_<daemon component version>_`, which is why the name template is part of
+the contract. `scripts/verify-release-assets.sh` checks that contract on both
 the snapshot build in CI and the real release — dropping the raw archive,
 renaming a template, or losing a target are all one-line edits that leave the
 build perfectly green.
@@ -73,25 +75,136 @@ the job does.
 
 The promote step passes `--prerelease` explicitly, derived from the label
 (`-beta.` means prerelease). goreleaser's `prerelease: auto` cannot be templated
-and reads the tag, so it is not the value the release ends up with; a beta
-promoted as a full release would move `/releases/latest` — and therefore the
-documented `curl … /releases/latest/download/install.sh` — onto a beta. The
-ghcr `:latest` tag is guarded separately, because `type=raw` in
-`docker/metadata-action` is unconditional; it is enabled only for a stable
+and reads the tag, so it is not the value the release ends up with; and the BOM
+generator refuses a release whose GitHub prerelease flag disagrees with the
+channel its tag names, so a beta promoted as a full release is one the site
+never carries. The ghcr `:latest` tag is guarded separately, because `type=raw`
+in `docker/metadata-action` is unconditional; it is enabled only for a stable
 label.
 
-**`install.sh` is addressed by release tag.** `TUMIKA_VERSION` names a release
-tag (`v2026.09.01`, with or without the `v`), not a component version. The script
-downloads that release's `release.yaml` asset to learn the daemon component
-version and so the asset name, which is why the workflow's install-command step
-requires `install.sh`, `release.yaml` and `checksums.txt` in the draft.
+**The site is published by a job of this workflow, not by its own trigger.**
+`publish-pages.yml` listens for `release: published`, but the promote step
+publishes with the default `GITHUB_TOKEN` and GitHub raises no workflow event
+for anything that token does — so after a real release that trigger never fires.
+The `pages` job calls the workflow directly (`uses:`, passing no secrets),
+after both the promote step and the image push. A called workflow cannot hold
+more permission than the job calling it, so that job grants the `pages: write`
+and `id-token: write` its deploy job needs while the top of `release.yml` stays
+read-only. The weekly schedule and `workflow_dispatch` on `publish-pages.yml`
+remain the recovery paths.
+
+**A first install and a self-update share one trust chain.**
+`scripts/install-daemon.sh` is served from `https://get.tumika.org`, never
+attached to a release — a first-time user has no release to download it from. It
+fetches a channel's signed bill of materials, verifies it against the release
+public key embedded in the script, and reads the asset URL and SHA-256 out of
+the verified document. `TUMIKA_CHANNEL` selects the channel (`stable`, the
+default, `beta` or `edge`); `TUMIKA_VERSION` pins a release LABEL
+(`2026.09.01`, `2026.09.01-beta.1`, `edge.417`; a leading `v` is accepted and
+dropped) and replaces the channel lookup entirely. Neither names a component
+version: the document does that. The workflow's asset check therefore asks only
+for `release.yaml` and `checksums.txt` in the draft.
 
 **Releases are cut from `main` only.** The gate asserts the tagged commit is an
 ancestor of `main`: re-running the tests is not the same as knowing the commit
 was reviewed, and anyone who can push a tag could otherwise point it at a commit
 that merely compiles.
 
-**Before any public release:** sign `checksums.txt` with an ECDSA key from
-Actions secrets and verify it in the updater. A checksum fetched from the same
-host as the binary proves the download was not corrupted; it does not prove who
-produced it.
+**Before the first publish, the repository needs four things nothing in the
+workflows creates.**
+
+- A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
+- Settings, Pages, Source set to GitHub Actions. Any other source ignores the
+  uploaded artifact and keeps serving whatever is there.
+- A tag ruleset restricting who may create `v*.*.*` tags. The `release-signing`
+  environment admits them, and a workflow at a tagged commit controls its own
+  jobs, so no check inside the workflow can establish that a tag was cut from
+  `main`: who may create the tag is the control.
+- The environment `release-signing`, whose deployment-branch policy admits only
+  `main` and `v*.*.*` tags, holding the secret `TUMIKA_RELEASE_SIGNING_KEY`: an
+  ECDSA P-256 private key as PEM (SEC1 or PKCS#8), for example from `openssl ecparam -name prime256v1
+  -genkey -noout`. Its public half must be the first entry of `releaseKeyPEMs`
+  in `source/daemon/internal/platform/release/keys.go`, which is also the key
+  embedded in `scripts/install-daemon.sh`; `installer_key_test.go` fails when
+  the two differ. `tumika-bom` refuses a key that is not in the compiled-in list.
+
+**The site is assembled from three inputs and served from one host.**
+`publish-pages.yml` runs `tumika-bom` (which reads the published releases and
+writes every document and its detached `.sig`), then
+`scripts/assemble-site.sh <bom-dir> <installer> <static-dir> <out-dir>`, which
+adds the installer and `scripts/site/` and refuses a tree without an installer,
+`CNAME`, `index.html`, a channel head, or a document's signature. It serves:
+
+| Path | Content |
+|---|---|
+| `/channels/<channel>.json` (+ `.sig`) | the head release of `stable`, `beta` or `edge` |
+| `/releases/<label>.json` (+ `.sig`) | one release's bill of materials |
+| `/install-daemon.sh` | the installer |
+| `/`, `/CNAME` | the landing page and the custom domain record |
+
+The BOMs are regenerated whole on every run, so re-running the workflow retries
+a failed deploy. The generator reads each raw asset's SHA-256 from
+`checksums.txt`, and skips a release lacking `release.yaml` or `checksums.txt`,
+so goreleaser must keep uploading both. A skipped release fails the run unless
+`-allow-skips` is passed. A component the generator does not know how to name
+(`componentBinaries` in `internal/bomgen`) is a skipped release too, so adding a
+component adds a row there.
+
+**An edge build is cut by dispatching the `edge` workflow on `main`, naming the
+thing to build:**
+
+```sh
+gh workflow run edge.yml --ref main -f ref=<branch, tag or commit>
+```
+
+Dispatching a workflow runs the workflow FILE from the dispatched ref, so
+choosing a branch in the UI would run that branch's definition of every job —
+including the permissions the jobs ask for. The ref is an input instead, and a
+first `guard` job everything else needs fails the run when `github.ref` is not
+`refs/heads/main`. The input is handed to `actions/checkout` and to `env:`, never
+spliced into a `run:` script, where a ref named `$(…)` would execute.
+
+The work splits in two, and the split is the point:
+
+- `build` checks out `ref` with `persist-credentials: false` and holds
+  `contents: read`. It runs the branch's `scripts/edge-version.sh` (labelling the
+  build `edge.<n>` and suffixing every component version with `-edge.<n>`), tags
+  the commit `edge-<run number>` **locally**, runs goreleaser with
+  `--skip=validate,publish` and no token, runs
+  `scripts/verify-release-assets.sh` — which executes the native binary, so it
+  belongs in the job that has one — stages the release's assets into one
+  directory and uploads them as an artifact.
+- `publish` runs `main`'s checkout with `contents: write` and `actions: write`.
+  It treats the artifact strictly as data: it executes nothing out of it, runs no
+  script from the built ref, and checks every downloaded file name against
+  `scripts/edge-check-artifact.sh` before `gh release create` sees it. The tag is
+  created by `--target <built commit>`, so no git credential and no branch code
+  tags anything. Then it promotes the draft as a prerelease, prunes to the newest
+  five edge releases (`scripts/edge-prune.sh`, which only touches tags spelled
+  `edge-<digits>`), and dispatches `publish-pages.yml` on `main` rather than
+  calling it.
+
+Without that split, the branch's own scripts and goreleaser config run beside a
+token that could `gh release upload --clobber` a published release's binary and
+`checksums.txt` — which `publish-pages.yml` then signs.
+
+`scripts/edge-check-artifact.sh <dir> <run-number>` is a closed allow-list, not
+a filter: every entry must be a regular file directly in the directory (no
+subdirectory, no symlink — `gh release create` would upload what a symlink points
+at) and must be one of the four targets' raw binary and `.tar.gz`,
+`checksums.txt`, or `release.yaml`, with all four targets present under one
+component version. The run number comes from `github.run_number`, so a build
+cannot upload assets belonging to another run under this one's tag.
+`goreleaser --skip=publish` leaves the raw binary in a per-target directory under
+the name `tumika`, so the staging step reads the asset name it would have been
+uploaded under out of `dist/artifacts.json`, and copies `release.yaml` explicitly
+because `release.extra_files` is only read by the publish step that was skipped.
+
+A cancelled run can leave a draft behind; the draft is never published and can be
+deleted by hand. It leaves no tag: the tag comes with the release.
+
+**What makes a published release trustworthy is the signature on its BOM.** The
+BOM carries each asset's SHA-256, and the signature covers the exact bytes
+served, so a checksum fetched from the same host as the binary is not what the
+updater or the installer relies on. `checksums.txt` is an input to the
+generator, not a trust root.

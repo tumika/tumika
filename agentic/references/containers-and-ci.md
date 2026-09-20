@@ -49,3 +49,43 @@ third `type=raw` tag enabled only when the label carries no `-beta.`.
 `ci-build.yml`'s snapshot release build exports `TUMIKA_DAEMON_VERSION` only.
 `.goreleaser.yml` fails without it, and leaving `TUMIKA_RELEASE` unset keeps the
 snapshot on the `dev` label that `verify-release-assets.sh` asserts.
+
+## Publishing workflows
+
+Two workflows beyond `release.yml` publish the release host (ADR-0009):
+
+- **`publish-pages.yml`** builds the signed BOM tree with `tumika-bom`, assembles
+  it with `scripts/assemble-site.sh`, and deploys it to Pages. It runs on
+  `release: published`, weekly, on dispatch, and as a called workflow. Its top
+  level is `contents: read`; only the `deploy` job holds `pages: write` and
+  `id-token: write`, and it checks nothing out. Concurrency group `pages` is
+  never cancelled, so one deploy runs at a time.
+- **`edge.yml`** is dispatched on `main` and builds whatever its `ref` input
+  names. Its top level is `contents: read`; the `build` job that runs the named
+  ref's code stays at `contents: read`, and only the `publish` job — which runs
+  `main`'s checkout — holds `contents: write` and `actions: write`. Concurrency
+  group `edge`, never cancelled.
+
+`release.yml` ends in a `pages` job that calls `publish-pages.yml` (`uses:`,
+passing no secrets). The promote step publishes with `GITHUB_TOKEN`, which raises
+no workflow event, so the trigger would not fire on its own. A called workflow
+cannot hold more permission than its caller, so the job grants `contents: read`,
+`pages: write` and `id-token: write`.
+
+`edge.yml` does not call it. A called workflow runs at the caller's commit, and
+the day this workflow is dispatched anywhere but `main` that is the built
+branch's own `tumika-bom` source standing in front of the signing key. Its
+`publish` job (`actions: write`) dispatches `publish-pages.yml` on `main`
+instead. The signing key is a secret of the `release-signing` environment, whose
+deployment-branch policy admits only `main` and `v*.*.*` tags, so a run from any
+other branch cannot resolve it. The environment cannot tell whether a `v*.*.*`
+tag was cut from `main`, so a tag ruleset restricting who may create those tags
+is what closes the tag path.
+
+The branch being built never runs beside a write token: `edge.yml`'s `build` job
+holds `contents: read` and no credentials, and hands its output to the `publish`
+job as an artifact whose file names `scripts/edge-check-artifact.sh` validates
+against a closed allow-list before anything is uploaded.
+
+The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in
+`.github/` invokes them.

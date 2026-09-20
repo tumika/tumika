@@ -4,10 +4,10 @@
 # Three separate contracts run through these names, and none of them is checked
 # by the compiler or by `goreleaser check`:
 #
-#   - scripts/install.sh downloads
-#     `tumika_<daemon component version>_<os>_<arch>` and verifies it against
-#     checksums.txt
-#   - `tumika update` fetches the same raw asset (ADR-0003)
+#   - the BOM generator finds a release's assets by the prefix
+#     `tumika_<daemon component version>_`, and publishes each one's URL and
+#     SHA-256 to every daemon and to scripts/install-daemon.sh
+#   - `tumika update` fetches the raw asset the BOM names (ADR-0003)
 #   - both would fail at the NEXT RELEASE rather than here, on somebody else's
 #     machine, with no obvious cause
 #
@@ -47,7 +47,7 @@ NATIVE=""
 ok()   { echo "  ok: $*"; }
 
 [[ -f "$ARTIFACTS" ]] || fail "no $ARTIFACTS — did goreleaser run?"
-[[ -f "$CHECKSUMS" ]] || fail "no $CHECKSUMS; install.sh and the updater both verify against it"
+[[ -f "$CHECKSUMS" ]] || fail "no $CHECKSUMS; it is what anyone checking a download compares against"
 
 # The daemon component's version, from release.yaml — not from the build.
 VERSION=$("$(dirname "$0")/release-component-version.sh" daemon) \
@@ -92,7 +92,7 @@ a = json.load(open('$ARTIFACTS'))
 print(next((x['path'] for x in a
             if x.get('type') == 'Binary' and x.get('name') == '$asset'), ''))
 ")
-  [[ -n "$found" ]] || fail "no raw asset '$asset'; install.sh and \`tumika update\` both fetch it by that name, and release.yaml is what names it"
+  [[ -n "$found" ]] || fail "no raw asset '$asset'; the BOM generator finds it by that name and \`tumika update\` fetches it, and release.yaml is what names it"
   found=$(rebase "$found")
   [[ -f "$found" ]] || fail "the raw asset '$asset' is registered at $found, which does not exist"
 
@@ -105,7 +105,7 @@ print(next((x['path'] for x in a
     esac
   fi
 
-  # And it has to be verifiable, or install.sh refuses it.
+  # And it has to be checksummed, so a download can be verified by hand.
   want=$(awk -v a="$asset" '$2 == a { print $1 }' "$CHECKSUMS")
   [[ -n "$want" ]] || fail "no checksum for '$asset' in checksums.txt"
 

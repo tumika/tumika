@@ -1,0 +1,126 @@
+name: publish-pages
+
+# Publishes get.tumika.org: the signed bills of materials every daemon reads to
+# find an update, the daemon installer, and the static pages beside them.
+#
+# The repository must provide four things this workflow cannot create:
+#
+#   - Settings → Pages → Source = GitHub Actions. Any other source ignores the
+#     artifact this workflow uploads and keeps serving whatever is there.
+#   - A DNS CNAME for get.tumika.org pointing at the Pages host. The record that
+#     names the domain to Pages is scripts/site/CNAME, which every deploy
+#     republishes.
+#   - A tag ruleset restricting who may create `v*.*.*` tags. The environment
+#     below admits those tags, and nothing in this file can check that a tag was
+#     cut from main: a workflow at a tagged commit controls its own jobs. Who may
+#     create the tag is the control.
+#   - The environment `release-signing`, with its deployment-branch policy limited
+#     to `main` and `v*.*.*` tags, holding the secret TUMIKA_RELEASE_SIGNING_KEY:
+#     the PEM release signing key
+#     (SEC1 "EC PRIVATE KEY" or PKCS#8 "PRIVATE KEY", ECDSA P-256). tumika-bom
+#     reads it from the environment only — never an argument, never a file it
+#     names in an error — and refuses a key that is not among the keys compiled
+#     into the daemon.
+#
+# The BOMs are regenerated from the Releases API on every run rather than
+# accumulated, so a run always publishes the whole tree and a failed deploy is
+# recovered by re-running the workflow. That is safe because the generator reads
+# PUBLISHED releases only: a channel head can never point at a draft, and a
+# re-run after a release was deleted removes it from the site.
+on:
+  # After the release exists, not while it is a draft — a draft has no
+  # downloadable assets and the generator skips it.
+  release:
+    types: [published]
+  # Catches a release published while this workflow was broken, and republishes
+  # a site that was deployed from a bad run.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  # release.yml calls this one after it promotes a release. It passes no secrets:
+  # the signing key is an environment secret, resolved by the build job below
+  # under that environment's branch policy, so no caller can hand it over and
+  # none can be made to.
+  workflow_call:
+
+# Read-only at the top. Only the deploy job is elevated, and it holds no
+# checkout and runs no repository code — see its own permissions block.
+permissions:
+  contents: read
+
+# One site, one deploy at a time. Never cancelled: a cancelled deploy leaves
+# Pages serving the previous tree, and a run cancelled by a newer one that then
+# fails would leave the site behind both.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    # The signing key exists only in this environment, whose deployment-branch
+    # policy admits `main` and `v*.*.*` tags. A run from any other branch — an edge
+    # branch, a pushed workflow file — fails to resolve the secret instead of
+    # receiving it, and this job runs repository code (`go run ./cmd/tumika-bom`)
+    # with the key in its environment.
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: source/daemon/go.sum
+
+      # tumika-bom lives in the daemon's module so that it builds the documents
+      # with the same types the daemon parses them with. It signs each one,
+      # verifies the signature against the daemon's compiled-in key list, and
+      # reads the files back off disk before reporting success — so a tree that
+      # reaches the assemble step is one a daemon can open.
+      #
+      # -allow-skips is left at its default: a release that could not be
+      # published fails the run rather than quietly disappearing from the site.
+      - name: generate the signed bills of materials
+        working-directory: source/daemon
+        env:
+          TUMIKA_RELEASE_SIGNING_KEY: ${{ secrets.TUMIKA_RELEASE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: go run ./cmd/tumika-bom -out "$GITHUB_WORKSPACE/site-bom" -repo "$GITHUB_REPOSITORY"
+
+      # The installer is passed by path and lands as /install-daemon.sh. The
+      # script refuses a tree missing the installer, CNAME, index.html, a
+      # channel head, or any document's detached signature: each of those
+      # deploys cleanly and then answers wrongly, and Pages replaces the whole
+      # site on every deploy.
+      - name: assemble the site
+        run: scripts/assemble-site.sh site-bom scripts/install-daemon.sh scripts/site site
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    # The only elevated job in the file. It checks nothing out and runs nothing
+    # from the repository: it takes the artifact the build job produced and
+    # hands it to Pages. id-token is what deploy-pages exchanges for its
+    # deployment credential.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Runs here rather than in the build job because it talks to the Pages
+      # API, and the build job deliberately has no pages permission. Nothing the
+      # build produces depends on its outputs — the site is static files at the
+      # domain root.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

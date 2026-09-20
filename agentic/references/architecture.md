@@ -2,6 +2,8 @@
 
 ```
 source/daemon/cmd/tumika/                      # thin main: version var + cobra Execute
+source/daemon/cmd/tumika-bom/                  # CI-only: builds, signs and self-verifies the published BOM tree
+source/daemon/internal/bomgen/                 # pure BOM generation from the releases list; tumika-bom signs it
 source/daemon/internal/cli/                    # cobra commands (serve install status update token login config …)
 source/daemon/internal/daemon/                 # composition root: wiring, runner supervision, shutdown
 source/daemon/internal/api/                    # LAYER 1 — ServeMux routing, middleware, DTOs, SSE
@@ -31,7 +33,8 @@ docs/adr/                               # architecture decision records
 agentic/rules/                          # one prescriptive rule per file
 agentic/references/                     # deep-dive notes, read on demand — see References
 source/daemon/.golangci.yml                           # lint config (v2 schema) — depguard enforces layering
-.github/workflows/{ci,release}.yml
+.github/workflows/{ci,ci-build,release,edge,publish-pages}.yml
+scripts/                                # install-daemon.sh, site assembly, edge version/prune helpers
 ```
 
 ```
