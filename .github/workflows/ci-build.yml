@@ -221,6 +221,22 @@ jobs:
           cache: true
           cache-dependency-path: source/daemon/go.sum
 
+      # The daemon COMPONENT's semver, which .goreleaser.yml requires: it names
+      # every asset and stamps -X main.version, and an absent value fails the
+      # build with "map has no entry for key" rather than falling back to a
+      # guess. Assigned before it is written, because under `bash -e` a failing
+      # command substitution in an assignment fails the step while
+      # `echo "X=$(script)" >> "$GITHUB_ENV"` keeps echo's exit status.
+      #
+      # TUMIKA_RELEASE is deliberately left unset. This is the unlabelled
+      # snapshot path, and the verification below asserts the binary carries the
+      # "dev" default — which is what catches -X main.release no longer reaching
+      # the compiler, on every PR rather than at the next release.
+      - name: the daemon component version
+        run: |
+          version=$(scripts/release-component-version.sh daemon)
+          echo "TUMIKA_DAEMON_VERSION=$version" >> "$GITHUB_ENV"
+
       # release --snapshot, not build --snapshot: `build` produces no archives
       # and no checksums, which is most of what the next step verifies.
       # --skip=publish means nothing leaves the runner.

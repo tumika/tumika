@@ -130,19 +130,31 @@ jobs:
           cache: true
           cache-dependency-path: source/daemon/go.sum
 
-      # The release LABEL for `-X main.release`, exported for every step below.
+      # The release LABEL for `-X main.release` and the daemon COMPONENT's semver
+      # for `-X main.version` and every asset name, exported for every step
+      # below.
       #
-      # It comes from release.yaml, never from the tag: a tag names the component
-      # version, and a label the daemon rejects
-      # (release.ValidateReleaseLabel) makes every update check on the released
-      # binary return an error. scripts/release-label.sh fails the job when the
-      # file names no label the daemon accepts, so a release is never published
-      # carrying the "dev" default — which reads as "no release" and leaves the
-      # recency half of the channel rules with nothing to compare against.
-      - name: the release label
+      # Both come from release.yaml, never from the tag. The tag is the release
+      # label spelled `v<label>` — a zero-padded CalVer that is not semver, so a
+      # component version taken from it could never be compared by the updater —
+      # and a label the daemon rejects (release.ValidateReleaseLabel) makes every
+      # update check on the released binary return an error. Each script fails
+      # the job when release.yaml names no value of the shape it requires, so a
+      # release is never published carrying the "dev" default — which reads as
+      # "no release" and leaves the recency half of the channel rules with
+      # nothing to compare against.
+      #
+      # Each value is assigned before it is written: under `bash -e` a failing
+      # command substitution in an assignment fails the step, whereas
+      # `echo "X=$(script)" >> "$GITHUB_ENV"` keeps echo's exit status and
+      # exports an empty value instead.
+      - name: the release label and the daemon component version
         run: |
           label=$(scripts/release-label.sh)
           echo "TUMIKA_RELEASE=$label" >> "$GITHUB_ENV"
+
+          version=$(scripts/release-component-version.sh daemon)
+          echo "TUMIKA_DAEMON_VERSION=$version" >> "$GITHUB_ENV"
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
@@ -175,10 +187,23 @@ jobs:
 
       # Promoted only now. This is the step that makes the release public and
       # moves /releases/latest onto it.
+      #
+      # The prerelease flag is passed explicitly because goreleaser's
+      # `prerelease: auto` cannot be templated — it can only read the tag — and
+      # this flag is the value the release ends up with whatever goreleaser
+      # inferred. It comes from the release label, the same source as everything
+      # else this job publishes: a beta label carries `-beta.`, and promoting one
+      # as a full release would move /releases/latest, and therefore the
+      # documented releases/latest/download/install.sh URL, onto a beta.
       - name: publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: |
+          prerelease=false
+          case "$TUMIKA_RELEASE" in
+            *-beta.*) prerelease=true ;;
+          esac
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease="$prerelease"
 
   # Published AFTER goreleaser, so a release never exists with an image tag that
   # points at nothing — the release notes tell people to pull it.
@@ -205,43 +230,62 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/tumika/tumika
-          tags: |
-            type=semver,pattern=v{{version}}
-            # type=raw is UNCONDITIONAL, unlike type=semver with latest=auto, so
-            # without this guard pushing v1.0.0-rc1 would move :latest onto the
-            # RC — and :latest is the tag this release's own notes tell people to
-            # run. A prerelease tag is the one with a hyphen in it.
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-
-      # The version WITHOUT its leading v, and a real timestamp.
+      # The daemon COMPONENT's semver, the release LABEL, and a real timestamp.
+      # It runs before the metadata step because the image's tags are those two
+      # values rather than the git tag.
       #
-      # goreleaser's {{ .Version }} strips the v, so passing github.ref_name
-      # made the image's binary report "tumika v0.1.0" while the released binary
-      # reported "tumika 0.1.0" for the same tag. ADR-0003 makes that string part
-      # of the update contract, and deploy/verify-image.sh only asserts the
-      # "tumika " prefix, so nothing would have caught the drift.
+      # The version is the component semver from release.yaml, not the tag with
+      # its leading v stripped: the tag is the CalVer release label, so stamping
+      # it here would make the image's binary report a version the updater's
+      # parseVersion cannot compare, while the release archives reported the
+      # component semver for the same tag. ADR-0003 makes that string part of the
+      # update contract, and deploy/verify-image.sh only asserts the "tumika "
+      # prefix, so nothing would catch the drift.
+      #
+      # The label is the same source the goreleaser job stamps into the published
+      # binaries, so the image and the release archives report the same label for
+      # the same tag. Each script fails the job rather than yielding an empty
+      # value, which would override the Dockerfile's own defaults with something
+      # that validates as neither.
       #
       # github.event.repository.updated_at is not a build date at all: it moves
       # when the description or topics change, and is identical for every image
       # built from the same tag.
-      #
-      # The release label is emitted separately, from release.yaml through
-      # scripts/release-label.sh — the same source the goreleaser job stamps into
-      # the published binaries, so the image and the release archives report the
-      # same label for the same tag. The script fails the job rather than
-      # yielding an empty RELEASE, which would override the Dockerfile's own
-      # default with a label that validates as neither.
       - id: buildmeta
         run: |
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          version=$(scripts/release-component-version.sh daemon)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
           release=$(scripts/release-label.sh)
           echo "release=$release" >> "$GITHUB_OUTPUT"
+
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+          # :latest follows a stable release only. Derived from the label, which
+          # spells a prerelease `-beta.` — `!contains(github.ref_name, '-')` is
+          # equally correct because the tag is v<label>, but every other value in
+          # this job comes from release.yaml and this one does too.
+          latest=true
+          case "$release" in
+            *-beta.*) latest=false ;;
+          esac
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/tumika/tumika
+          # Two raw tags, not type=semver: the git tag is a zero-padded CalVer
+          # label, which type=semver cannot parse, and it is not what identifies
+          # the image either. An image is addressed by the daemon component's
+          # semver, and by the label of the release it shipped in.
+          tags: |
+            type=raw,value=${{ steps.buildmeta.outputs.version }}
+            type=raw,value=${{ steps.buildmeta.outputs.release }}
+            # type=raw is UNCONDITIONAL, unlike type=semver with latest=auto, so
+            # without this guard publishing a beta would move :latest onto it —
+            # and :latest is the tag this release's own notes tell people to run.
+            type=raw,value=latest,enable=${{ steps.buildmeta.outputs.latest }}
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
