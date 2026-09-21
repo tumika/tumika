@@ -175,11 +175,19 @@ good_set 0.1.0 0.0.9
 run_check "$CASE_DIR" 0.1.0
 expect_fail a-bundle-of-another-version "reports CFBundleShortVersionString 0.0.9, not 0.1.0"
 
-# Tauri strips a prerelease segment from CFBundleShortVersionString, so a beta
-# component version is compared on its core.
+# The bundler writes a prerelease into CFBundleShortVersionString as given; one
+# that strips it leaves the core. Either matches the asset name.
 good_set 0.1.0-beta.1 0.1.0
 run_check "$CASE_DIR" 0.1.0-beta.1
-expect_pass a-prerelease-component-version
+expect_pass a-prerelease-component-version-reduced-to-its-core
+
+good_set 0.1.0-edge.1
+run_check "$CASE_DIR" 0.1.0-edge.1
+expect_pass a-prerelease-component-version-kept-whole
+
+good_set 0.1.0-edge.1 0.1.0-edge.2
+run_check "$CASE_DIR" 0.1.0-edge.1
+expect_fail a-prerelease-bundle-of-another-build "reports CFBundleShortVersionString 0.1.0-edge.2, not 0.1.0-edge.1"
 
 good_set 0.1.0
 printf 'x\n' > "$CASE_DIR/install-app.sh"

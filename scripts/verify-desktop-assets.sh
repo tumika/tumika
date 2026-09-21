@@ -16,9 +16,10 @@
 #
 #   - the archive is a regular file, non-empty, and a gzip tar
 #   - it contains `Tumika.app/Contents/Info.plist`, whose
-#     CFBundleShortVersionString is the component version. Tauri strips a
-#     prerelease segment from that key — it must be three dot-separated integers
-#     — so a beta or edge component version is compared on its core alone.
+#     CFBundleShortVersionString is the component version. The bundler writes
+#     the version as given, prerelease included, and a bundler that strips the
+#     segment leaves the core, so a beta or edge component version matches
+#     either spelling and nothing else.
 #   - the `.sig` beside it holds a minisign signature. Tauri writes the base64 of
 #     the minisign document, and bomgen copies that text verbatim into the BOM's
 #     `signature` field, so an empty or truncated file is a signature the updater
@@ -84,7 +85,7 @@ done
 # set of names no client resolves.
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
   || fail "'$VERSION' is not a component version (X.Y.Z[-prerelease])"
-# Info.plist carries the core alone; see the header.
+# Info.plist carries the version or its core; see the header.
 CORE="${VERSION%%-*}"
 
 [[ -d "$DIR" ]] || fail "no directory '$DIR'; it is where the build stages the renamed bundle"
@@ -148,8 +149,8 @@ check_archive() {
     ok "$name — gzip tar carrying $member, whose CFBundleShortVersionString no tool here could read and which is therefore not asserted"
     return
   fi
-  [[ "$got" == "$CORE" ]] \
-    || fail "'$name' reports CFBundleShortVersionString $got, not $CORE; the asset name says the app is $VERSION, so either release.yaml never reached tauri.conf.json or the archive is from another build"
+  [[ "$got" == "$VERSION" || "$got" == "$CORE" ]] \
+    || fail "'$name' reports CFBundleShortVersionString $got, not $VERSION; the asset name says the app is $VERSION, so either release.yaml never reached tauri.conf.json or the archive is from another build"
   ok "$name — gzip tar whose bundle reports $got"
 }
 
