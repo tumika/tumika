@@ -31,8 +31,8 @@ use p256::pkcs8::DecodePublicKey;
 /// that adds the next key is itself signed by a key already here.
 const RELEASE_KEY_PEMS: &[&str] = &[concat!(
     "-----BEGIN PUBLIC KEY-----\n",
-    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb1Q/ZY2pcax1kXsEG/6Xt9uOMqMd\n",
-    "924/2yXhfcMZ6CtT8UTPkUko9fxiEcyPS81LHMMuHjN1IYHxO+6bee6iZA==\n",
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGgmfTHgWRmKZRGo7FrLeAEPcr7y1\n",
+    "v7rAq2l1R6qbrMFeBxyiaU4+XvOuP1THEIJjk8y5dqM6zzMgh2LydpLZ/g==\n",
     "-----END PUBLIC KEY-----\n",
 )];
 
