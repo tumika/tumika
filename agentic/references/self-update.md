@@ -7,7 +7,7 @@ memory.
 
 ```
 apply:  head+rule → fetch+verify → PRE-FLIGHT → mark pending → keep .old → rename → exit 0
-boot:   ConfirmBoot → (serving) Confirm → confirmed
+boot:   serve only: ConfirmBoot → (serving) Confirm → confirmed
                     → 3 failed boots → restore .old → rolled_back → exit 0
 ```
 
@@ -30,6 +30,21 @@ Four orderings carry the whole safety property, and each is mutation-checked:
 - **`Confirm` runs once the daemon is SERVING**, not merely constructed — and
   only then deletes `.old`. A binary that starts and then fails every request has
   proven nothing.
+- **Only `serve` resolves a boot, and only the updated build confirms it.** CLI
+  processes set `daemon.Options.SkipUpdateBoot`. `Confirm` refuses with
+  `service.ErrNotTheUpdatedBuild` unless the running component version equals the
+  pending row's `to_version`, leaving the row `pending` and `.old` kept.
+
+## Applying and restarting (ADR-0012)
+
+`update.auto_apply` defaults to true, so an install with the key unset applies at
+its next check; the desktop app follows the daemon's release (ADR-0011) and moves
+with it. `tumika update` then restarts the service when it is installed and
+running (Stop, then Start); `--no-restart` skips. If the replaced binary is not
+the managed copy it warns (`tumika install`) and does not restart. Stop ok plus
+Start failed exits non-zero. A newer CLI against an older running daemon can
+migrate the schema, so the old daemon can crash-loop on the schema-version guard
+until `install` is re-run.
 
 ## Channels and the update rule
 

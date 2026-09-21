@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, the PATH-symlink and restart-instruction parts superseded by ADR-0012
 date: 2026-08-14
 ---
 
