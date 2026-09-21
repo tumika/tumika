@@ -17,8 +17,8 @@ trap 'rm -rf "$WORK"' EXIT
 failures=0
 
 # Builds a complete, valid case under $WORK/<case>: a BOM tree with one channel
-# head and one release, an installer, and the repo's own static files. Each case
-# then removes or corrupts the one thing it is about.
+# head and one release, both installers, and the repo's own static files. Each
+# case then removes or corrupts the one thing it is about.
 new_case() {
   local case="$1"
   local dir="$WORK/$case"
@@ -30,7 +30,8 @@ new_case() {
   echo 'signature' > "$dir/bom/releases/2026.09.00.json.sig"
 
   printf '#!/bin/sh\necho install\n' > "$dir/install-daemon.sh"
-  chmod +x "$dir/install-daemon.sh"
+  printf '#!/bin/sh\necho install app\n' > "$dir/install-app.sh"
+  chmod +x "$dir/install-daemon.sh" "$dir/install-app.sh"
 
   cp "$HERE/site/CNAME" "$HERE/site/index.html" "$dir/static/"
 }
@@ -41,7 +42,7 @@ run_case() {
   local case="$1"
   local dir="$WORK/$case"
   set +e
-  RUN_OUT=$("$SCRIPT" "$dir/bom" "$dir/install-daemon.sh" "$dir/static" "$dir/site" 2>&1)
+  RUN_OUT=$("$SCRIPT" "$dir/bom" "$dir/install-daemon.sh" "$dir/install-app.sh" "$dir/static" "$dir/site" 2>&1)
   RUN_STATUS=$?
   set -e
 }
@@ -82,7 +83,7 @@ expect_fail() {
 new_case complete
 expect_pass complete "1 channel head(s)"
 site="$WORK/complete/site"
-for want in CNAME index.html install-daemon.sh \
+for want in CNAME index.html install-daemon.sh install-app.sh \
   channels/stable.json channels/stable.json.sig \
   releases/2026.09.00.json releases/2026.09.00.json.sig; do
   if [[ ! -f "$site/$want" ]]; then
@@ -90,8 +91,17 @@ for want in CNAME index.html install-daemon.sh \
     failures=$((failures + 1))
   fi
 done
-if [[ ! -x "$site/install-daemon.sh" ]]; then
-  echo "FAIL - complete: install-daemon.sh is not executable"
+for installer in install-daemon.sh install-app.sh; do
+  if [[ ! -x "$site/$installer" ]]; then
+    echo "FAIL - complete: $installer is not executable"
+    failures=$((failures + 1))
+  fi
+done
+# Both installers are documented by name, so each has to be the file passed for
+# it: one copied over the other serves a daemon install to someone asking for
+# the app.
+if [[ "$(cat "$site/install-app.sh")" == "$(cat "$site/install-daemon.sh")" ]]; then
+  echo "FAIL - complete: install-app.sh and install-daemon.sh are the same file"
   failures=$((failures + 1))
 fi
 if [[ "$(cat "$site/CNAME")" != "get.tumika.org" ]]; then
@@ -99,11 +109,15 @@ if [[ "$(cat "$site/CNAME")" != "get.tumika.org" ]]; then
   failures=$((failures + 1))
 fi
 
-# The installer is named by path because it is produced elsewhere; an absent one
+# An installer is named by path because it is produced elsewhere; an absent one
 # is the case worth saying plainly.
-new_case no-installer
-rm "$WORK/no-installer/install-daemon.sh"
-expect_fail no-installer "is not a file"
+new_case no-daemon-installer
+rm "$WORK/no-daemon-installer/install-daemon.sh"
+expect_fail no-daemon-installer "serves it as /install-daemon.sh"
+
+new_case no-app-installer
+rm "$WORK/no-app-installer/install-app.sh"
+expect_fail no-app-installer "serves it as /install-app.sh"
 
 new_case no-cname
 rm "$WORK/no-cname/static/CNAME"
@@ -149,11 +163,11 @@ mkdir -p "$WORK/out-exists/site"
 expect_fail out-exists "already exists"
 
 set +e
-usage=$("$SCRIPT" one two three 2>&1)
+usage=$("$SCRIPT" one two three four 2>&1)
 usage_status=$?
 set -e
 if [[ "$usage_status" -eq 0 || "$usage" != *"usage:"* ]]; then
-  echo "FAIL - arity: three arguments should be refused with a usage line"
+  echo "FAIL - arity: four arguments should be refused with a usage line"
   failures=$((failures + 1))
 else
   echo "ok   - arity"
