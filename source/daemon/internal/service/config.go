@@ -63,7 +63,7 @@ var settingDefinitions = []domain.SettingDefinition{
 		Key:         KeyUpdateAutoApply,
 		Kind:        domain.SettingBool,
 		Description: "Apply an available update automatically rather than waiting to be told.",
-		Default:     json.RawMessage(`false`),
+		Default:     json.RawMessage(`true`),
 	},
 	{
 		Key:         KeyUpdateChannel,

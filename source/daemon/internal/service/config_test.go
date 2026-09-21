@@ -311,7 +311,7 @@ func TestListReturnsEveryKnownSettingOrdered(t *testing.T) {
 			if !v.IsSet || string(v.Value) != "true" {
 				t.Errorf("stored value not reflected: %+v", v)
 			}
-			if string(v.Default) != "false" {
+			if string(v.Default) != "true" {
 				t.Errorf("Default = %s, want the definition's default even when set", v.Default)
 			}
 		}
