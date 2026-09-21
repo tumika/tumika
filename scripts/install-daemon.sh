@@ -262,7 +262,16 @@ if ! printf '%s\n' "$WANT" | grep -Eq '^[0-9a-f]{64}$'; then
 fi
 
 echo "downloading tumika ${COMPONENT_VERSION} from release ${DOC_RELEASE} (${OS}/${ARCH})..."
-if ! curl -fsSL -o "$STAGE/tumika" "$ASSET_URL"; then
+# The binary is the one large download, and a slow link makes a silent transfer
+# look like a hang. A progress bar goes to stderr, which is the terminal even
+# under `curl … | sh`; with no terminal the transfer stays silent so a log or a
+# pipe is not filled with bar redraws.
+if [ -t 2 ]; then
+  fetch_binary() { curl --fail --show-error --location --progress-bar "$@"; }
+else
+  fetch_binary() { curl -fsSL "$@"; }
+fi
+if ! fetch_binary -o "$STAGE/tumika" "$ASSET_URL"; then
   echo "error: release $DOC_RELEASE names $ASSET_URL, which could not be downloaded" >&2
   exit 1
 fi
