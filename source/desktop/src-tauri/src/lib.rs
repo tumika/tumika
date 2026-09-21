@@ -1,5 +1,7 @@
+pub mod bomsig;
 mod health;
 mod keychain;
+pub mod pairing;
 mod status;
 
 use std::sync::Mutex;

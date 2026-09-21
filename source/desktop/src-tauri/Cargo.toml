@@ -34,6 +34,19 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 
+# Pure Rust ECDSA P-256, for the signature over a bill of materials. `pem`
+# reads the compiled-in public keys; nothing here signs, so no private-key
+# feature is enabled.
+p256 = { version = "0.14", default-features = false, features = [
+    "ecdsa",
+    "pem",
+    "std",
+] }
+
+# The release label pattern is a copy of the daemon's Go regexp, so it is
+# matched by a regexp engine of the same dialect rather than re-spelled by hand.
+regex = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
 
