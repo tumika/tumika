@@ -37,11 +37,10 @@ on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
-  # release.yml calls this one after it promotes a release. It passes no secrets:
-  # the signing key is an environment secret, resolved by the build job below
-  # under that environment's branch policy, so no caller can hand it over and
-  # none can be made to.
-  workflow_call:
+  # release.yml and edge.yml dispatch this one on main after they promote a
+  # release. The signing key is an environment secret, resolved by the build job
+  # below under that environment's branch policy, so no caller can hand it over
+  # and none can be made to.
 
 # Read-only at the top. Only the deploy job is elevated, and it holds no
 # checkout and runs no repository code — see its own permissions block.

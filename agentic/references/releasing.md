@@ -118,12 +118,13 @@ label.
 `publish-pages.yml` listens for `release: published`, but the promote step
 publishes with the default `GITHUB_TOKEN` and GitHub raises no workflow event
 for anything that token does — so after a real release that trigger never fires.
-The `pages` job calls the workflow directly (`uses:`, passing no secrets),
-after both the promote step and the image push. A called workflow cannot hold
-more permission than the job calling it, so that job grants the `pages: write`
-and `id-token: write` its deploy job needs while the top of `release.yml` stays
-read-only. The weekly schedule and `workflow_dispatch` on `publish-pages.yml`
-remain the recovery paths.
+The `pages` job dispatches the workflow on `main` (`gh workflow run`, which
+`GITHUB_TOKEN` may do), after both the promote step and the image push. It does
+not call the workflow with `uses:`, because the signing environment's secret
+arrives empty in a called workflow. The dispatch returns once the run is queued,
+so a failed site publish shows on the `publish-pages` run, not on the release
+run. The weekly schedule and `workflow_dispatch` on `publish-pages.yml` remain
+the recovery paths.
 
 **A first install and a self-update share one trust chain.**
 `scripts/install-daemon.sh` is served from `https://get.tumika.org`, never
