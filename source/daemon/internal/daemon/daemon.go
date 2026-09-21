@@ -69,6 +69,18 @@ type Options struct {
 	// never exercised until a real release runs them on someone's machine.
 	Updates service.UpdateService
 
+	// SkipUpdateBoot leaves the previous update unresolved: no boot attempt is
+	// counted, nothing is rolled back.
+	//
+	// Set by the CLI's in-process helper, because a boot attempt is evidence
+	// about the process that SERVES, and a command that opens the database and
+	// exits proves nothing about it. Counting one there is enough for three
+	// ordinary `tumika` invocations after an update to reach MaxBootAttempts
+	// and roll it back from inside a CLI process — renaming .old over the
+	// executable that very process is running, with no daemon ever having had a
+	// chance to boot on the update.
+	SkipUpdateBoot bool
+
 	// TokenCustody is the platform secret store the minted API token is handed
 	// to. Nil means store nothing.
 	//
@@ -159,7 +171,7 @@ func New(ctx context.Context, opts Options) (*Daemon, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	if updates != nil {
+	if updates != nil && !opts.SkipUpdateBoot {
 		rolledBack, bootErr := updates.ConfirmBoot(ctx)
 		if bootErr != nil {
 			// Not fatal on its own: a daemon that cannot read its update row can
@@ -414,9 +426,11 @@ func (d *Daemon) ServeListener(ctx context.Context, listener net.Listener) error
 	// to call keeps a stale .old forever, which is its own failure.
 	if d.updates != nil {
 		if err := d.updates.Confirm(ctx); err != nil {
-			// A stale .old is worth saying out loud: the next Apply refuses to
-			// overwrite it, so an update would be blocked until it is removed.
-			d.log.WarnContext(ctx, "the update was confirmed but its fallback remains", "err", err)
+			// Not fatal, and worth saying out loud either way. Confirm refuses
+			// when this build is not the one the pending update installed, and
+			// otherwise reports a fallback it could not delete — which the next
+			// Apply refuses to overwrite, blocking updates until it is removed.
+			d.log.WarnContext(ctx, "the pending update was not fully resolved", "err", err)
 		}
 	}
 

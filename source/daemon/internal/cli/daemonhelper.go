@@ -25,6 +25,10 @@ func withDaemon(g *globals, cmd *cobra.Command, fn func(*daemon.Daemon) error) e
 		// `token rotate` and `install` reach the platform secret store from a
 		// real invocation and from nowhere else.
 		TokenCustody: g.tokenCustody,
+		// A CLI command is not a boot of the daemon. Only `serve` resolves the
+		// previous update, so an ordinary command can neither count a boot
+		// attempt against a pending update nor roll one back underneath itself.
+		SkipUpdateBoot: true,
 	})
 	if err != nil {
 		return err
