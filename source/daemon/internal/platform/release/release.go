@@ -35,6 +35,14 @@ const DefaultBaseURL = "https://get.tumika.org"
 // materials.
 const DaemonComponent = "daemon"
 
+// DesktopComponent is the component name the desktop app is published under.
+//
+// Nothing in the daemon reads this component: the app resolves its own entry out
+// of the bill of materials of the release the daemon it talks to is running. The
+// name lives here because the publisher and the app must spell it identically,
+// and the publisher is built from this package.
+const DesktopComponent = "desktop"
+
 // signatureSuffix names the detached signature beside a document: the channel
 // head is `<base>/channels/<channel>.json` and its signature is that same path
 // with this appended.

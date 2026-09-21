@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
-# Fails when a component version in release.yaml does not advance past the one
-# the most recently published release carries.
+# Fails when a component version in release.yaml sits below the one the most
+# recently published release carries, and reports which components changed.
 #
 # The BOM reader never auto-downgrades: a stable or beta client takes the
 # channel head only when its component version compares greater than the one it
-# runs. A release that repeats or lowers a component version therefore publishes
-# a head nobody moves onto — it installs cleanly, it is announced, and every
-# daemon silently stays where it is. Nothing downstream can detect that, so the
+# runs. A release that lowers a component version therefore publishes a head
+# nobody moves onto — it installs cleanly, it is announced, and every daemon
+# silently stays where it is. Nothing downstream can detect that, so the
 # comparison happens here, before anything is built.
 #
-# Every component listed in release.yaml must advance in each release: an
-# unchanged component cannot be listed with its old version.
+# An unchanged component is carried over instead of rebuilt, and carrying it
+# over means repeating its version: the release's BOM entry names the earlier
+# release's asset, so the same bytes are never republished under a second
+# component version. An equal version is therefore the definition of unchanged
+# and passes; a component release.yaml names for the first time has nothing to
+# compare against and counts as changed.
+#
+# The components that did change are reported, so a workflow builds only those:
+#
+#   - a single `changed=daemon,desktop` line on stdout — the only line of that
+#     shape, and `changed=` alone when nothing changed;
+#   - the same `changed=<list>` appended to $GITHUB_OUTPUT when that variable is
+#     set, which makes it the step output `changed`.
+#
+# verify-release-assets.sh reads that list back out of
+# TUMIKA_CHANGED_COMPONENTS, so a release that carries the daemon over is not
+# asked for daemon assets it never built.
 #
 # The previous release is found through the Releases API rather than through git
 # tags: a tag exists the moment it is pushed, while what clients can reach is
@@ -93,6 +108,42 @@ semver_cmp() {
   echo 0
 }
 
+# Every entry of the top-level `components:` block, in the same shape
+# validate-release.sh reads them. Read before the release list, because the paths
+# that find nothing to compare against still have to report every component as
+# changed.
+names=$(awk '
+  /^components:/ { inblock = 1; next }
+  /^[^[:space:]#]/ { inblock = 0 }
+  inblock && /^[[:space:]]+[^[:space:]#]/ {
+    line = $0
+    sub(/^[[:space:]]+/, "", line)
+    n = index(line, ":")
+    if (n > 0) print substr(line, 1, n - 1)
+  }
+' "$FILE")
+[[ -n "$names" ]] || fail "no components under 'components:' in $FILE"
+
+# The components this release rebuilds. Emitted on every passing path, because a
+# caller that gets no list cannot tell "nothing changed" from "the gate did not
+# say", and would have to guess which build jobs to run.
+changed=()
+emit_changed() {
+  local list
+  list="$(IFS=,; printf '%s' "${changed[*]:-}")"
+  echo "changed=$list"
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "changed=$list" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+all_changed() {
+  local name
+  while IFS= read -r name; do
+    changed+=("$name")
+  done <<< "$names"
+}
+
 # The tag of the release being cut. validate-release.sh has already refused a
 # tag that disagrees with the label, so this is the tag GitHub will carry — and
 # it is excluded below, because comparing a release against itself would reject
@@ -130,6 +181,8 @@ done <<< "$releases"
 
 if [[ -z "$prev_tag" ]]; then
   echo "no published release to compare against; every component version in $FILE is a first"
+  all_changed
+  emit_changed
   exit 0
 fi
 
@@ -146,6 +199,8 @@ assets=$(gh release view "$prev_tag" --json assets --jq '.assets[].name') \
 
 if ! grep -Fxq release.yaml <<< "$assets"; then
   echo "$prev_tag carries no release.yaml asset; no component version to compare against"
+  all_changed
+  emit_changed
   exit 0
 fi
 
@@ -153,30 +208,26 @@ gh release download "$prev_tag" --pattern release.yaml --dir "$tmp" >/dev/null \
   || fail "could not download release.yaml from $prev_tag"
 [[ -f "$tmp/release.yaml" ]] || fail "release.yaml downloaded from $prev_tag is missing"
 
-# Every entry of the top-level `components:` block of the new file, in the same
-# shape validate-release.sh reads them.
-names=$(awk '
-  /^components:/ { inblock = 1; next }
-  /^[^[:space:]#]/ { inblock = 0 }
-  inblock && /^[[:space:]]+[^[:space:]#]/ {
-    line = $0
-    sub(/^[[:space:]]+/, "", line)
-    n = index(line, ":")
-    if (n > 0) print substr(line, 1, n - 1)
-  }
-' "$FILE")
-[[ -n "$names" ]] || fail "no components under 'components:' in $FILE"
-
 while IFS= read -r name; do
   new=$("$HERE/release-component-version.sh" "$name" "$FILE")
   if ! old=$("$HERE/release-component-version.sh" "$name" "$tmp/release.yaml" 2>/dev/null); then
     echo "$name $new is new since $prev_tag"
+    changed+=("$name")
     continue
   fi
-  if [[ "$(semver_cmp "$new" "$old")" != "1" ]]; then
-    fail "component '$name' is $new in $FILE and $old in $prev_tag; a released component version must compare greater than the last published one"
-  fi
-  echo "$name $old -> $new"
+  case "$(semver_cmp "$new" "$old")" in
+    1)
+      echo "$name $old -> $new"
+      changed+=("$name")
+      ;;
+    0)
+      echo "$name $new unchanged since $prev_tag"
+      ;;
+    *)
+      fail "component '$name' is $new in $FILE and $old in $prev_tag; a released component version never compares lower than the last published one — repeat it to carry the component over, or advance it"
+      ;;
+  esac
 done <<< "$names"
 
-echo "release.yaml advances every component version past $prev_tag"
+echo "every component version in release.yaml is at or past $prev_tag"
+emit_changed

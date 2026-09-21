@@ -53,17 +53,18 @@ without a release.
   calling it, so a called workflow can never run the built ref's `tumika-bom` source with the
   signing key.
 
-- **No branch-controlled code runs in a job holding a write token.** `edge.yml` splits in two.
-  `build` checks out the named ref with `persist-credentials: false`, holds `contents: read`,
-  runs that ref's scripts, goreleaser (`--skip=publish`, no token) and
-  `verify-release-assets.sh`, tags only locally, and uploads the release's assets as an
-  artifact. `publish` runs `main`'s checkout with `contents: write` and `actions: write`, treats
-  the artifact strictly as data — it executes nothing out of it and runs no script from the
-  built ref — validates every downloaded file name against `scripts/edge-check-artifact.sh`, and
-  creates the release with `gh release create --target <built commit>`, which is what writes the
-  tag. Undivided, the built branch's own `edge-version.sh` and `.goreleaser.yml` would run
-  beside a token able to `gh release upload --clobber` over a published release's binary and
-  `checksums.txt`, which `publish-pages.yml` then signs.
+- **No branch-controlled code runs in a job holding a write token or a signing key.** `edge.yml`
+  splits in four. `build` and `desktop` check out the named ref with `persist-credentials:
+  false`, hold `contents: read` and no secret, run that ref's scripts, goreleaser
+  (`--skip=publish`, no token) and `verify-release-assets.sh`, and upload their output as
+  artifacts; `build` tags only locally. `sign` runs `main`'s checkout and signs the desktop
+  archives with the updater key, executing nothing from the artifact. `publish` runs `main`'s
+  checkout with `contents: write` and `actions: write`, treats the artifacts strictly as data,
+  validates every downloaded file name against `scripts/edge-check-artifact.sh`, and creates the
+  release with `gh release create --target <built commit>`, which is what writes the tag.
+  Undivided, the built branch's own `edge-version.sh` and `.goreleaser.yml` would run beside a
+  token able to `gh release upload --clobber` over a published release's binary and
+  `checksums.txt`, which `publish-pages.yml` then signs. ADR-0010 covers the desktop half.
 
 - **The installer verifies before it trusts.** `scripts/install-daemon.sh` is served from the
   site, not attached to a release. It verifies the BOM's signature with `openssl` against a

@@ -6,8 +6,17 @@ on:
       - "v*.*.*"
 
 # Read-only at the top, elevated per JOB to the minimum each one needs:
-# `contents: write` for goreleaser to publish the release, `packages: write` for
-# the ghcr push. The gate job gets neither.
+# `contents: write` for the jobs that write the draft and publish it,
+# `packages: write` for the ghcr push. The gate and the desktop build get
+# neither.
+#
+# The desktop build is why the write token and the signing keys are in different
+# jobs. It holds the Tauri updater's private key and, when they exist, the Apple
+# certificate and notarization credentials, and it runs pnpm, cargo and a bundler
+# over a dependency graph nobody here audits. A `contents: write` token beside
+# that could `gh release upload --clobber` over a published release's assets,
+# which publish-pages.yml then signs. It hands its output on as a workflow
+# artifact instead, and the jobs that attach and publish hold no signing secret.
 #
 # A release workflow holds the most powerful token in the repository, and it runs
 # on a tag — which is exactly the trigger somebody would reach for.
@@ -32,6 +41,13 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
+    outputs:
+      # The components whose version rose or is new, as
+      # scripts/check-release-monotonic.sh reports them. Every job below reads
+      # it: a component this release carries over is not rebuilt, so the jobs
+      # that would rebuild it do not run, and the one that verifies the daemon's
+      # assets is told not to ask for assets no build produced.
+      changed: ${{ steps.monotonic.outputs.changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,6 +83,7 @@ jobs:
       # contents: read is all this needs — it reads the release list and one
       # asset of an already-published release.
       - name: every component version advances past the last published release
+        id: monotonic
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -111,9 +128,17 @@ jobs:
       - name: install under a real systemd
         run: deploy/testharness/verify.sh
 
+  # Only when this release changes the daemon. A release that carries the daemon
+  # over publishes no daemon assets at all: its bill of materials points the
+  # daemon entry at the earlier release's asset, so rebuilding would republish
+  # identical bytes under the same component version.
+  #
+  # The list is matched comma-delimited on both sides, so a component whose name
+  # merely contains another's cannot satisfy it.
   goreleaser:
     name: goreleaser
     needs: gate
+    if: ${{ contains(format(',{0},', needs.gate.outputs.changed), ',daemon,') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -163,22 +188,331 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # goreleaser published a DRAFT (see .goreleaser.yml). Nothing below is
-      # downloadable until the promote step at the end, so a failure here leaves
-      # a draft to delete rather than a broken release people can install.
+      # goreleaser published a DRAFT (see .goreleaser.yml). Nothing is
+      # downloadable until the promote job, so a failure here leaves a draft to
+      # delete rather than a broken release people can install.
+      #
+      # The changed list is passed through because the script skips its
+      # assertions for a carried-over daemon, and an ABSENT list means the daemon
+      # changed. Passing it keeps this job's claim the same claim the gate made,
+      # rather than one that happens to agree because this job only runs when the
+      # daemon changed.
       - name: the release ships what the updater and installer expect
+        env:
+          TUMIKA_CHANGED_COMPONENTS: ${{ needs.gate.outputs.changed }}
         run: scripts/verify-release-assets.sh
 
-      # release.yaml is delivered by `release.extra_files`, so it never appears
-      # under dist/ and the script above cannot see it; checksums.txt is
-      # uploaded by goreleaser itself. The next release's gate downloads this
-      # release's release.yaml to enforce that every component version advances,
-      # so losing the extra_files line would leave every check here green and
-      # disarm that gate one release later — the draft's asset list is what gets
-      # asked instead.
-      - name: the release carries the assets the next one depends on
+  # The macOS tray app, as the release component it is. Every asset name, the
+  # updater signature and the Info.plist version are asserted by
+  # scripts/verify-desktop-assets.sh before anything leaves this job.
+  #
+  # `contents: read`: this is the job that holds the signing keys, and it uploads
+  # a workflow artifact rather than a release asset. See the note at the top.
+  #
+  # macos-latest is not a preference — Tauri links against WebKit and AppKit, and
+  # the app is macOS-only by design. Both architectures are built with `--target`
+  # on that one runner: an Intel Mac is a machine somebody already runs the daemon
+  # on, and a missing platform is one the app's updater finds no asset for.
+  desktop:
+    name: desktop (${{ matrix.target.platform }})
+    needs: gate
+    if: ${{ contains(format(',{0},', needs.gate.outputs.changed), ',desktop,') }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      # Neither leg is a preview of the other: the pair is what the release
+      # publishes, and seeing both failures is worth more than stopping early.
+      fail-fast: false
+      matrix:
+        target:
+          - { triple: aarch64-apple-darwin, platform: darwin_arm64 }
+          - { triple: x86_64-apple-darwin, platform: darwin_amd64 }
+    env:
+      TRIPLE: ${{ matrix.target.triple }}
+      PLATFORM: ${{ matrix.target.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # pnpm before setup-node: `cache: pnpm` asks node to locate the pnpm
+      # store, which only works once pnpm is on PATH. The pnpm version comes
+      # from the `packageManager` field of the app's package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: source/desktop/package.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26.7.0"
+          cache: pnpm
+          cache-dependency-path: source/desktop/pnpm-lock.yaml
+
+      # The desktop COMPONENT's semver, which names both assets this job stages.
+      # Assigned before it is written: under `bash -e` a failing command
+      # substitution in an assignment fails the step, whereas
+      # `echo "X=$(script)" >> "$GITHUB_ENV"` keeps echo's exit status and
+      # exports an empty value instead.
+      #
+      # --check rather than a stamp. The four files that each carry a copy of the
+      # component version are committed in step with release.yaml, and rewriting
+      # them here would mean the tag no longer describes what was shipped — the
+      # same reason .goreleaser.yml runs `go mod download` and not `go mod tidy`.
+      # A disagreement fails before the build rather than shipping an app whose
+      # reported version came from an edit on the runner.
+      - name: the desktop component version
+        run: |
+          version=$(scripts/release-component-version.sh desktop)
+          echo "TUMIKA_DESKTOP_VERSION=$version" >> "$GITHUB_ENV"
+          scripts/desktop-version.sh --check
+
+      # --frozen-lockfile fails rather than resolving: a lockfile that disagrees
+      # with package.json means the release built something nobody committed.
+      - name: pnpm install
+        working-directory: source/desktop
+        run: pnpm install --frozen-lockfile
+
+      # No toolchain argument: rustup reads source/desktop/rust-toolchain.toml,
+      # which pins the channel. The target is this leg's, and the release build
+      # is the only thing that cross-compiles the app at all.
+      - name: install the pinned rust toolchain
+        working-directory: source/desktop
+        run: |
+          rustup toolchain install
+          rustup target add "$TRIPLE"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/desktop/src-tauri/target
+          key: cargo-release-${{ runner.os }}-${{ matrix.target.triple }}-${{ hashFiles('source/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-${{ matrix.target.triple }}-
+
+      # Apple Developer ID signing and notarization are a switch, thrown by the
+      # secrets existing. There is no Apple Developer account today, so the app
+      # is ad-hoc signed (tauri.conf.json's signingIdentity "-") and installed
+      # only through install-app.sh, which curl leaves unquarantined.
+      #
+      # A secret cannot be read in an `if:`, so the presence test happens in a
+      # step and the two build steps below branch on its output. Anything between
+      # all six and none fails HERE: a half-configured signing setup that fell
+      # back to ad-hoc would publish an unsigned app under a release that looks
+      # signed, and nothing downstream distinguishes the two.
+      - name: whether this release is signed with a Developer ID
+        id: signing
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          present=0
+          missing=""
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -n "${!name}" ]; then
+              present=$((present + 1))
+            else
+              missing="$missing $name"
+            fi
+          done
+
+          if [ "$present" -eq 6 ]; then
+            echo "signing with a Developer ID certificate, and notarizing"
+            echo "developer-id=true" >> "$GITHUB_OUTPUT"
+          elif [ "$present" -eq 0 ]; then
+            echo "no Apple credentials: the app is ad-hoc signed, as install-app.sh expects"
+            echo "developer-id=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Apple signing is configured by halves; missing:$missing" >&2
+            exit 1
+          fi
+
+      # TAURI_SIGNING_PRIVATE_KEY is the updater keypair's private half — the key
+      # CONTENTS, not a path — and its public half is committed in
+      # tauri.conf.json, which is what makes createUpdaterArtifacts produce the
+      # `.sig` the bill of materials carries. Tauri refuses a private key that
+      # does not match that pubkey, so a rotation that touches only the secret
+      # fails the build rather than publishing signatures no app accepts.
+      #
+      # No APPLE_* variable is declared on this path. Tauri infers a codesign
+      # identity from APPLE_CERTIFICATE whenever that variable is SET, so an empty
+      # value would send the ad-hoc build down the certificate path with nothing
+      # to import.
+      - name: tauri build (ad-hoc signed)
+        if: ${{ steps.signing.outputs.developer-id == 'false' }}
+        working-directory: source/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target "$TRIPLE"
+
+      # The same build with the Developer ID certificate imported from
+      # APPLE_CERTIFICATE and notarization performed with the app-specific
+      # password. signingIdentity is overridden on the command line because
+      # tauri.conf.json commits the ad-hoc "-", and Tauri fails rather than
+      # signs when the imported certificate's name disagrees with a configured
+      # identity. The value is expanded by the shell from the environment, never
+      # spliced into the workflow expression that builds the script.
+      - name: tauri build (Developer ID, notarized)
+        if: ${{ steps.signing.outputs.developer-id == 'true' }}
+        working-directory: source/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          pnpm tauri build --target "$TRIPLE" \
+            -c "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+
+      # Tauri names its updater archive after the product — Tumika.app.tar.gz —
+      # and the bill of materials resolves the desktop component by
+      # tumika-desktop_<component version>_<goos>_<goarch>.app.tar.gz. This
+      # rename is that contract, and the step below is what asserts it.
+      #
+      # The archive is located by glob and required to be the only one, so a
+      # productName change is a failure here rather than an asset staged under a
+      # name taken from a stale expectation.
+      - name: stage the updater archive under its asset name
+        run: |
+          bundle="source/desktop/src-tauri/target/$TRIPLE/release/bundle/macos"
+          archives=("$bundle"/*.app.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ] || [ ! -f "${archives[0]}" ]; then
+            echo "expected exactly one *.app.tar.gz under $bundle, found: ${archives[*]}" >&2
+            exit 1
+          fi
+          archive="${archives[0]}"
+
+          mkdir dist-desktop
+          name="tumika-desktop_${TUMIKA_DESKTOP_VERSION}_${PLATFORM}.app.tar.gz"
+          cp "$archive" "dist-desktop/$name"
+          cp "$archive.sig" "dist-desktop/$name.sig"
+          ls -l dist-desktop
+
+      # Run here, in the job that has the bundle: the check reads the app's own
+      # Info.plist out of the archive, which is the only thing that can say the
+      # component version reached tauri.conf.json.
+      - name: the staged assets are what the bill of materials reads
+        run: scripts/verify-desktop-assets.sh --platform "$PLATFORM" dist-desktop "$TUMIKA_DESKTOP_VERSION"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-${{ matrix.target.platform }}
+          path: dist-desktop
+          if-no-files-found: error
+          # Long enough to look at a failed release, short enough that build
+          # outputs do not accumulate. The release is the durable copy.
+          retention-days: 7
+
+  # Where the two paths converge on one draft, whichever components changed.
+  #
+  # A desktop-only hotfix still needs a release carrying release.yaml (the next
+  # gate reads it to enforce that every component version advances) and
+  # checksums.txt (the BOM generator reads every asset's SHA-256 out of it, and
+  # skips a release without one). goreleaser publishes both, but it does not run
+  # when the daemon is carried over — so this job creates the draft when there is
+  # none, and appends the desktop digests to the checksums file in either case.
+  #
+  # `contents: write` and no signing secret; the artifact it uploads is data.
+  # `!cancelled() && !failure()` runs it when a needed job was SKIPPED and never
+  # when one failed or was cancelled, so a failed desktop build leaves a draft
+  # rather than a published release.
+  finalize:
+    name: finalize
+    needs: [gate, goreleaser, desktop]
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GORELEASER_RESULT: ${{ needs.goreleaser.result }}
+    steps:
+      # persist-credentials is off because nothing here publishes with git; `gh`
+      # authenticates with GH_TOKEN.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The desktop COMPONENT's semver, which names the assets this job attaches
+      # and the digests it writes. Read from release.yaml rather than carried out
+      # of the build job, so the names asserted here are the ones the release was
+      # declared with.
+      - name: the desktop component version
+        run: |
+          version=$(scripts/release-component-version.sh desktop)
+          echo "TUMIKA_DESKTOP_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Both legs into one directory, which is then exactly the desktop half of
+      # the release's asset list.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ needs.desktop.result == 'success' }}
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: desktop-assets
+
+      # The draft, when goreleaser did not create one. release.yaml is attached
+      # here for the same reason `release.extra_files` attaches it there. The
+      # notes are GitHub's own, because goreleaser — which builds them from the
+      # commit range since the previous tag — did not run, and a release that
+      # carries the daemon over has no daemon changelog to write. It is a DRAFT
+      # for the same reason goreleaser's is: nothing is downloadable until the
+      # promote job.
+      - name: create the draft release
+        if: ${{ needs.goreleaser.result == 'skipped' }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            release.yaml
+        env:
+          GH_REPO: ${{ github.repository }}
+
+      # The artifact is DATA: nothing in it is executed or read as configuration,
+      # and the names its files must carry come from release.yaml, not from the
+      # artifact.
+      #
+      # The digests are computed from the very bytes being uploaded and appended
+      # to checksums.txt, because the BOM generator reads each asset's SHA-256
+      # from that file and goreleaser writes it for the daemon's assets alone. An
+      # asset absent from it is a component the generator cannot publish.
+      - name: attach the desktop assets and their digests
+        if: ${{ needs.desktop.result == 'success' }}
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          scripts/verify-desktop-assets.sh --checksums \
+            desktop-assets "$TUMIKA_DESKTOP_VERSION" > desktop-checksums.txt
+          cat desktop-checksums.txt
+
+          if [ "$GORELEASER_RESULT" = success ]; then
+            gh release download "$GITHUB_REF_NAME" --pattern checksums.txt --dir .
+          else
+            : > checksums.txt
+          fi
+          cat desktop-checksums.txt >> checksums.txt
+
+          gh release upload "$GITHUB_REF_NAME" desktop-assets/* checksums.txt --clobber
+
+      # release.yaml is delivered by goreleaser's `release.extra_files`, so it
+      # never appears under dist/ and verify-release-assets.sh cannot see it. The
+      # next release's gate downloads this release's release.yaml to enforce that
+      # every component version advances, so losing that line would leave every
+      # other check green and disarm the gate one release later — the draft's
+      # asset list is what gets asked instead.
+      - name: the release carries the assets the next one depends on
         run: |
           assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
           echo "$assets"
@@ -187,32 +521,49 @@ jobs:
               || { echo "the release has no $want" >&2; exit 1; }
           done
 
-      # Promoted only now. This is the step that makes the release public and
-      # moves /releases/latest onto it.
-      #
-      # The prerelease flag is passed explicitly because goreleaser's
-      # `prerelease: auto` cannot be templated — it can only read the tag — and
-      # this flag is the value the release ends up with whatever goreleaser
-      # inferred. It comes from the release label, the same source as everything
-      # else this job publishes: a beta label carries `-beta.`, and the BOM
-      # generator refuses a release whose GitHub prerelease flag disagrees with
-      # the channel its tag names — so a beta promoted as a full release is one
-      # the site never carries.
+  # Promoted only now, in a job of its own: this is what makes the release public
+  # and moves /releases/latest onto it, and it must happen after EVERY component
+  # of the release is attached and verified. A desktop build that failed leaves
+  # finalize skipped, which leaves this job out and the draft where it is.
+  #
+  # The prerelease flag is passed explicitly because goreleaser's
+  # `prerelease: auto` cannot be templated — it can only read the tag — and this
+  # flag is the value the release ends up with whatever goreleaser inferred. It
+  # comes from the release label, the same source as every asset: a beta label
+  # carries `-beta.`, and the BOM generator refuses a release whose GitHub
+  # prerelease flag disagrees with the channel its tag names, so a beta promoted
+  # as a full release is one the site never carries.
+  promote:
+    name: promote
+    needs: [goreleaser, desktop, finalize]
+    if: ${{ !cancelled() && !failure() && needs.finalize.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          label=$(scripts/release-label.sh)
           prerelease=false
-          case "$TUMIKA_RELEASE" in
+          case "$label" in
             *-beta.*) prerelease=true ;;
           esac
           gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease="$prerelease"
 
-  # Published AFTER goreleaser, so a release never exists with an image tag that
-  # points at nothing — the release notes tell people to pull it.
+  # Published AFTER the release, so a release never exists with an image tag that
+  # points at nothing — the release notes tell people to pull it. Only when the
+  # daemon changed: the image IS the daemon, and a carried-over daemon's image is
+  # the one the earlier release pushed.
   image:
     name: image
-    needs: goreleaser
+    needs: [gate, promote]
+    if: ${{ needs.promote.result == 'success' && contains(format(',{0},', needs.gate.outputs.changed), ',daemon,') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -321,7 +672,12 @@ jobs:
   # `main` and `v*.*.*` tags.
   pages:
     name: pages
-    needs: [goreleaser, image]
+    needs: [promote, image]
+    # The image job does not run for a release that carries the daemon over, and
+    # a skipped `needs` is not a reason to leave the site on the previous channel
+    # heads. A failed one is: the notes of the release about to be published name
+    # an image tag.
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.image.result != 'failure' }}
     permissions:
       contents: read
       pages: write

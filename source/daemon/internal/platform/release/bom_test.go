@@ -218,6 +218,52 @@ func TestParseBOMRejectsABadComponentEntry(t *testing.T) {
 	}
 }
 
+// The daemon's own assets carry no signature, so the document a daemon-only
+// release publishes is the one this reader has always accepted.
+func TestParseBOMAcceptsAnAssetWithNoSignature(t *testing.T) {
+	bom, err := ParseBOM([]byte(validBOM))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	asset, ok := bom.Asset(DaemonComponent, "linux", "arm64")
+	if !ok {
+		t.Fatal("the daemon asset for linux/arm64 is missing")
+	}
+	if asset.Signature != "" {
+		t.Fatalf("got signature %q", asset.Signature)
+	}
+}
+
+// An asset's signature is text this package never parses — the client that
+// verifies with it owns the format — so what is refused is a value that cannot be
+// a signature file at all.
+func TestParseBOMRejectsASignatureThatIsNotAFile(t *testing.T) {
+	withSignature := func(signature string) string {
+		return strings.Replace(validBOM, `"sha256":`, `"signature": "`+signature+`",
+          "sha256":`, 1)
+	}
+
+	for name, signature := range map[string]string{
+		"blank":      " \\n ",
+		"a nul byte": "untrusted comment\\u0000",
+		"an escape":  "untrusted comment\\u001b[2J",
+		"past the byte cap": "untrusted comment: " +
+			strings.Repeat("A", maxAssetSignatureBytes),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseBOM([]byte(withSignature(signature))); !errors.Is(err, ErrMalformedBOM) {
+				t.Fatalf("want ErrMalformedBOM, got %v", err)
+			}
+		})
+	}
+
+	// Two lines of base64 under a comment: what a minisign `.sig` file holds.
+	valid := `untrusted comment: signature from minisign key DCEC313987A2C979\\nRWR5yaKHOTHs3Hy94MYfQLY+kxs7C36ALLmGWmI5Gn86eT57fCREZzc8\\n`
+	if _, err := ParseBOM([]byte(withSignature(valid))); err != nil {
+		t.Fatalf("a minisign signature must be accepted: %v", err)
+	}
+}
+
 // A field a later publisher adds must not strand a daemon on an old release.
 func TestParseBOMAcceptsUnknownFields(t *testing.T) {
 	body := strings.Replace(validBOM, `"release":`, `"notes_url": "https://get.tumika.org/notes", "release":`, 1)
@@ -241,6 +287,13 @@ func TestParseBOMReadsACarriedOverComponent(t *testing.T) {
 	}
 	if desktop.FromRelease != "2026.09.00" {
 		t.Fatalf("got from_release %q", desktop.FromRelease)
+	}
+	asset, ok := bom.Asset(DesktopComponent, "darwin", "arm64")
+	if !ok {
+		t.Fatal("the desktop asset for darwin/arm64 is missing")
+	}
+	if !strings.HasPrefix(asset.Signature, "untrusted comment:") {
+		t.Fatalf("the app archive's signature did not survive the parse: %q", asset.Signature)
 	}
 	if _, ok := bom.Asset("desktop", "linux", "arm64"); ok {
 		t.Fatal("desktop publishes no linux/arm64 asset")

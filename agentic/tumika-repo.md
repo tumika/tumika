@@ -39,7 +39,8 @@ Each file contains one rule. New rules go in that directory — one file per rul
 `source/desktop/` is a macOS-only Tauri app and a client of the daemon exactly as the CLI is: it
 holds no state. Its Rust core reads the API token from the login Keychain via `/usr/bin/security`
 and polls `/v1/health`; the React popover renders the result. It is not part of the Go module,
-the daemon image, or the release archives. Toolchain and commands are in
+the daemon image, or the daemon's release archives; a release ships it as its own `desktop`
+component (`docs/adr/0010-the-desktop-app-is-a-release-component.md`). Toolchain and commands are in
 `source/desktop/README.md`; it has its own lint (`eslint`), licence check (`cargo-deny`) and CI job.
 
 ## References

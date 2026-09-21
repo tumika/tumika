@@ -20,8 +20,9 @@
       "version": "0.0.1",
       "assets": {
         "darwin_arm64": {
-          "url": "https://get.tumika.org/download/2026.09.00/tumika-desktop_0.0.1_darwin_arm64.tar.gz",
-          "sha256": "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
+          "url": "https://get.tumika.org/download/2026.09.00/tumika-desktop_0.0.1_darwin_arm64.app.tar.gz",
+          "sha256": "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c",
+          "signature": "untrusted comment: signature from minisign key DCEC313987A2C979\nRWR5yaKHOTHs3Hy94MYfQLY+kxs7C36ALLmGWmI5Gn86eT57fCREZzc8\n"
         }
       },
       "from_release": "2026.09.00"

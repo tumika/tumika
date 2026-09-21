@@ -38,6 +38,10 @@ func (s stubSource) Releases(context.Context) ([]bomgen.Release, error) {
 
 const daemonDigest = "1111111111111111111111111111111111111111111111111111111111111111"
 
+// appSignature stands in for the text of an updater archive's .sig: the comment
+// line and the base64 line minisign writes.
+const appSignature = "untrusted comment: signature from the tumika updater key\nUlVEWQ==\n"
+
 func publishedRelease(t *testing.T, label, tag string, prerelease bool, at time.Time) bomgen.Release {
 	t.Helper()
 	return bomgen.Release{
@@ -292,7 +296,10 @@ func TestDestinationRefusesAPathOutsideTheOutputTree(t *testing.T) {
 	}
 }
 
-func TestGitHubSourceResolvesDigestsFromChecksums(t *testing.T) {
+// A digest comes from checksums.txt, which carries digests and nothing else, so
+// a detached signature is read as the file it is and attached to the asset it
+// names.
+func TestGitHubSourceResolvesDigestsFromChecksumsAndSignaturesFromTheirFiles(t *testing.T) {
 	var (
 		listed int
 		base   string
@@ -315,7 +322,9 @@ func TestGitHubSourceResolvesDigestsFromChecksums(t *testing.T) {
 			   "assets":[
 			     {"name":"checksums.txt","browser_download_url":"`+base+`/checksums.txt"},
 			     {"name":"release.yaml","browser_download_url":"`+base+`/release.yaml"},
-			     {"name":"tumika_0.0.1_linux_amd64","browser_download_url":"https://example.test/bin"}]},
+			     {"name":"tumika_0.0.1_linux_amd64","browser_download_url":"https://example.test/bin"},
+			     {"name":"tumika-desktop_0.1.0_darwin_arm64.app.tar.gz","browser_download_url":"https://example.test/app"},
+			     {"name":"tumika-desktop_0.1.0_darwin_arm64.app.tar.gz.sig","browser_download_url":"`+base+`/app.sig"}]},
 			  {"tag_name":"v2026.09.01","draft":true,"prerelease":false,
 			   "published_at":"2026-09-08T00:00:00Z",
 			   "assets":[{"name":"checksums.txt","browser_download_url":"https://unreachable.test/x"}]}
@@ -323,7 +332,9 @@ func TestGitHubSourceResolvesDigestsFromChecksums(t *testing.T) {
 		case r.URL.Path == "/checksums.txt":
 			_, _ = io.WriteString(w, daemonDigest+"  tumika_0.0.1_linux_amd64\n")
 		case r.URL.Path == "/release.yaml":
-			_, _ = io.WriteString(w, "release: 2026.09.00\ncomponents:\n  daemon: 0.0.1\n")
+			_, _ = io.WriteString(w, "release: 2026.09.00\ncomponents:\n  daemon: 0.0.1\n  desktop: 0.1.0\n")
+		case r.URL.Path == "/app.sig":
+			_, _ = io.WriteString(w, appSignature)
 		default:
 			http.NotFound(w, r)
 		}
@@ -357,10 +368,23 @@ func TestGitHubSourceResolvesDigestsFromChecksums(t *testing.T) {
 	for _, a := range first.Assets {
 		if a.Name == "tumika_0.0.1_linux_amd64" {
 			found = a.SHA256 == daemonDigest
+			if a.Signature != "" {
+				t.Errorf("the daemon binary publishes no signature, got %q", a.Signature)
+			}
 		}
 	}
 	if !found {
 		t.Fatalf("the binary's digest was not resolved from checksums.txt: %+v", first.Assets)
+	}
+	for _, a := range first.Assets {
+		// The signature belongs to the archive, not to the .sig asset, which the
+		// generator never points at.
+		if a.Name == "tumika-desktop_0.1.0_darwin_arm64.app.tar.gz" && a.Signature != appSignature {
+			t.Errorf("the app archive carries signature %q, want the contents of its .sig", a.Signature)
+		}
+		if a.Name == "tumika-desktop_0.1.0_darwin_arm64.app.tar.gz.sig" && a.Signature != "" {
+			t.Errorf("a .sig asset carries a signature of its own: %q", a.Signature)
+		}
 	}
 	// A draft's assets are never fetched: its checksums.txt URL resolves
 	// nowhere, so reaching for it would have failed the run.

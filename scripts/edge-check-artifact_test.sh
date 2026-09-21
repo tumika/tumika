@@ -19,15 +19,25 @@ trap 'rm -rf "$WORK"' EXIT
 failures=0
 
 CASE_DIR=""
-# A fresh directory holding the full, good asset set for edge-<run> at <version>.
+DESKTOP_VERSION=""
+# A fresh directory holding the full, good asset set for edge-<run>: the daemon
+# at <daemon-version> and the desktop app at <desktop-version>, which defaults to
+# a DIFFERENT component version carrying the same edge suffix. release.yaml
+# versions the two components independently, so a fixture in which they agree
+# would not exercise the case every real release is.
 good_set() {
   local version="$1"
+  DESKTOP_VERSION="${2:-0.2.0-edge.${version##*-edge.}}"
   CASE_DIR="$(mktemp -d "$WORK/case.XXXXXX")"
   local target os arch
   for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
     os="${target%%/*}"; arch="${target##*/}"
     printf 'binary\n' > "$CASE_DIR/tumika_${version}_${os}_${arch}"
     printf 'archive\n' > "$CASE_DIR/tumika_${version}_${os}_${arch}.tar.gz"
+  done
+  for arch in amd64 arm64; do
+    printf 'app\n' > "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_${arch}.app.tar.gz"
+    printf 'sig\n' > "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_${arch}.app.tar.gz.sig"
   done
   printf 'deadbeef  tumika\n' > "$CASE_DIR/checksums.txt"
   printf 'release: 2026.09.01\n' > "$CASE_DIR/release.yaml"
@@ -137,13 +147,61 @@ expect_fail missing-an-archive "no 'tumika_0.0.1-edge.7_darwin_amd64.tar.gz' in 
 good_set 0.0.1-edge.7
 printf 'binary\n' > "$CASE_DIR/tumika_0.0.2-edge.7_linux_amd64"
 run_check "$CASE_DIR" 7
-expect_fail mixed-versions "more than one component version"
+expect_fail mixed-daemon-versions "more than one daemon component version"
+
+good_set 0.0.1-edge.7
+printf 'app\n' > "$CASE_DIR/tumika-desktop_0.3.0-edge.7_darwin_arm64.app.tar.gz"
+run_check "$CASE_DIR" 7
+expect_fail mixed-desktop-versions "more than one desktop component version"
+
+# The app is macOS-only, and its two architectures are the two the release
+# publishes. Anything else is a name no bill of materials resolves.
+good_set 0.0.1-edge.7
+printf 'app\n' > "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_linux_amd64.app.tar.gz"
+run_check "$CASE_DIR" 7
+expect_fail desktop-wrong-platform "is not an edge-7 release asset"
+
+good_set 0.0.1-edge.7
+printf 'app\n' > "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_x64.app.tar.gz"
+run_check "$CASE_DIR" 7
+expect_fail desktop-wrong-arch "is not an edge-7 release asset"
+
+# An unsuffixed desktop version is the calendar release's asset name, which this
+# build must not publish under an edge tag.
+good_set 0.0.1-edge.7
+printf 'app\n' > "$CASE_DIR/tumika-desktop_0.2.0_darwin_arm64.app.tar.gz"
+run_check "$CASE_DIR" 7
+expect_fail desktop-missing-suffix "is not an edge-7 release asset"
+
+good_set 0.0.1-edge.7
+printf 'x\n' > "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_arm64.app.tar.gz.asc"
+run_check "$CASE_DIR" 7
+expect_fail desktop-stray-file "is not an edge-7 release asset"
+
+# A signature whose archive is missing is a release asset nothing resolves, and
+# an archive whose signature is missing is a component the generator refuses.
+good_set 0.0.1-edge.7
+rm "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_arm64.app.tar.gz"
+run_check "$CASE_DIR" 7
+expect_fail desktop-signature-without-archive \
+  "no 'tumika-desktop_${DESKTOP_VERSION}_darwin_arm64.app.tar.gz' in the artifact"
+
+good_set 0.0.1-edge.7
+rm "$CASE_DIR/tumika-desktop_${DESKTOP_VERSION}_darwin_amd64.app.tar.gz.sig"
+run_check "$CASE_DIR" 7
+expect_fail desktop-archive-without-signature \
+  "no 'tumika-desktop_${DESKTOP_VERSION}_darwin_amd64.app.tar.gz.sig' in the artifact"
+
+good_set 0.0.1-edge.7
+rm "$CASE_DIR"/tumika-desktop_*
+run_check "$CASE_DIR" 7
+expect_fail no-desktop-assets "carries no desktop assets"
 
 CASE_DIR="$(mktemp -d "$WORK/case.XXXXXX")"
 printf 'deadbeef  tumika\n' > "$CASE_DIR/checksums.txt"
 printf 'release: 2026.09.01\n' > "$CASE_DIR/release.yaml"
 run_check "$CASE_DIR" 7
-expect_fail no-assets-at-all "carries no release assets"
+expect_fail no-assets-at-all "carries no daemon assets"
 
 run_check "$WORK/does-not-exist" 7
 expect_fail missing-directory "no directory"

@@ -37,6 +37,13 @@ Both were verified by adding a cgo package. `go list` reporting a non-empty
 
 ## Release builds
 
+`release.yml`'s jobs run in the order `gate`, then `goreleaser` and the
+`desktop` matrix, then `finalize`, `promote`, `image` and `pages` (see
+`releasing.md`); `goreleaser`, `desktop` and `image` run only when the gate's
+`changed` output names their component. `desktop` holds the app updater's
+signing secrets under a read-only token; `finalize` holds the write token and
+no signing secret. ADR-0010 records why.
+
 `release.yml`'s image job takes its build args and tags from `release.yaml`, not
 from the git tag. `VERSION` is the daemon component's semver
 (`scripts/release-component-version.sh daemon`) and `RELEASE` is the label
@@ -45,6 +52,10 @@ empty value that would override the Dockerfile's defaults. The image is tagged
 with the component version and with the label, both as `type=raw`, because the
 tag is a zero-padded CalVer that `type=semver` cannot parse. `:latest` is a
 third `type=raw` tag enabled only when the label carries no `-beta.`.
+
+`ci-build.yml`'s desktop build and `edge.yml`'s `desktop` job pass
+`-c '{"bundle":{"createUpdaterArtifacts":false}}'`: the committed value is on,
+which needs the updater private key.
 
 `ci-build.yml`'s snapshot release build exports `TUMIKA_DAEMON_VERSION` only.
 `.goreleaser.yml` fails without it, and leaving `TUMIKA_RELEASE` unset keeps the
@@ -61,10 +72,12 @@ Two workflows beyond `release.yml` publish the release host (ADR-0009):
   `id-token: write`, and it checks nothing out. Concurrency group `pages` is
   never cancelled, so one deploy runs at a time.
 - **`edge.yml`** is dispatched on `main` and builds whatever its `ref` input
-  names. Its top level is `contents: read`; the `build` job that runs the named
-  ref's code stays at `contents: read`, and only the `publish` job — which runs
-  `main`'s checkout — holds `contents: write` and `actions: write`. Concurrency
-  group `edge`, never cancelled.
+  names, in four jobs after a `guard`. Its top level is `contents: read`; the
+  `build` and `desktop` jobs that run the named ref's code stay at `contents:
+  read` with no secret. `sign` runs `main`'s checkout with the updater key over
+  the desktop archives, as data. Only `publish` — which runs `main`'s checkout —
+  holds `contents: write` and `actions: write`. Concurrency group `edge`, never
+  cancelled.
 
 `release.yml` ends in a `pages` job that calls `publish-pages.yml` (`uses:`,
 passing no secrets). The promote step publishes with `GITHUB_TOKEN`, which raises
@@ -82,9 +95,10 @@ other branch cannot resolve it. The environment cannot tell whether a `v*.*.*`
 tag was cut from `main`, so a tag ruleset restricting who may create those tags
 is what closes the tag path.
 
-The branch being built never runs beside a write token: `edge.yml`'s `build` job
-holds `contents: read` and no credentials, and hands its output to the `publish`
-job as an artifact whose file names `scripts/edge-check-artifact.sh` validates
+The branch being built never runs beside a write token or a signing key:
+`edge.yml`'s `build` and `desktop` jobs hold `contents: read` and no credentials,
+and hand their output on as artifacts (the desktop one through `sign`) whose file
+names `scripts/edge-check-artifact.sh` validates
 against a closed allow-list before anything is uploaded.
 
 The shell fixture tests under `scripts/*_test.sh` are run by hand; no workflow in

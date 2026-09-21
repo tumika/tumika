@@ -2,6 +2,7 @@ package bomgen
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -16,6 +17,9 @@ import (
 // The platforms a release publishes a daemon binary for.
 var platforms = []string{"linux_amd64", "linux_arm64", "darwin_arm64"}
 
+// The platforms the desktop app is bundled for: Apple silicon and Intel.
+var desktopPlatforms = []string{"darwin_arm64", "darwin_amd64"}
+
 func at(day int, hour int) time.Time {
 	return time.Date(2026, 9, day, hour, 0, 0, 0, time.UTC)
 }
@@ -27,21 +31,62 @@ func digest(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func downloadURL(tag, name string) string {
+	return "https://github.com/tumika/tumika/releases/download/" + tag + "/" + name
+}
+
 func rawAssets(tag, version string) []Asset {
 	assets := make([]Asset, 0, len(platforms))
 	for _, platform := range platforms {
 		name := "tumika_" + version + "_" + platform
 		assets = append(assets, Asset{
 			Name:   name,
-			URL:    "https://github.com/tumika/tumika/releases/download/" + tag + "/" + name,
+			URL:    downloadURL(tag, name),
 			SHA256: digest(name),
 		})
 	}
 	return assets
 }
 
+// minisign stands in for the text of a .sig file: the comment line and the
+// base64 line Tauri's signer writes. The generator only copies it.
+func minisign(name string) string {
+	return "untrusted comment: signature from the tumika updater key\n" +
+		base64.StdEncoding.EncodeToString([]byte(name)) + "\n"
+}
+
+// desktopAssets are the app's updater archive for each platform and the detached
+// signature published beside it, exactly as the release workflow uploads them.
+func desktopAssets(tag, version string) []Asset {
+	assets := make([]Asset, 0, 2*len(desktopPlatforms))
+	for _, platform := range desktopPlatforms {
+		name := "tumika-desktop_" + version + "_" + platform + ".app.tar.gz"
+		assets = append(assets,
+			Asset{
+				Name:      name,
+				URL:       downloadURL(tag, name),
+				SHA256:    digest(name),
+				Signature: minisign(name),
+			},
+			Asset{
+				Name:   name + ".sig",
+				URL:    downloadURL(tag, name+".sig"),
+				SHA256: digest(name + ".sig"),
+			},
+		)
+	}
+	return assets
+}
+
 func releaseSpec(label, daemonVersion string) []byte {
 	return []byte("# a comment\nrelease: " + label + "\ncomponents:\n  daemon: " + daemonVersion + "\n")
+}
+
+// bothSpec is the release.yaml of a release shipping both components, whether or
+// not it built either of them.
+func bothSpec(label, daemonVersion, desktopVersion string) []byte {
+	return []byte("release: " + label + "\ncomponents:\n  daemon: " + daemonVersion +
+		"\n  desktop: " + desktopVersion + "\n")
 }
 
 // stable, beta and edge build the release each channel is cut from, complete
@@ -72,6 +117,24 @@ func edge(run, label string, published time.Time, daemonVersion string) Release 
 		Assets:      rawAssets(tag, version),
 		ReleaseYAML: releaseSpec(label, daemonVersion),
 	}
+}
+
+// both is a stable release naming two components, built where a version is
+// given and left to carry over where it is empty — which is how a release that
+// changed only one component is spelled.
+func both(label string, published time.Time, daemonVersion, desktopVersion string, built ...string) Release {
+	rel := stable(label, published, daemonVersion)
+	rel.ReleaseYAML = bothSpec(label, daemonVersion, desktopVersion)
+	rel.Assets = nil
+	for _, name := range built {
+		switch name {
+		case release.DaemonComponent:
+			rel.Assets = append(rel.Assets, rawAssets(rel.Tag, daemonVersion)...)
+		case release.DesktopComponent:
+			rel.Assets = append(rel.Assets, desktopAssets(rel.Tag, desktopVersion)...)
+		}
+	}
+	return rel
 }
 
 func generate(t *testing.T, releases ...Release) Result {
@@ -364,6 +427,199 @@ func TestAnUnchangedComponentIsCarriedOver(t *testing.T) {
 	}
 }
 
+// A release that built both components names both, each at its own component
+// version, and each from its own assets. The names are told apart by their
+// extension alone, so the archives published beside them must not be mistaken
+// for the assets the document points at.
+func TestAReleaseThatBuildsBothComponentsPublishesBoth(t *testing.T) {
+	rel := both("2026.09.01", at(2, 9), "0.0.2", "0.1.0", release.DaemonComponent, release.DesktopComponent)
+	for _, platform := range platforms {
+		name := "tumika_0.0.2_" + platform + ".tar.gz"
+		rel.Assets = append(rel.Assets, Asset{Name: name, URL: downloadURL(rel.Tag, name), SHA256: digest(name)})
+	}
+
+	result := generate(t, rel)
+
+	if len(result.Skipped) != 0 {
+		t.Fatalf("skip report is %+v, want nothing skipped", result.Skipped)
+	}
+	bom := parse(t, result.Releases[0])
+	daemon := bom.Components[release.DaemonComponent]
+	if daemon.Version != "0.0.2" || len(daemon.Assets) != len(platforms) {
+		t.Errorf("daemon is %s with %d assets, want 0.0.2 with %d", daemon.Version, len(daemon.Assets), len(platforms))
+	}
+	if daemon.FromRelease != "" {
+		t.Errorf("the release that built the daemon names from_release %s", daemon.FromRelease)
+	}
+
+	desktop := bom.Components[release.DesktopComponent]
+	if desktop.Version != "0.1.0" {
+		t.Errorf("desktop component version is %s, want 0.1.0", desktop.Version)
+	}
+	if len(desktop.Assets) != len(desktopPlatforms) {
+		t.Fatalf("desktop publishes %d assets, want %v", len(desktop.Assets), desktopPlatforms)
+	}
+	for _, platform := range desktopPlatforms {
+		asset := desktop.Assets[platform]
+		name := "tumika-desktop_0.1.0_" + platform + ".app.tar.gz"
+		if !strings.HasSuffix(asset.URL, "/"+name) {
+			t.Errorf("desktop %s is %s, want the archive %s", platform, asset.URL, name)
+		}
+		// The .sig is never an asset of its own: its text is the archive's
+		// signature, which is the only thing the app's updater checks with.
+		if asset.Signature != minisign(name) {
+			t.Errorf("desktop %s carries signature %q", platform, asset.Signature)
+		}
+		if asset.SHA256 != digest(name) {
+			t.Errorf("desktop %s hashes to %s, want the archive's digest", platform, asset.SHA256)
+		}
+	}
+}
+
+// A component the release did not build points at the assets of the release that
+// did, whichever component that is: a hotfix builds only what changed.
+func TestOnlyTheComponentAReleaseBuiltComesFromIt(t *testing.T) {
+	tests := []struct {
+		name    string
+		built   []string
+		carried string
+	}{
+		{
+			name:    "a desktop-only release carries the daemon over",
+			built:   []string{release.DesktopComponent},
+			carried: release.DaemonComponent,
+		},
+		{
+			name:    "a daemon-only release carries the desktop over",
+			built:   []string{release.DaemonComponent},
+			carried: release.DesktopComponent,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			first := both("2026.09.00", at(1, 9), "0.0.1", "0.1.0",
+				release.DaemonComponent, release.DesktopComponent)
+			second := both("2026.09.01", at(2, 9), "0.0.1", "0.1.0", tc.built...)
+
+			result := generate(t, first, second)
+
+			if len(result.Skipped) != 0 {
+				t.Fatalf("skip report is %+v, want nothing skipped", result.Skipped)
+			}
+			source, got := parse(t, result.Releases[0]), parse(t, result.Releases[1])
+			carried := got.Components[tc.carried]
+			if carried.FromRelease != "2026.09.00" {
+				t.Errorf("%s comes from %q, want 2026.09.00", tc.carried, carried.FromRelease)
+			}
+			for platform, asset := range carried.Assets {
+				if asset != source.Components[tc.carried].Assets[platform] {
+					t.Errorf("%s republishes %s at %s", tc.carried, platform, asset.URL)
+				}
+			}
+			for _, name := range tc.built {
+				if from := got.Components[name].FromRelease; from != "" {
+					t.Errorf("%s was built here and still names from_release %s", name, from)
+				}
+			}
+		})
+	}
+}
+
+// A release naming a component it neither built nor can carry over is skipped
+// whole, and so is one whose signed asset arrived without its signature: a
+// document pointing at an archive no updater can verify is worse than no
+// document.
+func TestADesktopComponentWithoutUsableAssetsIsSkipped(t *testing.T) {
+	tests := []struct {
+		name   string
+		rel    Release
+		reason string
+	}{
+		{
+			name:   "no archive, and nothing earlier to carry over",
+			rel:    both("2026.09.02", at(9, 9), "0.0.3", "0.1.1", release.DaemonComponent),
+			reason: "no tumika-desktop_0.1.1_<goos>_<goarch>.app.tar.gz asset",
+		},
+		{
+			name: "an archive published without its signature",
+			rel: func() Release {
+				rel := both("2026.09.02", at(9, 9), "0.0.3", "0.1.1",
+					release.DaemonComponent, release.DesktopComponent)
+				for i := range rel.Assets {
+					rel.Assets[i].Signature = ""
+				}
+				return rel
+			}(),
+			reason: "tumika-desktop_0.1.1_darwin_arm64.app.tar.gz is published without its " +
+				"tumika-desktop_0.1.1_darwin_arm64.app.tar.gz.sig",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := generate(t, both("2026.09.01", at(1, 9), "0.0.2", "0.1.0",
+				release.DaemonComponent, release.DesktopComponent), tc.rel)
+
+			if len(result.Releases) != 1 {
+				t.Fatalf("published %d releases, want only the complete one", len(result.Releases))
+			}
+			if len(result.Skipped) != 1 {
+				t.Fatalf("skip report is %+v, want one entry", result.Skipped)
+			}
+			if !strings.Contains(result.Skipped[0].Reason, tc.reason) {
+				t.Errorf("skip reason %q does not mention %q", result.Skipped[0].Reason, tc.reason)
+			}
+		})
+	}
+}
+
+// A release shipping only the daemon publishes the document it always did: no
+// component gains a field because another component has one, and the daemon's
+// own reader accepts it unchanged.
+func TestADaemonOnlyDocumentCarriesNoSignature(t *testing.T) {
+	result := generate(t, stable("2026.09.01", at(2, 9), "0.0.2"))
+
+	doc := result.Releases[0]
+	bom, err := release.ParseBOM(doc.Bytes)
+	if err != nil {
+		t.Fatalf("%s does not parse: %v", doc.Path, err)
+	}
+	if len(bom.Components) != 1 {
+		t.Fatalf("document names %d components, want the daemon alone", len(bom.Components))
+	}
+	if strings.Contains(string(doc.Bytes), "signature") {
+		t.Errorf("a daemon-only document carries a signature field:\n%s", doc.Bytes)
+	}
+	for _, asset := range bom.Components[release.DaemonComponent].Assets {
+		if asset.Signature != "" {
+			t.Errorf("daemon asset %s carries a signature", asset.URL)
+		}
+	}
+}
+
+// A draft's assets are not downloadable, so a later release must not carry a
+// component over from one: the entry would point at a URL that 404s and the
+// draft's own document is never published to explain it.
+func TestADraftIsNeverACarryOverSource(t *testing.T) {
+	draft := both("2026.09.01", at(1, 9), "0.0.2", "0.1.0",
+		release.DaemonComponent, release.DesktopComponent)
+	draft.Draft = true
+	carrier := both("2026.09.02", at(2, 9), "0.0.2", "0.1.0", release.DaemonComponent)
+
+	result := generate(t, draft, carrier)
+
+	if len(result.Releases) != 0 {
+		t.Fatalf("published %d releases, want none: the carrier can only point at the draft", len(result.Releases))
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Tag != carrier.Tag {
+		t.Fatalf("skip report is %+v, want %s alone", result.Skipped, carrier.Tag)
+	}
+	if !strings.Contains(result.Skipped[0].Reason, "no earlier release publishes desktop 0.1.0") {
+		t.Errorf("skip reason %q does not name the missing desktop", result.Skipped[0].Reason)
+	}
+}
+
 // An edge build's component version carries the run number of the build that
 // produced it, so two edge builds of one commit never claim the same component
 // version — and the assets are named by the version they carry.
@@ -548,6 +804,13 @@ func TestParseTheCommittedReleaseYAML(t *testing.T) {
 	}
 	if _, ok := spec.components[release.DaemonComponent]; !ok {
 		t.Errorf("%s names no %s component, only %v", path, release.DaemonComponent, spec.componentNames())
+	}
+	// A component the generator cannot name an asset for skips every release that
+	// ships it, so adding one to release.yaml adds a row to componentAssets.
+	for _, name := range spec.componentNames() {
+		if _, ok := componentAssets[name]; !ok {
+			t.Errorf("%s names component %s, whose assets this generator cannot name", path, name)
+		}
 	}
 }
 

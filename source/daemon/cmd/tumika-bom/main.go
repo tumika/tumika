@@ -419,29 +419,41 @@ func (s *gitHubSource) convert(ctx context.Context, rel apiRelease) (bomgen.Rele
 	// hundreds of megabytes of binaries to learn what that file already says.
 	// It is not a trust decision — the digests are signed into the bill of
 	// materials here, which is what a daemon checks its download against.
+	//
+	// A detached signature is the content of a file rather than a digest, so
+	// checksums.txt cannot supply it: every `.sig` a release carries is read the
+	// way release.yaml is, and attached to the asset it names.
 	digests := map[string]string{}
+	signatures := map[string]string{}
 	for _, asset := range rel.Assets {
-		switch asset.Name {
-		case checksumsAsset:
+		switch {
+		case asset.Name == checksumsAsset:
 			body, err := s.get(ctx, asset.URL)
 			if err != nil {
 				return bomgen.Release{}, err
 			}
 			digests = parseChecksums(body)
-		case releaseYAMLAsset:
+		case asset.Name == releaseYAMLAsset:
 			body, err := s.get(ctx, asset.URL)
 			if err != nil {
 				return bomgen.Release{}, err
 			}
 			converted.ReleaseYAML = body
+		case strings.HasSuffix(asset.Name, signatureSuffix):
+			body, err := s.get(ctx, asset.URL)
+			if err != nil {
+				return bomgen.Release{}, err
+			}
+			signatures[strings.TrimSuffix(asset.Name, signatureSuffix)] = string(body)
 		}
 	}
 
 	for _, asset := range rel.Assets {
 		converted.Assets = append(converted.Assets, bomgen.Asset{
-			Name:   asset.Name,
-			URL:    asset.URL,
-			SHA256: digests[asset.Name],
+			Name:      asset.Name,
+			URL:       asset.URL,
+			SHA256:    digests[asset.Name],
+			Signature: signatures[asset.Name],
 		})
 	}
 	return converted, nil

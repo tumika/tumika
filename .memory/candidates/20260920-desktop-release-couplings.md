@@ -1,0 +1,22 @@
+---
+about: couplings in shipping the desktop app as a release component that a change can break without a failing build; what breaks if any of these change
+saw:
+  - scripts/check-release-monotonic.sh
+  - scripts/verify-desktop-assets.sh
+  - scripts/desktop-version.sh
+  - scripts/edge-check-artifact.sh
+  - source/daemon/internal/bomgen/bomgen.go
+  - source/desktop/src-tauri/tauri.conf.json
+  - .github/workflows/release.yml
+  - .github/workflows/edge.yml
+  - .github/workflows/ci-build.yml
+---
+- The gate accepts an EQUAL component version and refuses only a lower one. Equal means carried over: the component is not built and bomgen points its BOM entry at the earlier release's asset (`from_release`). Restoring "strictly greater" fails every release that leaves a component alone; a component whose version is repeated while its code changed ships the old bytes.
+- The gate's `changed=` output gates the `goreleaser`, `desktop` and `image` jobs and reaches verify-release-assets.sh as `TUMIKA_CHANGED_COMPONENTS`. Its format (one `changed=a,b` line, `changed=` when empty) is parsed by `contains(format(',{0},', ...))` in the workflow; a different shape silently skips every build.
+- The asset name is `tumika-desktop_<component version>_<goos>_<goarch>.app.tar.gz`, but Tauri writes `Tumika.app.tar.gz`; the rename in the workflow is the whole contract. bomgen reports a misnamed archive as a component the release did not build, never as an error, so only verify-desktop-assets.sh notices. The four `tumika*` names (raw binary, `.tar.gz`, `.app.tar.gz`, `.sig`) are told apart by extension alone; loosening either rule's extension makes one name satisfy two components.
+- checksums.txt is written by goreleaser for the daemon's assets only. The finalize job (and edge's publish job) must append the desktop archives' digests, or bomgen cannot read them and skips the component. The `.sig` files get no digest line: the BOM carries their text.
+- release.yml's `finalize` and `promote` use `!cancelled() && !failure()` so a SKIPPED needed job (an unchanged component) does not stop them while a failed or cancelled one does. Plain `success()` never runs when a component is skipped; dropping the guard lets a failed desktop leg promote a release without its app. Promote must stay a job after finalize, or the release goes public before every asset is attached.
+- The desktop component version lives in four files (tauri.conf.json, Cargo.toml, Cargo.lock, package.json) plus release.yaml. The release job runs `desktop-version.sh --check`; edge runs the stamping form. Bumping release.yaml without the four fails the release desktop job; bumping one copy alone ships an app reporting the wrong component version.
+- tauri.conf.json commits `createUpdaterArtifacts: true` with the public key, so any build without the private key must override it off (`-c '{"bundle":{"createUpdaterArtifacts":false}}'`, as ci-build.yml and edge's `desktop` job do). Rotating the secret without the committed pubkey fails the build; losing the private key strands installed apps on the old pubkey.
+- Edge signing is separated from edge building: the `desktop` job runs branch code with no secret and packs the archive by hand; only `sign` (main's checkout, main's Tauri CLI) holds TAURI_SIGNING_PRIVATE_KEY. Moving the key into the build job, or having `sign` run anything from the artifact, puts the key beside branch code.
+- Apple signing is all six `APPLE_*` secrets or none. The ad-hoc build step declares no `APPLE_*` variable at all, because Tauri infers a certificate identity whenever `APPLE_CERTIFICATE` is set, even empty.

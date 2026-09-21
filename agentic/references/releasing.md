@@ -2,9 +2,18 @@
 
 Edit `release.yaml` (the label and each component version), merge it to `main`,
 then tag `v<label>` and push the tag. `release.yml` then: re-runs the full gate
-(including the systemd install harness) on that exact commit, runs `goreleaser
-release`, and publishes a multi-arch image to `ghcr.io/tumika/tumika`. ADR-0008
-records why the tag names the release and nothing else.
+(including the systemd install harness) on that exact commit, builds the
+components whose version changed, publishes the release, and pushes a multi-arch
+image to `ghcr.io/tumika/tumika`. ADR-0008 records why the tag names the release
+and nothing else; ADR-0010 records the desktop component.
+
+The job graph: `gate` → `goreleaser` (daemon changed) and `desktop` (desktop
+changed, one leg per platform) → `finalize` → `promote` → `image` (daemon
+changed) → `pages`. `goreleaser` creates the draft release; `desktop` holds the
+signing secrets and a read-only token; `finalize` holds the write token and no
+signing secret; `promote` is its own job. `finalize` and `promote` run under
+`!cancelled() && !failure()`, which tolerates a skipped needed job and stops on a
+failed one, so a failed leg leaves a draft.
 
 The gate is a full re-run rather than a reference to the commit's CI result,
 because a tag can be pushed to any commit — including one whose PR checks never
@@ -40,11 +49,17 @@ cannot be compared by the updater.
 
 **Two checks in the gate job run before anything is built.**
 `scripts/validate-release.sh --tag "$GITHUB_REF_NAME"` asserts the tag equals
-`v<label>`. `scripts/check-release-monotonic.sh` asserts each component version
-is strictly greater than the one in the most recently published calendar
-release (drafts, the in-flight tag and `edge-*` releases are skipped). A beta's
-component version carries a `-beta.N` suffix, which semver orders below the
-stable version of the same core, so the same comparison covers beta to stable.
+`v<label>`. `scripts/check-release-monotonic.sh` asserts no component version is
+lower than the one in the most recently published calendar release (drafts, the
+in-flight tag and `edge-*` releases are skipped). An EQUAL component version is
+accepted and means the component is carried over: it is not rebuilt, and the
+BOM points at the earlier release's assets (`from_release`). The script reports
+the components that differ as `changed=<list>`, the gate's `changed` output,
+which gates the `goreleaser`, `desktop` and `image` jobs and reaches
+`verify-release-assets.sh` as `TUMIKA_CHANGED_COMPONENTS`. A component named for
+the first time counts as changed. A beta's component version carries a
+`-beta.N` suffix, which semver orders below the stable version of the same core,
+so the same comparison covers beta to stable.
 It fails closed: an unreadable release list, or an unreadable asset list or
 download for the previous release, fails the gate. Only a previous release whose
 successfully fetched asset list has no `release.yaml` passes without a
@@ -70,8 +85,25 @@ dropping `-X main.version` — the metadata stayed correct and the binary report
 
 **The release is published as a DRAFT and promoted only after verification.**
 A gate that runs after `release --clean` reports rather than prevents: the
-broken release would already be downloadable. The promote step is the last thing
-the job does.
+broken release would already be downloadable. The `promote` job runs after every
+component is attached.
+
+**The desktop app is a component of the release.** The `desktop` matrix builds
+`darwin_arm64` and `darwin_amd64` on one macOS runner, asserts
+`scripts/desktop-version.sh --check` (the four committed copies of the desktop
+component version — `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`,
+`package.json` — must equal `release.yaml`, so they move together in one
+commit), renames Tauri's `Tumika.app.tar.gz` to
+`tumika-desktop_<component version>_<platform>.app.tar.gz`, and checks the pair
+with `scripts/verify-desktop-assets.sh`. `finalize` creates the draft when
+`goreleaser` was skipped, uploads both archives and their `.sig` files, and
+appends the archives' digests to `checksums.txt`; without those lines `bomgen`
+skips the component. Four names begin `tumika`, told apart by the ending: the
+daemon's raw binary, its `.tar.gz`, the app's `.app.tar.gz` and its `.sig`.
+Signing is ad-hoc (`signingIdentity` `"-"`) unless all six `APPLE_*` secrets are
+set, in which case the app is Developer ID signed and notarized; some but not
+all fails the job. The updater signature comes from `TAURI_SIGNING_PRIVATE_KEY`
+and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
 The promote step passes `--prerelease` explicitly, derived from the label
 (`-beta.` means prerelease). goreleaser's `prerelease: auto` cannot be templated
@@ -110,7 +142,7 @@ ancestor of `main`: re-running the tests is not the same as knowing the commit
 was reviewed, and anyone who can push a tag could otherwise point it at a commit
 that merely compiles.
 
-**Before the first publish, the repository needs four things nothing in the
+**Before the first publish, the repository needs these things nothing in the
 workflows creates.**
 
 - A DNS CNAME for `get.tumika.org` pointing at the GitHub Pages host.
@@ -127,6 +159,11 @@ workflows creates.**
   in `source/daemon/internal/platform/release/keys.go`, which is also the key
   embedded in `scripts/install-daemon.sh`; `installer_key_test.go` fails when
   the two differ. `tumika-bom` refuses a key that is not in the compiled-in list.
+- A Tauri updater keypair (`pnpm tauri signer generate`): the public key is
+  committed in `tauri.conf.json`, the private key's contents are the secret
+  `TAURI_SIGNING_PRIVATE_KEY`, with `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+  Losing the private key means shipping a new public key to every installed app
+  (ADR-0010). The six `APPLE_*` secrets are optional, all or none.
 
 **The site is assembled from three inputs and served from one host.**
 `publish-pages.yml` runs `tumika-bom` (which reads the published releases and
@@ -147,8 +184,10 @@ a failed deploy. The generator reads each raw asset's SHA-256 from
 `checksums.txt`, and skips a release lacking `release.yaml` or `checksums.txt`,
 so goreleaser must keep uploading both. A skipped release fails the run unless
 `-allow-skips` is passed. A component the generator does not know how to name
-(`componentBinaries` in `internal/bomgen`) is a skipped release too, so adding a
-component adds a row there.
+(`componentAssets` in `internal/bomgen`) is a skipped release too, so adding a
+component adds a row there. A component with a signature rule publishes each
+asset's `<name>.sig` text as the asset's optional `signature` field in the BOM,
+and a release whose archive lacks its `.sig` is skipped.
 
 **An edge build is cut by dispatching the `edge` workflow on `main`, naming the
 thing to build:**
@@ -164,7 +203,7 @@ first `guard` job everything else needs fails the run when `github.ref` is not
 `refs/heads/main`. The input is handed to `actions/checkout` and to `env:`, never
 spliced into a `run:` script, where a ref named `$(…)` would execute.
 
-The work splits in two, and the split is the point:
+The work splits in four, and the split is the point:
 
 - `build` checks out `ref` with `persist-credentials: false` and holds
   `contents: read`. It runs the branch's `scripts/edge-version.sh` (labelling the
@@ -174,10 +213,19 @@ The work splits in two, and the split is the point:
   `scripts/verify-release-assets.sh` — which executes the native binary, so it
   belongs in the job that has one — stages the release's assets into one
   directory and uploads them as an artifact.
+- `desktop` does the same for the app under `contents: read` and no secret: it
+  stamps the four component-version copies with the edge component version,
+  builds with `createUpdaterArtifacts` off (the committed value is on) and packs
+  the archive by hand.
+- `sign` runs `main`'s checkout and pinned Tauri CLI with the updater key over
+  the archives, downloaded as data, with `tauri signer sign`. It runs no branch
+  code.
 - `publish` runs `main`'s checkout with `contents: write` and `actions: write`.
   It treats the artifact strictly as data: it executes nothing out of it, runs no
-  script from the built ref, and checks every downloaded file name against
-  `scripts/edge-check-artifact.sh` before `gh release create` sees it. The tag is
+  script from the built ref, appends the desktop archives' digests to
+  `checksums.txt` (`scripts/verify-desktop-assets.sh --checksums`), and checks
+  every downloaded file name against `scripts/edge-check-artifact.sh` before
+  `gh release create` sees it. The tag is
   created by `--target <built commit>`, so no git credential and no branch code
   tags anything. Then it promotes the draft as a prerelease, prunes to the newest
   five edge releases (`scripts/edge-prune.sh`, which only touches tags spelled
@@ -191,9 +239,10 @@ token that could `gh release upload --clobber` a published release's binary and
 `scripts/edge-check-artifact.sh <dir> <run-number>` is a closed allow-list, not
 a filter: every entry must be a regular file directly in the directory (no
 subdirectory, no symlink — `gh release create` would upload what a symlink points
-at) and must be one of the four targets' raw binary and `.tar.gz`,
-`checksums.txt`, or `release.yaml`, with all four targets present under one
-component version. The run number comes from `github.run_number`, so a build
+at) and must be one of the four targets' raw binary and `.tar.gz`, the two desktop
+`.app.tar.gz` archives with their `.sig`, `checksums.txt`, or `release.yaml`,
+with all four daemon targets and both desktop platforms present, each component
+under one version. The run number comes from `github.run_number`, so a build
 cannot upload assets belonging to another run under this one's tag.
 `goreleaser --skip=publish` leaves the raw binary in a per-target directory under
 the name `tumika`, so the staging step reads the asset name it would have been

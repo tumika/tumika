@@ -139,6 +139,15 @@ else
   echo "ok   - multi-component suffixes every component"
 fi
 
+# The written file is what the edge desktop build reads its own component version
+# out of, through the same script the calendar release reads it with: that value
+# names the app's assets and is stamped into the bundle.
+if [[ "$("$HERE/release-component-version.sh" desktop "$WORK/multi/out.yaml")" != "0.0.3-edge.9" ]]; then
+  report_failure multi-component "the written file should name the edge desktop version"
+else
+  echo "ok   - multi-component names the edge desktop version"
+fi
+
 # The written file keeps the calendar label. An edge build has no calendar
 # release of its own, and the generator reads its edge label from the tag.
 if ! grep -qx 'release: 2026.09.01' "$WORK/multi/out.yaml"; then
