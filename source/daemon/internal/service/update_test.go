@@ -608,6 +608,33 @@ func TestConfirmMarksSuccessAndRemovesTheFallback(t *testing.T) {
 	}
 }
 
+// A pending row names one binary, and only that binary can confirm it. Serving
+// from a build the update did not install — a restored .old, a supervisor on a
+// different unit — must leave the row alone and keep the fallback, or a version
+// nobody runs is recorded as proven and the way back from the one that is runs
+// gets deleted.
+func TestConfirmRefusesFromABuildTheUpdateDidNotInstall(t *testing.T) {
+	h := newHarness(t, "0.1.0")
+	if err := os.WriteFile(h.binary+".old", []byte("binary 0.1.0"), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+		t.Fatalf("write: %v", err)
+	}
+	h.repo.state = domain.UpdateState{
+		Status: domain.UpdatePending, FromVersion: "0.1.0", ToVersion: "0.2.0",
+	}
+
+	err := h.svc.Confirm(t.Context())
+	if !errors.Is(err, service.ErrNotTheUpdatedBuild) {
+		t.Fatalf("Confirm = %v, want ErrNotTheUpdatedBuild", err)
+	}
+	if h.repo.state.Status != domain.UpdatePending {
+		t.Errorf("status = %q, want pending so the update still has to prove itself",
+			h.repo.state.Status)
+	}
+	if _, err := os.Stat(h.binary + ".old"); err != nil {
+		t.Errorf("the fallback was removed by a build that is not the update: %v", err)
+	}
+}
+
 // Confirming when nothing is pending must not touch anything — it runs on every
 // serve.
 func TestConfirmIsInertWhenNothingIsPending(t *testing.T) {
@@ -1017,8 +1044,13 @@ func TestTheHappyPathEndToEnd(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	// The next process boots on the new binary.
-	rolledBack, err := h.svc.ConfirmBoot(t.Context())
+	// The next process boots on the new binary, so the boot half runs against a
+	// service reporting the version that was installed — the same row and the
+	// same binary, a different build. Driving it from the 0.1.0 service instead
+	// would model a restart that never happened.
+	booted := service.NewUpdateService(directDeps(h.repo, "0.2.0", h.binary))
+
+	rolledBack, err := booted.ConfirmBoot(t.Context())
 	if err != nil {
 		t.Fatalf("ConfirmBoot: %v", err)
 	}
@@ -1030,7 +1062,7 @@ func TestTheHappyPathEndToEnd(t *testing.T) {
 	}
 
 	// And then it serves.
-	if err := h.svc.Confirm(t.Context()); err != nil {
+	if err := booted.Confirm(t.Context()); err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
 	if h.repo.state.Status != domain.UpdateConfirmed {

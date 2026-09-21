@@ -126,6 +126,12 @@ func newInstallCmd(g *globals) *cobra.Command {
 			if cfg.SealedKey != "" {
 				printf(cmd, "  key     sealed to this host (%s)\n", cfg.SealedKey)
 			}
+			// Only the daemon-owned copy is linked to. An explicit --binary names
+			// a path the operator manages themselves, and pointing PATH at a
+			// binary tumika does not update would be the very drift this avoids.
+			if binary == "" {
+				linkPATHBinary(cmd, p, cfg.Binary)
+			}
 			return reportStatus(cmd, mgr)
 		},
 	}

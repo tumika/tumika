@@ -20,6 +20,7 @@ import (
 	"github.com/tumika/tumika/source/daemon/internal/platform/buildinfo"
 	"github.com/tumika/tumika/source/daemon/internal/platform/paths"
 	"github.com/tumika/tumika/source/daemon/internal/platform/secrets"
+	"github.com/tumika/tumika/source/daemon/internal/repository/sqlite"
 	"github.com/tumika/tumika/source/daemon/internal/service"
 )
 
@@ -705,6 +706,96 @@ func TestAnUpdateIsConfirmedOnceServing(t *testing.T) {
 	if _, confirms := updates.counts(); confirms != 1 {
 		t.Errorf("Confirm ran %d times, want 1", confirms)
 	}
+}
+
+// A CLI command opens the daemon's resources and exits; it never boots the
+// daemon, so it takes no part in the update's second half.
+//
+// Driven with the REAL update service over a real update row and a real binary
+// on disk, because what has to stay untouched is the row and the filesystem.
+// Counting a boot attempt here would let MaxBootAttempts ordinary commands roll
+// an update back from inside a CLI process, before the daemon ever ran on it.
+func TestACLICommandNeitherCountsABootNorRollsBack(t *testing.T) {
+	useTestKeyCustody(t)
+
+	dir := t.TempDir()
+	p, err := paths.Resolve(filepath.Join(dir, "home"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// The update row lives in its own database: Options.Updates is injected
+	// whole, so the state machine's store is independent of the daemon's.
+	store, err := sqlite.Open(ctx, filepath.Join(dir, "update.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := sqlite.Migrate(ctx, store); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	repo := sqlite.NewUpdateStateRepo(store)
+	if err := repo.Put(ctx, domain.UpdateState{
+		Status: domain.UpdatePending, FromVersion: "0.1.0", ToVersion: "0.2.0",
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	binary := filepath.Join(dir, "tumika")
+	for path, body := range map[string]string{binary: "binary 0.2.0", binary + ".old": "binary 0.1.0"} {
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil { //nolint:gosec // a stand-in for an executable
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	updates := service.NewUpdateService(service.UpdateDeps{
+		Repo:    repo,
+		Tx:      store,
+		Schema:  func(context.Context) (int64, error) { return 1, nil },
+		Version: "0.2.0",
+		Binary:  binary,
+	})
+
+	// More invocations than MaxBootAttempts: under a counted boot the rollback
+	// would have fired by now.
+	for i := range domain.MaxBootAttempts + 1 {
+		d, err := daemon.New(ctx, daemon.Options{Paths: p, Updates: updates, SkipUpdateBoot: true})
+		if err != nil {
+			t.Fatalf("invocation %d: daemon.New: %v", i+1, err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("invocation %d: Close: %v", i+1, err)
+		}
+	}
+
+	state, err := repo.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if state.Status != domain.UpdatePending {
+		t.Errorf("status = %q, want pending — a CLI command resolved the update", state.Status)
+	}
+	if state.BootAttempts != 0 {
+		t.Errorf("boot attempts = %d, want 0 — a CLI command counted as a boot", state.BootAttempts)
+	}
+	if body := readFile(t, binary); body != "binary 0.2.0" {
+		t.Errorf("the binary is %q, want the updated one", body)
+	}
+	if body := readFile(t, binary+".old"); body != "binary 0.1.0" {
+		t.Errorf("the fallback is %q, want the previous binary", body)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path) //nolint:gosec // a path this test created
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(body)
 }
 
 // A daemon that cannot read its update row still starts: refusing would turn a

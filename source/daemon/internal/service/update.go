@@ -33,6 +33,11 @@ const oldSuffix = ".old"
 // because the next Apply refuses to overwrite a stale .old.
 var ErrFallbackNotRemoved = errors.New("the previous binary could not be removed")
 
+// ErrNotTheUpdatedBuild means the pending update names a version other than the
+// one this process is running, so it is not the update's own binary and cannot
+// confirm it.
+var ErrNotTheUpdatedBuild = errors.New("the running build is not the one the pending update installed")
+
 // UpdateService owns the self-update state machine.
 //
 // The whole design turns on one constraint: a process cannot replace the binary
@@ -614,6 +619,18 @@ func (s *updateService) Confirm(ctx context.Context) error {
 	}
 	if state.Status != domain.UpdatePending {
 		return nil
+	}
+
+	// The row is evidence about ONE binary — the one it names. A process whose
+	// component version differs is not that binary, however well it serves: the
+	// swap may have been undone, or the supervisor may have relaunched a
+	// different unit. Confirming from here would record a version nobody is
+	// running as proven and delete the .old that is still the way back from the
+	// one that is. The row stays pending, so the binary it names gets its boot
+	// attempts and its rollback when it next starts.
+	if state.ToVersion != s.deps.Version {
+		return fmt.Errorf("%w: the pending update installed %s and this build is %s",
+			ErrNotTheUpdatedBuild, state.ToVersion, s.deps.Version)
 	}
 
 	state.Status = domain.UpdateConfirmed

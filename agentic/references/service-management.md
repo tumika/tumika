@@ -52,3 +52,14 @@ Note what the container itself hides: `InContainer()` forces the system home, so
 the per-user-home bug was invisible until the harness started running an install
 with `TUMIKA_CONTAINER=0`. A harness has blind spots of its own, and they are
 worth writing down when found.
+
+## The PATH copy (ADR-0012)
+
+On macOS, `install` replaces the invoked, regular-file `tumika` that PATH resolves
+to with a symlink to the managed binary (temporary symlink, then rename). It does
+nothing when that copy is already managed or a link to it, leaves a copy invoked
+from elsewhere alone with a note, links nothing under `--binary`, and treats an
+unwritable PATH directory as a warning. On Linux it links nothing and prints a
+note: the managed directory is `0700` and owned by the service account, and
+`sudo <abs path> install` is never the PATH `tumika`. A dangling link after
+`uninstall` with a deleted home is accepted.
