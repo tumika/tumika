@@ -17,8 +17,8 @@ import (
 // release signed by the one replacing it.
 var releaseKeyPEMs = []string{
 	`-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb1Q/ZY2pcax1kXsEG/6Xt9uOMqMd
-924/2yXhfcMZ6CtT8UTPkUko9fxiEcyPS81LHMMuHjN1IYHxO+6bee6iZA==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGgmfTHgWRmKZRGo7FrLeAEPcr7y1
+v7rAq2l1R6qbrMFeBxyiaU4+XvOuP1THEIJjk8y5dqM6zzMgh2LydpLZ/g==
 -----END PUBLIC KEY-----
 `,
 }

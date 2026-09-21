@@ -56,8 +56,8 @@ main() {
 # verifies its own updates against; TestInstallerKeyMatchesReleaseKey fails when
 # the two drift. Rotating the key means editing both.
 RELEASE_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb1Q/ZY2pcax1kXsEG/6Xt9uOMqMd
-924/2yXhfcMZ6CtT8UTPkUko9fxiEcyPS81LHMMuHjN1IYHxO+6bee6iZA==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGgmfTHgWRmKZRGo7FrLeAEPcr7y1
+v7rAq2l1R6qbrMFeBxyiaU4+XvOuP1THEIJjk8y5dqM6zzMgh2LydpLZ/g==
 -----END PUBLIC KEY-----'
 
 DEFAULT_BASE_URL="https://get.tumika.org"
