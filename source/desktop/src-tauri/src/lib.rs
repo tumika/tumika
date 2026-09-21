@@ -3,6 +3,7 @@ mod health;
 mod keychain;
 pub mod pairing;
 mod status;
+pub mod update;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use tauri_plugin_positioner::{Position, WindowExt};
 use health::DEFAULT_BASE_URL;
 use keychain::SecurityCli;
 use status::{icon_for, DaemonStatus, IconKind, Monitor};
+use update::SharedStatus;
 
 /// Label of the window configured in `tauri.conf.json` as the tray popover.
 const POPOVER: &str = "popover";
@@ -63,13 +65,20 @@ pub fn run() {
         // The positioner plugin has to be registered for `Position::TrayCenter`
         // to resolve, even though only Rust calls `move_window`.
         .plugin(tauri_plugin_positioner::init())
+        // The updater's public key comes from `plugins.updater.pubkey`; the
+        // endpoint carrying each decision is built at runtime, so none is
+        // configured. Only Rust drives it, so no capability grants the webview
+        // its commands.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(CurrentStatus::default())
+        .manage(SharedStatus::default())
         .manage(LastDismissal::default())
         .invoke_handler(tauri::generate_handler![daemon_status, quit])
         .setup(|app| {
             set_accessory_activation_policy(app);
             build_tray(app)?;
             start_polling(app.handle().clone())?;
+            start_pairing(app.handle().clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -160,6 +169,14 @@ fn start_polling(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    Ok(())
+}
+
+/// Starts the loop that keeps this app on the desktop component version its
+/// daemon's release names.
+fn start_pairing(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let status = app.state::<SharedStatus>().inner().clone();
+    update::start(app.clone(), status, DEFAULT_BASE_URL)?;
     Ok(())
 }
 
