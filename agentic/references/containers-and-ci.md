@@ -79,21 +79,20 @@ Two workflows beyond `release.yml` publish the release host (ADR-0009):
   holds `contents: write` and `actions: write`. Concurrency group `edge`, never
   cancelled.
 
-`release.yml` ends in a `pages` job that calls `publish-pages.yml` (`uses:`,
-passing no secrets). The promote step publishes with `GITHUB_TOKEN`, which raises
-no workflow event, so the trigger would not fire on its own. A called workflow
-cannot hold more permission than its caller, so the job grants `contents: read`,
-`pages: write` and `id-token: write`.
-
-`edge.yml` does not call it. A called workflow runs at the caller's commit, and
-the day this workflow is dispatched anywhere but `main` that is the built
-branch's own `tumika-bom` source standing in front of the signing key. Its
-`publish` job (`actions: write`) dispatches `publish-pages.yml` on `main`
-instead. The signing key is a secret of the `release-signing` environment, whose
-deployment-branch policy admits only `main` and `v*.*.*` tags, so a run from any
-other branch cannot resolve it. The environment cannot tell whether a `v*.*.*`
-tag was cut from `main`, so a tag ruleset restricting who may create those tags
-is what closes the tag path.
+`release.yml` ends in a `pages` job that dispatches `publish-pages.yml` on `main`
+(`gh workflow run`, `actions: write`). The promote step publishes with
+`GITHUB_TOKEN`, which raises no workflow event, so the release trigger would not
+fire on its own, though that token may still dispatch a workflow. The job does
+not call the workflow with `uses:`: the `release-signing` environment secret
+arrives empty in a called workflow's job, so the site build fails after the
+release is already published. `edge.yml`'s `publish` job dispatches it the same
+way, which also keeps the built branch's own `tumika-bom` source away from the
+signing key: the signing job always runs `main`'s code. The signing key is a
+secret of the `release-signing` environment, whose deployment-branch policy
+admits only `main` and `v*.*.*` tags, so a run from any other branch cannot
+resolve it. The environment cannot tell whether a `v*.*.*` tag was cut from
+`main`, so a tag ruleset restricting who may create those tags is what closes
+the tag path.
 
 The branch being built never runs beside a write token or a signing key:
 `edge.yml`'s `build` and `desktop` jobs hold `contents: read` and no credentials,

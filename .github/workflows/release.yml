@@ -655,21 +655,28 @@ jobs:
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.buildmeta.outputs.date }}
 
-  # Called, not left to publish-pages.yml's own `release: published` trigger.
+  # Dispatched, not left to publish-pages.yml's own `release: published` trigger
+  # and not called with `uses:`.
+  #
   # The promote step above publishes the release with the default GITHUB_TOKEN,
   # and GitHub does not raise workflow events for anything that token did — so
   # that trigger never fires after a real release, and the site would keep
   # serving the previous channel heads until the weekly schedule caught up.
+  # GITHUB_TOKEN may still dispatch a workflow, which is the one thing it can
+  # start.
   #
-  # It runs last: the BOM generator reads PUBLISHED releases, so it has nothing
-  # to publish until the promote step has run, and the release notes point at an
-  # image the job above pushes.
+  # Calling the workflow instead runs its signing job under this run's tag, and
+  # the `release-signing` environment secret arrives empty there, so the site
+  # build fails after the release has already been published. Dispatched on
+  # main, the signing job runs main's `tumika-bom` under the environment's
+  # branch policy, exactly as it does for an edge build and for a manual run.
+  # The generator reads PUBLISHED releases from the API, so it needs nothing
+  # from the tag being built.
   #
-  # A called workflow cannot hold more permission than the job that calls it,
-  # so the two the deploy job in publish-pages.yml needs are granted here; the
-  # top of this file stays read-only. No secrets are passed: the signing key is
-  # an environment secret that workflow's build job resolves itself, and only for
-  # `main` and `v*.*.*` tags.
+  # It runs last: the BOM generator has nothing to publish until the promote
+  # step has run, and the release notes point at an image the job above pushes.
+  # The dispatch returns once the run is queued; the site run itself is where a
+  # failed publish shows, and re-running it is the recovery.
   pages:
     name: pages
     needs: [promote, image]
@@ -678,8 +685,13 @@ jobs:
     # heads. A failed one is: the notes of the release about to be published name
     # an image tag.
     if: ${{ !cancelled() && needs.promote.result == 'success' && needs.image.result != 'failure' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/publish-pages.yml
+      actions: write
+    steps:
+      - name: publish the site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run publish-pages.yml --ref main
