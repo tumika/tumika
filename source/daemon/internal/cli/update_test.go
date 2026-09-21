@@ -12,6 +12,7 @@ import (
 
 	"github.com/tumika/tumika/source/daemon/internal/domain"
 	"github.com/tumika/tumika/source/daemon/internal/platform/release"
+	"github.com/tumika/tumika/source/daemon/internal/platform/servicemgr"
 	"github.com/tumika/tumika/source/daemon/internal/service"
 )
 
@@ -56,7 +57,7 @@ func TestUpdateRefusesInAContainer(t *testing.T) {
 // by an operator.
 func TestUpdateFlags(t *testing.T) {
 	cmd := newUpdateCmd(&globals{})
-	for _, name := range []string{"check", "to"} {
+	for _, name := range []string{"check", "to", "no-restart"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("--%s is missing", name)
 		}
@@ -91,21 +92,81 @@ func (f *fakeUpdates) Confirm(context.Context) error             { return nil }
 
 var _ service.UpdateService = (*fakeUpdates)(nil)
 
-func run2(t *testing.T, fn func(*cobra.Command) error) (string, error) {
+func run2(t *testing.T, fn func(*cobra.Command) error) (string, string, error) {
 	t.Helper()
 	cmd := &cobra.Command{}
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
 	cmd.SetContext(context.Background())
 	err := fn(cmd)
-	return out.String(), err
+	return out.String(), errOut.String(), err
+}
+
+// restartManager reports one state and records what was asked of it, with Stop
+// and Start failing independently — the half-restarted case is the one worth
+// covering and a single error field cannot express it.
+type restartManager struct {
+	state     servicemgr.State
+	statusErr error
+	stopErr   error
+	startErr  error
+	calls     []string
+}
+
+func (m *restartManager) Prepare(context.Context, servicemgr.Config) error { return nil }
+func (m *restartManager) Install(context.Context, servicemgr.Config) error { return nil }
+func (m *restartManager) Uninstall(context.Context) error                  { return nil }
+
+func (m *restartManager) Start(context.Context) error {
+	m.calls = append(m.calls, "start")
+	return m.startErr
+}
+
+func (m *restartManager) Stop(context.Context) error {
+	m.calls = append(m.calls, "stop")
+	return m.stopErr
+}
+
+func (m *restartManager) Status(context.Context) (servicemgr.Status, error) {
+	m.calls = append(m.calls, "status")
+	if m.statusErr != nil {
+		return servicemgr.Status{}, m.statusErr
+	}
+	return servicemgr.Status{Manager: "launchd", State: m.state}, nil
+}
+
+// updateWith runs an update whose binary IS the one the service runs, against
+// the given manager. The path never has to exist: nothing reads it.
+func updateWith(t *testing.T, mgr servicemgr.Manager, opts updateOptions) (string, string, error) {
+	t.Helper()
+
+	managed := "/var/lib/tumika/bin/tumika"
+	originalExe := executablePath
+	executablePath = func() (string, error) { return managed, nil }
+	t.Cleanup(func() { executablePath = originalExe })
+
+	originalFactory := managerFactory
+	managerFactory = func() (servicemgr.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { managerFactory = originalFactory })
+
+	if opts.managed == "" {
+		opts.managed = managed
+	}
+	if opts.current == "" {
+		opts.current = "0.1.0"
+	}
+	updates := &fakeUpdates{available: "0.2.0", newer: true}
+	return run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, opts)
+	})
 }
 
 func TestRunUpdateInstallsTheNewestVersion(t *testing.T) {
 	updates := &fakeUpdates{available: "0.2.0", newer: true}
 
-	out, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "")
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0", noRestart: true})
 	})
 	if err != nil {
 		t.Fatalf("runUpdate: %v", err)
@@ -113,8 +174,131 @@ func TestRunUpdateInstallsTheNewestVersion(t *testing.T) {
 	if len(updates.applied) != 1 || updates.applied[0] != "0.2.0" {
 		t.Errorf("applied %v, want [0.2.0]", updates.applied)
 	}
-	if !strings.Contains(out, "0.2.0") || !strings.Contains(out, "Restart the service") {
-		t.Errorf("the operator is not told what happened or what to do next:\n%s", out)
+	if !strings.Contains(out, "0.2.0") || !strings.Contains(out, "Installed.") {
+		t.Errorf("the operator is not told what happened:\n%s", out)
+	}
+}
+
+// The replacement is a new file, not a rewrite of the one the daemon has in
+// memory, so an update that does not restart leaves the old build serving.
+func TestRunUpdateRestartsARunningService(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateRunning}
+
+	out, _, err := updateWith(t, mgr, updateOptions{})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	if !strings.Contains(strings.Join(mgr.calls, ","), "stop,start") {
+		t.Errorf("the service was not stopped and started: %v", mgr.calls)
+	}
+	if !strings.Contains(out, "Restarting") {
+		t.Errorf("the restart is not reported:\n%s", out)
+	}
+}
+
+func TestRunUpdateNoRestartLeavesTheServiceAlone(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateRunning}
+
+	out, _, err := updateWith(t, mgr, updateOptions{noRestart: true})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	if len(mgr.calls) != 0 {
+		t.Errorf("--no-restart touched the service: %v", mgr.calls)
+	}
+	if !strings.Contains(out, "tumika start") {
+		t.Errorf("the operator is not told how to pick the new binary up:\n%s", out)
+	}
+}
+
+// Nothing to restart is a normal outcome — an operator updating a binary they
+// run by hand — and must not read as a failure.
+func TestRunUpdateWithNoServiceInstalled(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateNotInstalled}
+
+	out, _, err := updateWith(t, mgr, updateOptions{})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	for _, call := range mgr.calls {
+		if call == "stop" || call == "start" {
+			t.Errorf("an uninstalled service was driven: %v", mgr.calls)
+		}
+	}
+	if !strings.Contains(out, "not installed") {
+		t.Errorf("output does not say why nothing was restarted:\n%s", out)
+	}
+}
+
+// A stopped service was stopped by someone, and starting it from under them
+// would turn an update into a deployment.
+func TestRunUpdateDoesNotStartAStoppedService(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateStopped}
+
+	out, _, err := updateWith(t, mgr, updateOptions{})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	for _, call := range mgr.calls {
+		if call == "start" {
+			t.Errorf("a stopped service was started: %v", mgr.calls)
+		}
+	}
+	if !strings.Contains(out, "tumika start") {
+		t.Errorf("output does not name the command that starts it:\n%s", out)
+	}
+}
+
+// The supervisor runs the managed copy. Restarting after replacing some other
+// tumika relaunches the daemon on the build it already has.
+func TestRunUpdateDoesNotRestartWhenTheBinaryIsNotTheManagedOne(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateRunning}
+
+	_, errOut, err := updateWith(t, mgr, updateOptions{managed: "/opt/tumika/bin/tumika"})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	if len(mgr.calls) != 0 {
+		t.Errorf("the service was driven for a binary it does not run: %v", mgr.calls)
+	}
+	if !strings.Contains(errOut, "tumika install") {
+		t.Errorf("the warning does not name the fix:\n%s", errOut)
+	}
+}
+
+// Stopped and not started again is the one outcome an operator must not have to
+// infer: the binary is replaced and nothing is serving.
+func TestRunUpdateReportsAServiceThatStoppedAndDidNotStart(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateRunning, startErr: errors.New("bootstrap failed")}
+
+	_, errOut, err := updateWith(t, mgr, updateOptions{})
+	if err == nil {
+		t.Fatal("a service left stopped reported success")
+	}
+	if !strings.Contains(errOut, "STOPPED") || !strings.Contains(errOut, "tumika start") {
+		t.Errorf("the operator is not told the state or the fix:\n%s", errOut)
+	}
+}
+
+func TestRunUpdateReportsAStopFailure(t *testing.T) {
+	mgr := &restartManager{state: servicemgr.StateRunning, stopErr: errors.New("permission denied")}
+
+	if _, _, err := updateWith(t, mgr, updateOptions{}); err == nil {
+		t.Fatal("a failed stop reported success")
+	}
+}
+
+// A supervisor that cannot be read is not a failed update: the binary is on
+// disk, and the operator is told to restart it themselves.
+func TestRunUpdateWarnsWhenTheServiceStateCannotBeRead(t *testing.T) {
+	mgr := &restartManager{statusErr: errors.New("launchctl exploded")}
+
+	_, errOut, err := updateWith(t, mgr, updateOptions{})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	if !strings.Contains(errOut, "not restarted") {
+		t.Errorf("the warning does not say what was skipped:\n%s", errOut)
 	}
 }
 
@@ -123,8 +307,8 @@ func TestRunUpdateInstallsTheNewestVersion(t *testing.T) {
 func TestRunUpdateCheckInstallsNothing(t *testing.T) {
 	updates := &fakeUpdates{available: "0.2.0", newer: true}
 
-	out, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", true, "")
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0", check: true})
 	})
 	if err != nil {
 		t.Fatalf("runUpdate: %v", err)
@@ -140,8 +324,8 @@ func TestRunUpdateCheckInstallsNothing(t *testing.T) {
 func TestRunUpdateWhenAlreadyUpToDate(t *testing.T) {
 	updates := &fakeUpdates{available: "0.1.0", newer: false}
 
-	out, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "")
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0"})
 	})
 	if err != nil {
 		t.Fatalf("runUpdate: %v", err)
@@ -159,8 +343,8 @@ func TestRunUpdateWhenAlreadyUpToDate(t *testing.T) {
 func TestRunUpdateHonoursAnExplicitVersion(t *testing.T) {
 	updates := &fakeUpdates{available: "0.3.0", newer: true}
 
-	if _, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "0.2.0")
+	if _, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0", version: "0.2.0", noRestart: true})
 	}); err != nil {
 		t.Fatalf("runUpdate: %v", err)
 	}
@@ -174,8 +358,8 @@ func TestRunUpdateHonoursAnExplicitVersion(t *testing.T) {
 func TestRunUpdateWithNoReleasePublished(t *testing.T) {
 	updates := &fakeUpdates{checkErr: release.ErrNoRelease}
 
-	out, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "")
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0"})
 	})
 	if err != nil {
 		t.Fatalf("no release was reported as an error: %v", err)
@@ -190,8 +374,8 @@ func TestRunUpdateWithNoReleasePublished(t *testing.T) {
 func TestRunUpdateReportsACheckFailure(t *testing.T) {
 	updates := &fakeUpdates{checkErr: errors.New("connection reset")}
 
-	if _, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "")
+	if _, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0"})
 	}); err == nil {
 		t.Fatal("a failed check reported success")
 	}
@@ -203,16 +387,16 @@ func TestRunUpdateReportsAnApplyFailure(t *testing.T) {
 		applyErr: errors.New("checksum mismatch"),
 	}
 
-	if _, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, updates, "0.1.0", false, "")
+	if _, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{current: "0.1.0"})
 	}); err == nil {
 		t.Fatal("a failed install reported success")
 	}
 }
 
 func TestRunUpdateWithSelfUpdateDisabled(t *testing.T) {
-	if _, err := run2(t, func(cmd *cobra.Command) error {
-		return runUpdate(cmd, nil, "0.1.0", false, "")
+	if _, _, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, nil, updateOptions{current: "0.1.0"})
 	}); err == nil {
 		t.Fatal("update ran with no service")
 	}
@@ -245,7 +429,7 @@ func TestRunUpdateStatus(t *testing.T) {
 	}
 
 	for name, tc := range tests {
-		out, err := run2(t, func(cmd *cobra.Command) error {
+		out, _, err := run2(t, func(cmd *cobra.Command) error {
 			return runUpdateStatus(cmd, &fakeUpdates{state: tc.state})
 		})
 		if err != nil {
@@ -260,7 +444,7 @@ func TestRunUpdateStatus(t *testing.T) {
 }
 
 func TestRunUpdateStatusWithSelfUpdateDisabled(t *testing.T) {
-	out, err := run2(t, func(cmd *cobra.Command) error {
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
 		return runUpdateStatus(cmd, nil)
 	})
 	if err != nil {
@@ -306,7 +490,7 @@ func TestUpdateStatusRunsEndToEnd(t *testing.T) {
 
 // A confirmed update reports cleanly, with no rollback advice.
 func TestRunUpdateStatusConfirmed(t *testing.T) {
-	out, err := run2(t, func(cmd *cobra.Command) error {
+	out, _, err := run2(t, func(cmd *cobra.Command) error {
 		return runUpdateStatus(cmd, &fakeUpdates{state: domain.UpdateState{
 			Status: domain.UpdateConfirmed, FromVersion: "0.1.0", ToVersion: "0.2.0",
 		}})
