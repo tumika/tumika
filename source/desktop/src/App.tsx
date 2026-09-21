@@ -5,6 +5,7 @@ import {
   formatPolledAgo,
   instructionFor,
   pillFor,
+  updateLine,
   type DaemonStatus,
 } from "./daemon";
 
@@ -95,6 +96,15 @@ export default function App() {
       {instruction ? (
         <p className="instruction" data-testid="instruction">
           {instruction}
+        </p>
+      ) : null}
+
+      {status?.update ? (
+        <p
+          className={`update update-${status.update.state}`}
+          data-testid="update"
+        >
+          {updateLine(status.update)}
         </p>
       ) : null}
 

@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::health::{Health, HealthClient, HealthError};
 use crate::keychain::{self, TokenSource};
+use crate::update::UpdateStatus;
 
 /// The fixed set of things the tray can say about the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,6 +37,10 @@ pub struct DaemonStatus {
     /// Wall-clock milliseconds of this poll, so a reader can age it against a
     /// clock of its own rather than trusting an elapsed count to stay fresh.
     pub polled_at_ms: u64,
+    /// The app's own update status, or `None` before the first check has
+    /// started. A poll leaves it empty; the publisher fills it from the update
+    /// loop's shared status.
+    pub update: Option<UpdateStatus>,
 }
 
 /// Which menu bar image a state calls for.
@@ -145,6 +150,7 @@ impl Monitor {
                 .duration_since(UNIX_EPOCH)
                 .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or_default(),
+            update: None,
         }
     }
 }
@@ -366,6 +372,7 @@ mod tests {
             detail: None,
             address: "127.0.0.1:8737".to_string(),
             polled_at_ms: 1,
+            update: None,
         };
 
         let encoded = serde_json::to_string(&status).expect("serialise");
@@ -373,7 +380,40 @@ mod tests {
         assert!(!encoded.contains(TOKEN), "{encoded}");
         assert_eq!(
             encoded,
-            r#"{"state":"running","health":null,"detail":null,"address":"127.0.0.1:8737","polled_at_ms":1}"#
+            r#"{"state":"running","health":null,"detail":null,"address":"127.0.0.1:8737","polled_at_ms":1,"update":null}"#
+        );
+    }
+
+    #[test]
+    fn the_update_status_serialises_with_the_daemon_status() {
+        use crate::update::UpdateState;
+
+        let status = DaemonStatus {
+            state: DaemonState::Running,
+            health: None,
+            detail: None,
+            address: "127.0.0.1:8737".to_string(),
+            polled_at_ms: 1,
+            update: Some(UpdateStatus {
+                state: UpdateState::Failed,
+                component_version: "0.1.0".to_string(),
+                target_component_version: None,
+                detail: Some("signature rejected".to_string()),
+                checked_at_ms: 2,
+            }),
+        };
+
+        let encoded = serde_json::to_value(&status).expect("serialise");
+
+        assert_eq!(
+            encoded["update"],
+            serde_json::json!({
+                "state": "failed",
+                "component_version": "0.1.0",
+                "target_component_version": null,
+                "detail": "signature rejected",
+                "checked_at_ms": 2
+            })
         );
     }
 }

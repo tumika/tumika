@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
-import type { DaemonState, DaemonStatus, Health } from "./daemon";
+import type { DaemonState, DaemonStatus, Health, UpdateStatus } from "./daemon";
 
 /** Every handler `App` has subscribed with, so a test can publish a poll. */
 const subscribers: Array<(status: DaemonStatus) => void> = [];
@@ -43,6 +43,7 @@ function status(overrides: Partial<DaemonStatus> = {}): DaemonStatus {
     detail: null,
     address: "127.0.0.1:8737",
     polled_at_ms: POLLED_AT,
+    update: null,
     ...overrides,
   };
 }
@@ -217,5 +218,61 @@ describe("the fields no daemon data exists for", () => {
     }
     expect(screen.queryByText(/pid/i)).toBeNull();
     expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+});
+
+describe("the update line", () => {
+  const update: UpdateStatus = {
+    state: "up_to_date",
+    component_version: "0.1.0",
+    target_component_version: null,
+    detail: null,
+    checked_at_ms: POLLED_AT,
+  };
+
+  it("is absent before an update status exists", async () => {
+    await renderPopover();
+    await publish(status());
+
+    expect(screen.queryByTestId("update")).toBeNull();
+  });
+
+  it("says the app is up to date", async () => {
+    await renderPopover();
+    await publish(status({ update }));
+
+    expect(screen.getByTestId("update").textContent).toBe(
+      "Up to date with the release · component version 0.1.0",
+    );
+  });
+
+  it("names the component version being installed", async () => {
+    await renderPopover();
+    await publish(
+      status({
+        update: {
+          ...update,
+          state: "updating",
+          target_component_version: "0.2.0",
+        },
+      }),
+    );
+
+    expect(screen.getByTestId("update").textContent).toBe(
+      "Updating to component version 0.2.0…",
+    );
+  });
+
+  it("gives the reason an update failed", async () => {
+    await renderPopover();
+    await publish(
+      status({
+        update: { ...update, state: "failed", detail: "signature rejected" },
+      }),
+    );
+
+    expect(screen.getByTestId("update").textContent).toBe(
+      "Update failed: signature rejected",
+    );
   });
 });

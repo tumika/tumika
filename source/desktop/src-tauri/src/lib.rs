@@ -182,7 +182,9 @@ fn start_pairing(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Records a poll, points the tray at the icon it calls for, and tells the
 /// popover.
-fn publish(app: &AppHandle, status: DaemonStatus) {
+fn publish(app: &AppHandle, mut status: DaemonStatus) {
+    status.update = app.state::<SharedStatus>().get();
+
     if let Some(tray) = app.tray_by_id(TRAY) {
         if let Ok(icon) = Image::from_bytes(icon_bytes(icon_for(status.state))) {
             let _ = tray.set_icon(Some(icon));
