@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +265,51 @@ func TestRunUpdateDoesNotRestartWhenTheBinaryIsNotTheManagedOne(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "tumika install") {
 		t.Errorf("the warning does not name the fix:\n%s", errOut)
+	}
+}
+
+// The running binary's path is symlink-resolved, so a managed path reached
+// through a symlinked directory still names the same file.
+func TestRunUpdateRestartsWhenTheManagedPathIsReachedThroughASymlink(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(real, "tumika")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	self, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalExe := executablePath
+	executablePath = func() (string, error) { return self, nil }
+	t.Cleanup(func() { executablePath = originalExe })
+
+	mgr := &restartManager{state: servicemgr.StateRunning}
+	originalFactory := managerFactory
+	managerFactory = func() (servicemgr.Manager, error) { return mgr, nil }
+	t.Cleanup(func() { managerFactory = originalFactory })
+
+	updates := &fakeUpdates{available: "0.2.0", newer: true}
+	_, errOut, err := run2(t, func(cmd *cobra.Command) error {
+		return runUpdate(cmd, updates, updateOptions{
+			current: "0.1.0",
+			managed: filepath.Join(link, "tumika"),
+		})
+	})
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+	if len(mgr.calls) == 0 {
+		t.Errorf("the service was not restarted:\n%s", errOut)
 	}
 }
 

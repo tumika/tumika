@@ -172,7 +172,13 @@ func restartService(cmd *cobra.Command, managed string) error {
 	// The supervisor runs the managed copy, so restarting after replacing some
 	// other tumika would relaunch the daemon on exactly the build it already
 	// has — a restart that reports success and changes nothing.
-	if self != managed {
+	// self is symlink-resolved, so managed is resolved too: a symlinked home or
+	// data volume names the same file by two strings.
+	resolved := managed
+	if r, err := filepath.EvalSymlinks(managed); err == nil {
+		resolved = r
+	}
+	if self != resolved {
 		warnNoRestart(cmd, fmt.Sprintf("%s was replaced, but the service runs %s", self, managed))
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 			"Run `tumika install` to point the service at this copy.\n")
