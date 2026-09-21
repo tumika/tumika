@@ -1,0 +1,21 @@
+---
+about: couplings in pairing the desktop app to its daemon's release, and in install-app.sh, that a change can break without a failing build; what breaks if any of these change
+saw:
+  - source/desktop/src-tauri/src/pairing.rs
+  - source/desktop/src-tauri/src/bomsig.rs
+  - source/desktop/src-tauri/src/update.rs
+  - source/desktop/src-tauri/tauri.conf.json
+  - source/daemon/internal/platform/release/bom.go
+  - source/daemon/internal/platform/release/keys.go
+  - scripts/install-app.sh
+  - scripts/assemble-site.sh
+---
+- `RELEASE_LABEL_PATTERN` in pairing.rs is a copy of `releaseLabelPattern` in the daemon's bom.go, and install-app.sh spells it a third time; a test parses bom.go for the Rust copy. The label arrives over HTTP and goes into a URL path, so loosening any copy lets a hostile daemon report choose the URL the app fetches and the installer downloads from.
+- The asset-name contract is `tumika-desktop_<component version>_<goos>_<goarch>.app.tar.gz` and the BOM asset keys are `darwin_arm64` / `darwin_amd64`. `Arch::platform_key` and install-app.sh's `PLATFORM` build those keys; renaming either side leaves the app reporting "no asset for this platform" (a reason, not an error) and no build fails.
+- An asset's BOM `signature` is base64 of the minisign document beside the archive, passed to the updater unchanged and opaque to the app. Decoding it, trimming it or changing its encoding in bomgen makes the updater refuse every archive. install-app.sh never reads it.
+- The app's key list (`RELEASE_KEY_PEMS` in bomsig.rs) is a copy of `platform/release/keys.go`, and install-app.sh embeds the first key; a test fails on each drift. Adding a key means editing all three. A key the app lacks makes it refuse every document signed by it, and the popover shows a signature failure.
+- `plugins.updater.pubkey` in tauri.conf.json is what every installed app verifies archives against. Losing the private key means shipping a new pubkey in a build the old key signs; apps that cannot take that update are reinstalled by hand.
+- `plugins.updater.dangerousInsecureTransportProtocol: true` exists only because the update decision is served from a one-shot `http://127.0.0.1` endpoint (update.rs `serve_once`). It governs endpoint schemes, not the archive download. Dropping it makes the updater refuse the endpoint; pointing the endpoint at a remote http host with it set is an unauthenticated update source.
+- The updater's comparator accepts any component version that differs from the running one. Restoring the plugin's "strictly newer" rule stops the app following its daemon back to an older release.
+- install-app.sh is served as `/install-app.sh` beside `/install-daemon.sh`, and `scripts/assemble-site.sh` takes five arguments: `<bom-dir> <daemon-installer> <app-installer> <static-dir> <out-dir>`. A caller (publish-pages.yml) passing any other count fails the site build.
+- The daemon URL in both the app (`DEFAULT_BASE_URL` in health.rs) and install-app.sh is `http://127.0.0.1:8737`, a constant, so the app pairs with a local daemon only.
