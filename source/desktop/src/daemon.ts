@@ -18,6 +18,18 @@ export type DaemonState =
   | "needs_setup"
   | "token_rejected";
 
+/** What the app is doing about its own component version. */
+export type UpdateState = "checking" | "up_to_date" | "updating" | "failed";
+
+/** The app's update status, exactly as the Rust side serialises it. */
+export interface UpdateStatus {
+  state: UpdateState;
+  component_version: string;
+  target_component_version: string | null;
+  detail: string | null;
+  checked_at_ms: number;
+}
+
 /** A single poll's outcome, exactly as the Rust side serialises it. */
 export interface DaemonStatus {
   state: DaemonState;
@@ -25,6 +37,7 @@ export interface DaemonStatus {
   detail: string | null;
   address: string;
   polled_at_ms: number;
+  update: UpdateStatus | null;
 }
 
 /**
@@ -85,4 +98,20 @@ export function formatPolledAgo(nowMs: number, polledAtMs: number): string {
     return `polled ${minutes}m ago`;
   }
   return `polled ${Math.floor(minutes / 60)}h ago`;
+}
+
+/** One line saying where the app stands against its daemon's release. */
+export function updateLine(update: UpdateStatus): string {
+  switch (update.state) {
+    case "checking":
+      return "Checking the release…";
+    case "up_to_date":
+      return `Up to date with the release · component version ${update.component_version}`;
+    case "updating":
+      return update.target_component_version
+        ? `Updating to component version ${update.target_component_version}…`
+        : "Updating…";
+    case "failed":
+      return update.detail ? `Update failed: ${update.detail}` : "Update failed";
+  }
 }

@@ -165,18 +165,19 @@ workflows creates.**
   Losing the private key means shipping a new public key to every installed app
   (ADR-0010). The six `APPLE_*` secrets are optional, all or none.
 
-**The site is assembled from three inputs and served from one host.**
+**The site is assembled from four inputs and served from one host.**
 `publish-pages.yml` runs `tumika-bom` (which reads the published releases and
 writes every document and its detached `.sig`), then
-`scripts/assemble-site.sh <bom-dir> <installer> <static-dir> <out-dir>`, which
-adds the installer and `scripts/site/` and refuses a tree without an installer,
+`scripts/assemble-site.sh <bom-dir> <daemon-installer> <app-installer> <static-dir> <out-dir>`,
+which adds both installers and `scripts/site/` and refuses a tree without an installer,
 `CNAME`, `index.html`, a channel head, or a document's signature. It serves:
 
 | Path | Content |
 |---|---|
 | `/channels/<channel>.json` (+ `.sig`) | the head release of `stable`, `beta` or `edge` |
 | `/releases/<label>.json` (+ `.sig`) | one release's bill of materials |
-| `/install-daemon.sh` | the installer |
+| `/install-daemon.sh` | the daemon installer |
+| `/install-app.sh` | the macOS app installer, served from the same host |
 | `/`, `/CNAME` | the landing page and the custom domain record |
 
 The BOMs are regenerated whole on every run, so re-running the workflow retries

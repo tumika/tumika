@@ -115,3 +115,13 @@ than answering 404.
 `tumika update` is one of the few commands that does NOT go through the API: the
 case that matters most is a daemon that will not stay up, and an HTTP client
 cannot help an operator whose service is crash-looping.
+
+## The desktop app follows the daemon's release
+
+The app has its own half, and it is a client of this one: it asks the daemon which
+release it runs (`GET /v1/version`), verifies that release's bill of materials
+against its own copy of the key list, and installs the desktop component version the
+document names through the Tauri updater, in either direction. Any differing
+component version is an update. `scripts/install-app.sh` makes the same choice for a
+first install. The trust order, the loopback endpoint and the rejected alternatives
+are in ADR-0011.

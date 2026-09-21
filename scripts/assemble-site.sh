@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Assembles the tree get.tumika.org serves, and refuses to produce a broken one.
 #
-# Three inputs land in one directory: the signed BOM tree tumika-bom wrote, the
-# daemon installer, and the static files under scripts/site. The installer is
-# passed by path and always lands as install-daemon.sh, so the documented URL
-# does not depend on where the file was built.
+# Four inputs land in one directory: the signed BOM tree tumika-bom wrote, the
+# two installers, and the static files under scripts/site. Each installer is
+# passed by path and always lands under its documented name — install-daemon.sh
+# and install-app.sh — so the URL does not depend on where the file was built.
+# One Pages site is one host, so both live here.
 #
 # Every check below describes a site that deploys cleanly and then fails in a
 # way nobody watching the workflow can see: a document without its signature is
@@ -14,22 +15,24 @@
 # replaces the whole site on each deploy, so each of those takes the channel
 # down until the next successful run.
 #
-# Usage: scripts/assemble-site.sh <bom-dir> <installer> <static-dir> <out-dir>
+# Usage: scripts/assemble-site.sh <bom-dir> <daemon-installer> <app-installer> <static-dir> <out-dir>
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-[[ $# -eq 4 ]] || fail "usage: $0 <bom-dir> <installer> <static-dir> <out-dir>"
+[[ $# -eq 5 ]] || fail "usage: $0 <bom-dir> <daemon-installer> <app-installer> <static-dir> <out-dir>"
 
 BOM_DIR="$1"
-INSTALLER="$2"
-STATIC_DIR="$3"
-OUT_DIR="$4"
+DAEMON_INSTALLER="$2"
+APP_INSTALLER="$3"
+STATIC_DIR="$4"
+OUT_DIR="$5"
 
-# The installer is built by a different step and is the input most likely to be
+# An installer is built by a different step and is the input most likely to be
 # absent, so it is named plainly rather than reported as a missing file.
 [[ -d "$BOM_DIR" ]] || fail "$BOM_DIR is not a directory; tumika-bom writes the BOM tree"
-[[ -f "$INSTALLER" ]] || fail "$INSTALLER is not a file; the site serves it as /install-daemon.sh"
+[[ -f "$DAEMON_INSTALLER" ]] || fail "$DAEMON_INSTALLER is not a file; the site serves it as /install-daemon.sh"
+[[ -f "$APP_INSTALLER" ]] || fail "$APP_INSTALLER is not a file; the site serves it as /install-app.sh"
 [[ -d "$STATIC_DIR" ]] || fail "$STATIC_DIR is not a directory; it holds the site's static files"
 
 # A fresh directory is what makes the checks below cover the whole published
@@ -39,8 +42,9 @@ OUT_DIR="$4"
 mkdir -p "$OUT_DIR"
 
 cp -R "$BOM_DIR/." "$OUT_DIR/"
-cp "$INSTALLER" "$OUT_DIR/install-daemon.sh"
-chmod 0755 "$OUT_DIR/install-daemon.sh"
+cp "$DAEMON_INSTALLER" "$OUT_DIR/install-daemon.sh"
+cp "$APP_INSTALLER" "$OUT_DIR/install-app.sh"
+chmod 0755 "$OUT_DIR/install-daemon.sh" "$OUT_DIR/install-app.sh"
 # Last, so a static file wins over anything of the same name in the BOM tree.
 cp -R "$STATIC_DIR/." "$OUT_DIR/"
 
@@ -69,4 +73,4 @@ while IFS= read -r document; do
   [[ -f "$document.sig" ]] || fail "${document#"$OUT_DIR/"} has no matching .sig"
 done < <(find "${signed[@]}" -type f -name '*.json')
 
-echo "assembled $OUT_DIR: ${#channels[@]} channel head(s), install-daemon.sh, $(basename "$STATIC_DIR") static files"
+echo "assembled $OUT_DIR: ${#channels[@]} channel head(s), install-daemon.sh, install-app.sh, $(basename "$STATIC_DIR") static files"
