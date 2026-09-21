@@ -384,7 +384,17 @@ echo "downloading Tumika ${COMPONENT_VERSION} from release ${DOC_RELEASE} (darwi
 # curl sets no com.apple.quarantine attribute, which is what lets an ad-hoc
 # signed bundle open without a Gatekeeper prompt. Nothing here may be replaced
 # by a downloader that does set one.
-if ! curl --fail --silent --show-error --location --proto "$SITE_PROTO" \
+#
+# The archive is the one large download, and a slow link makes a silent transfer
+# look like a hang. A progress bar goes to stderr, which is the terminal even
+# under `curl … | sh`; with no terminal the transfer stays silent so a log or a
+# pipe is not filled with bar redraws.
+if [ -t 2 ]; then
+  fetch_archive() { curl --fail --show-error --location --progress-bar "$@"; }
+else
+  fetch_archive() { curl --fail --silent --show-error --location "$@"; }
+fi
+if ! fetch_archive --proto "$SITE_PROTO" \
   --connect-timeout 10 --max-time 600 --max-filesize 268435456 \
   -o "$STAGE/app.tar.gz" "$ASSET_URL"; then
   echo "error: release $DOC_RELEASE names $ASSET_URL, which could not be downloaded" >&2
