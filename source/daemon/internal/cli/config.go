@@ -148,7 +148,7 @@ func runConfigSet(cmd *cobra.Command, cfg configService, key, value string, asJS
 	} else {
 		printf(cmd, "%s = %s\n", view.Key, displayValue(view.Value))
 	}
-	printf(cmd, "%s", liveDaemonNote)
+	_, _ = fmt.Fprint(cmd.ErrOrStderr(), liveDaemonNote)
 	return nil
 }
 
@@ -191,7 +191,7 @@ func runConfigReset(cmd *cobra.Command, cfg configService, key string, asJSON bo
 		printf(cmd, "%s reset to default (%s), no longer explicitly set.\n",
 			view.Key, displayValue(view.Default))
 	}
-	printf(cmd, "%s", liveDaemonNote)
+	_, _ = fmt.Fprint(cmd.ErrOrStderr(), liveDaemonNote)
 	return nil
 }
 

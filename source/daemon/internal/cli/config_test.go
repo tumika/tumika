@@ -132,7 +132,7 @@ func TestConfigGetUnknownKey(t *testing.T) {
 func TestConfigSetBool(t *testing.T) {
 	cfg := newTestConfigService()
 
-	out, _, err := run2(t, func(cmd *cobra.Command) error {
+	out, errOut, err := run2(t, func(cmd *cobra.Command) error {
 		return runConfigSet(cmd, cfg, service.KeyUpdateAutoApply, "false", false)
 	})
 	if err != nil {
@@ -141,8 +141,8 @@ func TestConfigSetBool(t *testing.T) {
 	if !strings.Contains(out, service.KeyUpdateAutoApply+" = false") {
 		t.Errorf("set output missing the stored value:\n%s", out)
 	}
-	if !strings.Contains(out, "note: a running daemon picks this up on its next read") {
-		t.Errorf("set output missing the live-daemon note:\n%s", out)
+	if !strings.Contains(errOut, "note: a running daemon picks this up on its next read") {
+		t.Errorf("set stderr missing the live-daemon note:\n%s", errOut)
 	}
 
 	view, err := cfg.Get(context.Background(), service.KeyUpdateAutoApply)
@@ -160,14 +160,22 @@ func TestConfigSetBool(t *testing.T) {
 func TestConfigSetString(t *testing.T) {
 	cfg := newTestConfigService()
 
-	out, _, err := run2(t, func(cmd *cobra.Command) error {
+	out, errOut, err := run2(t, func(cmd *cobra.Command) error {
 		return runConfigSet(cmd, cfg, service.KeyProviderSelected, "claude-code", true)
 	})
 	if err != nil {
 		t.Fatalf("set --json: %v", err)
 	}
-	if !strings.Contains(out, `"value": "claude-code"`) {
-		t.Errorf("set --json output missing the stored value:\n%s", out)
+
+	var view domain.SettingView
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		t.Fatalf("set --json stdout is not valid JSON (%v):\n%s", err, out)
+	}
+	if displayValue(view.Value) != "claude-code" {
+		t.Errorf("set --json value = %s, want claude-code", view.Value)
+	}
+	if !strings.Contains(errOut, "note: a running daemon picks this up on its next read") {
+		t.Errorf("set --json stderr missing the live-daemon note:\n%s", errOut)
 	}
 }
 
@@ -203,7 +211,7 @@ func TestConfigResetReportsTheDefaultAndIsSetFalse(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 
-	out, _, err := run2(t, func(cmd *cobra.Command) error {
+	out, errOut, err := run2(t, func(cmd *cobra.Command) error {
 		return runConfigReset(cmd, cfg, service.KeyUpdateAutoApply, false)
 	})
 	if err != nil {
@@ -212,8 +220,8 @@ func TestConfigResetReportsTheDefaultAndIsSetFalse(t *testing.T) {
 	if !strings.Contains(out, service.KeyUpdateAutoApply+" reset to default (true), no longer explicitly set.") {
 		t.Errorf("reset message wording changed:\n%s", out)
 	}
-	if !strings.Contains(out, "note: a running daemon picks this up on its next read") {
-		t.Errorf("reset output missing the live-daemon note:\n%s", out)
+	if !strings.Contains(errOut, "note: a running daemon picks this up on its next read") {
+		t.Errorf("reset stderr missing the live-daemon note:\n%s", errOut)
 	}
 
 	view, err := cfg.Get(ctx, service.KeyUpdateAutoApply)
