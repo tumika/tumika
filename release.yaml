@@ -6,7 +6,7 @@
 # read through scripts/release-component-version.sh; a beta release carries a
 # -beta.N prerelease suffix on the component versions it changes. The release's
 # tag is v<label>. scripts/validate-release.sh checks the whole file.
-release: 2026.09.01
+release: 2026.09.02
 components:
-  daemon: 0.0.1
-  desktop: 0.1.0
+  daemon: 0.1.0
+  desktop: 0.1.1
