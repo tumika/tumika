@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, the in-process-CLI prohibition narrowed by ADR-0013
 date: 2026-08-14
 ---
 
@@ -40,7 +40,8 @@ enforces is an architecture with a half-life.
 
 - **The CLI is an HTTP client of the daemon**, not a second entry point into the services. One
   API surface, one set of business rules, and the CLI works identically against a local or a
-  remote daemon.
+  remote daemon. ADR-0013 narrows this to a single, bounded exception: a command that must work
+  without a serving daemon may call a service in-process instead.
 
 - **`depguard` in `source/daemon/.golangci.yml` is the enforcement point.** `api` may not import
   `repository`; `repository` may not import `service` or `api`; `runner` may not import
