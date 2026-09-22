@@ -14,6 +14,12 @@ go run ./source/daemon/cmd/tumika        # run the CLI locally
 go run ./source/daemon/cmd/tumika token rotate   # mint one, printed once
 go run ./source/daemon/cmd/tumika serve          # run the daemon in the foreground
 
+# Read and change daemon settings in-process, whether or not a daemon is serving
+go run ./source/daemon/cmd/tumika config list              # every known setting, aligned text table
+go run ./source/daemon/cmd/tumika config get update.channel
+go run ./source/daemon/cmd/tumika config set update.auto_apply false
+go run ./source/daemon/cmd/tumika config reset update.auto_apply   # falls back to its default
+
 # Release build dry-run (produces dist/). Both variables are mandatory: the
 # component version names every asset, and an unset one fails the build with
 # `map has no entry for key` rather than guessing.
