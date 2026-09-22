@@ -144,6 +144,7 @@ func newRootCmd(opts ...rootOption) *cobra.Command {
 	cmd.AddCommand(newStatusCmd(g))
 	cmd.AddCommand(newUpdateCmd(g))
 	cmd.AddCommand(newUpdateStatusCmd(g))
+	cmd.AddCommand(newConfigCmd(g))
 
 	return cmd
 }

@@ -8,10 +8,12 @@ import (
 
 // withDaemon opens the daemon's resources, runs fn, and closes them.
 //
-// For commands that must work before a daemon is running — `token` on a fresh
-// install being the case that matters, since the daemon refuses to serve without
-// one. Everything else talks to the running daemon over HTTP, because the CLI is
-// an API client and not a second entry point into the services (ADR-0004).
+// A command routes through here only when it must work without a serving
+// daemon (ADR-0013): `token` on a fresh install, `update` on a daemon that
+// will not stay up, and `config set`/`reset` on a setting that is the reason
+// it will not serve. Every other command stays an HTTP client of the running
+// daemon, because the CLI is not a second entry point into the services
+// (ADR-0004).
 func withDaemon(g *globals, cmd *cobra.Command, fn func(*daemon.Daemon) error) error {
 	p, err := g.Paths()
 	if err != nil {
