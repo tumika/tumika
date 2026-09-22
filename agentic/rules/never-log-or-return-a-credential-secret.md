@@ -85,6 +85,7 @@ defaults the AAD to `nil` defeats the whole scheme, so there is not one.
 | `source/daemon/internal/platform/secrets` | `Seal`/`Open`, AAD binding, key custody per backend |
 | `source/daemon/internal/platform/provider/claudecode/` | PTY transcript redaction at capture time |
 | `source/daemon/internal/service/` (`ProviderService`, `LoginService`) | the only layers that hold plaintext |
+| `source/daemon/internal/cli/config.go` | the narrow `configService` interface it declares omits `ReadSecret`/`WriteSecret` entirely — no CLI path can even compile against a secret setting |
 
 ## Example
 
