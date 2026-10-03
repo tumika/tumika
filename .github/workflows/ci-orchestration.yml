@@ -172,7 +172,7 @@ jobs:
     # would silently disable the security gate while the required check stayed
     # green. bulwark still runs *after* tests, to consume their coverage.
     if: "!cancelled() && needs.attest.outputs.validated != 'true'"
-    uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v1
+    uses: pedromvgomes/gt/.github/workflows/reusable-bulwark.yml@v2
     # Named explicitly, NOT `inherit`. GitHub documents inherit as working for
     # "reusable workflows in the same organization or enterprise", and gt lives
     # under a different owner than most repositories that call it — so an
