@@ -14,7 +14,7 @@
 # rebuilds the harness on the wrong architecture. The install then fails in ways
 # that look like bugs in tumika. The multi-arch index digest resolves correctly
 # on every host.
-FROM debian@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
+FROM debian@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=podman
