@@ -14,7 +14,7 @@
   "packageManager": "pnpm@11.9.0",
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "react": "^19.1.0",
+    "react": "^19.3.1",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
