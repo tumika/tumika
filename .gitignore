@@ -35,3 +35,4 @@ master.key
 
 # goreleaser output
 /dist/
+/.agentic-toolkit.lock.yaml
